@@ -39,6 +39,7 @@ import numpy as np
 from dotenv import load_dotenv
 import json_repair
 
+from lightrag.zotero_citations import citation_for
 from lightrag.exceptions import ChunkBlockMatchError, EmptyTruncatedResponseError
 from lightrag.constants import (
     DEFAULT_LOG_MAX_BYTES,
@@ -6618,7 +6619,15 @@ def generate_reference_list_from_chunks(
     # 5. Build reference_list
     reference_list = []
     for i, file_path in enumerate(unique_file_paths):
-        reference_list.append({"reference_id": str(i + 1), "file_path": file_path})
+        reference_list.append(
+            {
+                "reference_id": str(i + 1),
+                "file_path": file_path,
+                # Resolved from zotero_metadata.json so the API and the appended
+                # reference block cite real bibliography instead of a filename.
+                "citation": citation_for(file_path),
+            }
+        )
 
     return reference_list, updated_chunks
 
