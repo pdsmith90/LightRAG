@@ -206,5 +206,7 @@ def test_streamed_chunks_carry_no_verdict():
     lines = _ndjson_lines(response)
 
     content_lines = [line for line in lines if "response" in line]
-    assert [line["response"] for line in content_lines] == ["Hello", " world"]
+    # The references stripper holds back a short tail of the stream, so these
+    # two small chunks may arrive on one line; the text is what must survive.
+    assert "".join(line["response"] for line in content_lines) == "Hello world"
     assert all("llm_generated" not in line for line in content_lines)
