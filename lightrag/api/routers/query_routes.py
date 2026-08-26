@@ -579,12 +579,18 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             # omits the list entirely.
             if (
                 request.include_references
-                and references
                 and not request.only_need_context
                 and not request.only_need_prompt
             ):
+                # Strip even when there is nothing to append. Retrieval can
+                # legitimately yield zero chunks (a large top_k fills the token
+                # budget with KG entities and starves them), and the model still
+                # writes a references section -- an entirely invented one, since
+                # it had no sources. Leaving that in place is worse than leaving
+                # the answer bare.
                 response_content = strip_llm_references(response_content)
-                response_content += format_reference_block(references)
+                if references:
+                    response_content += format_reference_block(references)
 
             # Return response with or without references based on request
             if request.include_references:
@@ -644,9 +650,10 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                     enriched_references.append(ref_copy)
                 references = enriched_references
 
-            rewrite = bool(
-                include_references and references and allow_reference_block
-            )
+            # Strip whenever references are enabled; append only when there is
+            # something real to append. Zero-chunk retrievals still produce an
+            # invented references section that has to go.
+            rewrite = bool(include_references and allow_reference_block)
 
             if llm_response.get("is_streaming"):
                 # Streaming: references first, then response chunks
@@ -675,7 +682,11 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                             yield f"{json.dumps({'response': tail})}\n"
                         # Emitted even after an error line: a partial answer
                         # still deserves its sources.
-                        block = format_reference_block(references)
+                        block = (
+                            format_reference_block(references)
+                            if references
+                            else ""
+                        )
                         if block:
                             yield f"{json.dumps({'response': block})}\n"
             else:
@@ -688,7 +699,8 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                 # kg_query returns a plain QueryResult for a cached answer.
                 if rewrite:
                     response_content = strip_llm_references(response_content)
-                    response_content += format_reference_block(references)
+                    if references:
+                        response_content += format_reference_block(references)
 
                 complete_response = {"response": response_content}
                 if include_references:
