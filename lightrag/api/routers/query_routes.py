@@ -649,10 +649,10 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                     enriched_references.append(ref_copy)
                 references = enriched_references
 
-            # Replace whatever reference section the LLM improvised with one
-            # compiled from the retrieval result. The model is given only file
-            # paths, so left to itself it fabricates titles, years and DOIs --
-            # or omits the list entirely.
+            # Replace whatever reference section the LLM improvised with the
+            # full retrieved source list. The model is given only file paths,
+            # so left to itself it fabricates titles, years and DOIs -- or
+            # omits the list entirely.
             if (
                 request.include_references
                 and references
@@ -660,7 +660,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                 and not request.only_need_prompt
             ):
                 response_content = strip_llm_references(response_content)
-                response_content += format_reference_block(references, response_content)
+                response_content += format_reference_block(references)
 
             # Return response with or without references based on request
             if request.include_references:
@@ -749,7 +749,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                             yield f"{json.dumps({'response': tail})}\n"
                         # Emitted even after an error line: a partial answer
                         # still deserves its sources.
-                        block = format_reference_block(references, stripper.kept)
+                        block = format_reference_block(references)
                         if block:
                             yield f"{json.dumps({'response': block})}\n"
             else:
@@ -764,9 +764,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                 # kg_query returns a plain QueryResult for a cached answer.
                 if rewrite:
                     response_content = strip_llm_references(response_content)
-                    response_content += format_reference_block(
-                        references, response_content
-                    )
+                    response_content += format_reference_block(references)
 
                 # The flag rides this line rather than a separate one: it
                 # describes THIS content, and a client that ignores the key
