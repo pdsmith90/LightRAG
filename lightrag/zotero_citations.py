@@ -43,7 +43,6 @@ _next_stat: float = 0.0
 _warned = False
 
 _KEY_RE = re.compile(r"^[A-Z0-9]{8}$")
-_MARKER_RE = re.compile(r"\[(\d{1,3})\]")
 
 # A references heading the answering LLM may have emitted. Anchored to the start
 # of a line; the bare form must be alone on its line so ordinary prose beginning
@@ -51,7 +50,12 @@ _MARKER_RE = re.compile(r"\[(\d{1,3})\]")
 _HEADING_RE = re.compile(
     r"^[ \t]{0,3}(?:#{1,6}[ \t]*references\b"
     r"|\*\*references\*\*:?[ \t]*$"
-    r"|references[ \t]*:?[ \t]*$)",
+    r"|references[ \t]*:?[ \t]*$"
+    # "Sources" must be the WHOLE heading. Unanchored it would eat legitimate
+    # prose sections -- "### Sources of error" is ordinary geophysics writing.
+    r"|#{1,6}[ \t]*sources[ \t]*:?[ \t]*$"
+    r"|\*\*sources\*\*:?[ \t]*$"
+    r"|sources[ \t]*:[ \t]*$)",
     re.IGNORECASE | re.MULTILINE,
 )
 
@@ -234,29 +238,32 @@ def strip_llm_references(text: str) -> str:
     return text[: m.start()].rstrip() if m else text
 
 
-def format_reference_block(references: list, answer_text: str) -> str:
-    """Render the ``### References`` block appended to an answer.
+def format_reference_block(references: list) -> str:
+    """Render the ``### Sources`` block appended to an answer.
 
-    Lists only the references the answer actually cites with an ``[n]`` marker,
-    so a retrieved-but-unused document is not passed off as a source. If the
-    answer cites nothing, every retrieved reference is listed instead.
+    Lists every retrieved reference, in reference_id order.
+
+    An earlier version listed only ids the answer marked with ``[n]``. That was
+    wrong twice over: this model's marker use is erratic (one observed answer
+    emitted none at all, another cited [2] and [3] when retrieval returned a
+    single reference), and filtering left visible gaps -- a lone "[2]" entry
+    reads as a broken list even though it correctly matches its inline marker.
+    Listing everything retrieved has no gaps, and "Sources" claims only what is
+    true: these are the documents the retrieval returned. Whether the model
+    actually leaned on each one is not something the reference list can know.
     """
     try:
         if not references:
             return ""
-        cited = set(_MARKER_RE.findall(answer_text or ""))
-        chosen = [r for r in references if str(r.get("reference_id", "")) in cited]
-        if not chosen:
-            chosen = list(references)
         lines = []
-        for ref in chosen:
+        for ref in references:
             rid = ref.get("reference_id", "?")
             path = ref.get("file_path", "")
             cite = ref.get("citation") or citation_for(path) or path or "(unknown source)"
             lines.append(f"- [{rid}] {cite}")
         if not lines:
             return ""
-        return "\n\n### References\n\n" + "\n".join(lines) + "\n"
+        return "\n\n### Sources\n\n" + "\n".join(lines) + "\n"
     except Exception as e:
         logger.warning(f"zotero_citations: format_reference_block failed: {e}")
         return ""
@@ -313,13 +320,3 @@ class ReferenceStripper:
         """Everything fed so far, references heading and all."""
         return "".join(self._acc)
 
-    @property
-    def kept(self) -> str:
-        """The answer as the client saw it, with any references section removed.
-
-        Scan this -- not :attr:`text` -- for ``[n]`` markers: the LLM's own
-        references block lists every retrieved id, so counting markers there
-        would defeat the cited-only filtering in
-        :func:`format_reference_block`.
-        """
-        return strip_llm_references("".join(self._acc))
