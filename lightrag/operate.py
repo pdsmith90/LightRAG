@@ -15,6 +15,7 @@ from lightrag.exceptions import (
     IndexFlushError,
     PipelineCancelledException,
 )
+from lightrag.zotero_citations import citation_short
 from lightrag.utils import (
     logger,
     compute_mdhash_id,
@@ -5823,7 +5824,13 @@ async def _build_context_str(
         for chunk in truncated_chunks
     ]
     reference_list_str = "\n".join(
-        f"[{ref['reference_id']}] {ref['file_path']}"
+        # Short bibliographic form instead of the corpus filename, to ground
+        # the inline [n] markers. Capped to the filename's own length: a
+        # citation is NOT inherently shorter than the slug, and over a
+        # ten-entry list the growth can exceed the 200 tokens buffer_tokens
+        # above reserves.
+        f"[{ref['reference_id']}] "
+        f"{citation_short(ref['file_path'], len(ref['file_path'])) or ref['file_path']}"
         for ref in reference_list
         if ref["reference_id"]
     )
@@ -6760,7 +6767,13 @@ async def naive_query(
     # Build chunks_context from processed chunks with reference IDs
     text_units_str = render_chunks_context_text(processed_chunks_with_ref_ids)
     reference_list_str = "\n".join(
-        f"[{ref['reference_id']}] {ref['file_path']}"
+        # Short bibliographic form instead of the corpus filename, to ground
+        # the inline [n] markers. Capped to the filename's own length: a
+        # citation is NOT inherently shorter than the slug, and over a
+        # ten-entry list the growth can exceed the 200 tokens buffer_tokens
+        # above reserves.
+        f"[{ref['reference_id']}] "
+        f"{citation_short(ref['file_path'], len(ref['file_path'])) or ref['file_path']}"
         for ref in reference_list
         if ref["reference_id"]
     )

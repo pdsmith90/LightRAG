@@ -24,6 +24,11 @@ from lightrag.constants import (
 )
 from lightrag.query_validation import validate_query_not_empty, validate_rag_query
 from lightrag.utils import logger
+from lightrag.zotero_citations import (
+    ReferenceStripper,
+    format_reference_block,
+    strip_llm_references,
+)
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
@@ -276,6 +281,10 @@ class ReferenceItem(BaseModel):
 
     reference_id: str = Field(description="Unique reference identifier")
     file_path: str = Field(description="Path to the source file")
+    citation: Optional[str] = Field(
+        default=None,
+        description="Bibliographic citation resolved from Zotero metadata; empty when the source cannot be resolved",
+    )
     content: Optional[List[str]] = Field(
         default=None,
         description="List of chunk contents from this file (only present when include_chunk_content=True)",
@@ -640,6 +649,19 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                     enriched_references.append(ref_copy)
                 references = enriched_references
 
+            # Replace whatever reference section the LLM improvised with one
+            # compiled from the retrieval result. The model is given only file
+            # paths, so left to itself it fabricates titles, years and DOIs --
+            # or omits the list entirely.
+            if (
+                request.include_references
+                and references
+                and not request.only_need_context
+                and not request.only_need_prompt
+            ):
+                response_content = strip_llm_references(response_content)
+                response_content += format_reference_block(references, response_content)
+
             # Return response with or without references based on request
             if request.include_references:
                 return QueryResponse(
@@ -663,6 +685,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
         *,
         result: dict[str, Any],
         include_references: bool,
+        allow_reference_block: bool = True,
         include_chunk_content: bool,
         include_response_time: bool,
         start_time: float,
@@ -699,6 +722,8 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                     enriched_references.append(ref_copy)
                 references = enriched_references
 
+            rewrite = bool(include_references and references and allow_reference_block)
+
             if llm_response.get("is_streaming"):
                 # Streaming: references first, then response chunks
                 if include_references:
@@ -706,13 +731,27 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
 
                 response_stream = llm_response.get("response_iterator")
                 if response_stream:
+                    # Hold back a short tail so a references heading split
+                    # across chunks is caught before any of it is sent.
+                    stripper = ReferenceStripper() if rewrite else None
                     try:
                         async for chunk in response_stream:
                             if chunk:
-                                yield f"{json.dumps({'response': chunk})}\n"
+                                out = stripper.feed(chunk) if stripper else chunk
+                                if out:
+                                    yield f"{json.dumps({'response': out})}\n"
                     except Exception as e:
                         logger.error(f"Streaming error: {str(e)}")
                         yield f"{json.dumps({'error': str(e)})}\n"
+                    if stripper:
+                        tail = stripper.flush()
+                        if tail:
+                            yield f"{json.dumps({'response': tail})}\n"
+                        # Emitted even after an error line: a partial answer
+                        # still deserves its sources.
+                        block = format_reference_block(references, stripper.kept)
+                        if block:
+                            yield f"{json.dumps({'response': block})}\n"
             else:
                 # Non-streaming: complete response in one message
                 response_content = llm_response.get("content", "")
@@ -720,6 +759,14 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                 if not response_content:
                     response_content = "No relevant context found for the query."
                     llm_generated = False
+
+                # A cache hit arrives here even when stream=true, because
+                # kg_query returns a plain QueryResult for a cached answer.
+                if rewrite:
+                    response_content = strip_llm_references(response_content)
+                    response_content += format_reference_block(
+                        references, response_content
+                    )
 
                 # The flag rides this line rather than a separate one: it
                 # describes THIS content, and a client that ignores the key
@@ -1063,6 +1110,9 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                         stream_gen = _build_stream_generator(
                             result=result,
                             include_references=include_references,
+                            allow_reference_block=not (
+                                request.only_need_context or request.only_need_prompt
+                            ),
                             include_chunk_content=include_chunk_content,
                             include_response_time=True,
                             start_time=start_time,
@@ -1092,6 +1142,9 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                 stream_gen = _build_stream_generator(
                     result=result,
                     include_references=request.include_references,
+                    allow_reference_block=not (
+                        request.only_need_context or request.only_need_prompt
+                    ),
                     include_chunk_content=request.include_chunk_content,
                     include_response_time=False,
                     start_time=start_time,
