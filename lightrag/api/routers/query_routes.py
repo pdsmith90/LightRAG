@@ -22,13 +22,51 @@ from lightrag.constants import (
     MAX_RESPONSE_TYPE_CHARS,
     MAX_ROLE_CHARS,
 )
-from lightrag.utils import logger
+from lightrag.utils import logger, get_env_value
+from lightrag.constants import (
+    DEFAULT_MAX_TOTAL_TOKENS,
+    DEFAULT_MAX_ENTITY_TOKENS,
+    DEFAULT_MAX_RELATION_TOKENS,
+)
 from lightrag.zotero_citations import (
     ReferenceStripper,
     format_reference_block,
     strip_llm_references,
 )
 from pydantic import BaseModel, Field, field_validator, model_validator
+
+
+def _clamp_token_budget(param: "QueryParam") -> None:
+    """Clamp per-request context budgets to this deployment's configured maxima.
+
+    The bundled web UI ships its own defaults (top_k 40, max_total_tokens 30000,
+    entity 6000, relation 8000) and sends them on every request, overriding the
+    server's .env. Those numbers are not a preference this deployment can honour:
+    the local model's context is OLLAMA_LLM_NUM_CTX=8192, so a 30000-token context
+    budget is unsatisfiable, and letting the graph claim 6000+8000 starves document
+    chunks out of the prompt entirely (measured: 194 tokens left for chunks, i.e.
+    0.2 of one 1000-token chunk).
+
+    The web UI persists its settings in browser localStorage, so patching the
+    built bundle only affects new profiles -- existing sessions keep the old
+    values. Clamping here is the only fix that reaches every caller (web UI, API
+    and the MCP proxy) regardless of what they ask for.
+
+    This is a CEILING, not an override: a client asking for LESS than the
+    configured maximum still gets what it asked for.
+    """
+    for attr, env_key, default in (
+        ("max_total_tokens", "MAX_TOTAL_TOKENS", DEFAULT_MAX_TOTAL_TOKENS),
+        ("max_entity_tokens", "MAX_ENTITY_TOKENS", DEFAULT_MAX_ENTITY_TOKENS),
+        ("max_relation_tokens", "MAX_RELATION_TOKENS", DEFAULT_MAX_RELATION_TOKENS),
+    ):
+        ceiling = get_env_value(env_key, default, int)
+        requested = getattr(param, attr, None)
+        if requested is not None and requested > ceiling:
+            logger.debug(
+                f"clamping {attr} {requested} -> {ceiling} (deployment maximum)"
+            )
+            setattr(param, attr, ceiling)
 
 
 class QueryRequest(BaseModel):
@@ -235,6 +273,7 @@ class QueryRequest(BaseModel):
         # Ensure `mode` and `stream` are set explicitly
         param = QueryParam(**request_data)
         param.stream = is_stream
+        _clamp_token_budget(param)
         return param
 
 
