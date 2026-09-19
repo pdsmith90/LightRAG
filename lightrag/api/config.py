@@ -31,6 +31,7 @@ from lightrag.constants import (
     DEFAULT_COSINE_THRESHOLD,
     DEFAULT_RELATED_CHUNK_NUMBER,
     DEFAULT_MIN_RERANK_SCORE,
+    DEFAULT_DROP_BIBLIOGRAPHY_CHUNKS,
     DEFAULT_FORCE_LLM_SUMMARY_ON_MERGE,
     DEFAULT_MAX_ASYNC,
     DEFAULT_MAX_PARALLEL_INSERT,
@@ -848,6 +849,9 @@ def parse_args() -> argparse.Namespace:
     # Min rerank score configuration
     args.min_rerank_score = get_env_value(
         "MIN_RERANK_SCORE", DEFAULT_MIN_RERANK_SCORE, float
+    )
+    args.drop_bibliography_chunks = get_env_value(
+        "DROP_BIBLIOGRAPHY_CHUNKS", DEFAULT_DROP_BIBLIOGRAPHY_CHUNKS, bool
     )
 
     # LLM / Embedding request timeouts

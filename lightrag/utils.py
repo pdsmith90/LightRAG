@@ -5897,6 +5897,82 @@ def normalize_rerank_result(
     return {"index": index, "relevance_score": score}, None
 
 
+# ---- bibliography chunk filter (pdrag-deploy, 2026-09-19) ---------------------
+# A reference list is keyword-dense in exactly the words a query uses -- paper
+# titles -- so its chunks win vector search AND the reranker while carrying no
+# content: on the Zotero KB, 3 of the 5 chunks returned for a GRACE-accuracy
+# question were reference-list text, each the same citation line lifted from a
+# different paper's bibliography. New documents have reference sections stripped
+# at build time (lightrag-bundle/build_corpus.py, same day); this filter covers
+# the chunks indexed before that. A chunk is a bibliography when it holds >= 5
+# reference-entry lines -- a line that STARTS like a reference ("Surname, I.",
+# "SURNAME W. A.", "I. Surname", optional list marker) and carries a year plus a
+# citation cue -- or one packed line (> 600 chars, starts like a reference, >= 5
+# years, >= 3 doi/url) where a whole list was emitted as a single paragraph.
+# Measured over all 108,463 indexed chunks on 2026-09-19: 11,370 match
+# (10.5%). The entry-line histogram is bimodal (91,732 chunks with none,
+# 7,630 with ten or more); the 3-4 bucket (~870 each) is where a chunk straddles
+# the last prose paragraph and the first entries, so 5 is the valley. A raw DOI
+# count was tried and rejected: two DOIs cited in prose plus a three-entry tail
+# already reach five, and a data-availability paragraph listing dataset DOIs is
+# not a bibliography. Mirrors build_corpus._is_ref_entry / _ref_weight -- keep
+# the two in step. Opt-in per deployment: DROP_BIBLIOGRAPHY_CHUNKS.
+BIBLIOGRAPHY_MIN_ENTRIES = 5
+_BIB_URL_RE = re.compile(r"\bdoi\b|doi\.org|https?://", re.IGNORECASE)
+_BIB_YEAR_RE = re.compile(r"(?<!\d)(?:1[6-9]\d{2}|20[0-3]\d)[a-z]?(?!\d)")
+_BIB_CUE_RE = re.compile(
+    r"\bdoi\b|doi\.org|https?://|\barxiv\b|\bpp?\.\s*\d|\bvol\.?\s*\d"
+    r"|\d{1,4}\s*\(\s*[A-Za-z]?\d{1,4}\s*\)\s*[,:]?\s*[A-Za-z]?\d"   # 48(12), 4384
+    r"|\b\d{1,4}\s*,\s*\d{1,5}\s*[–—-]\s*\d{1,5}\b"                # 62, 4384–4399
+    r"|\bIn:\s*[A-Z]|\(eds?\.?\)|\bedited\s+by\b",
+    re.IGNORECASE)
+_BIB_AUTHOR_RE = re.compile(
+    r"\b[A-Z][A-Za-z'’-]+,\s*(?:[A-Z]\.[\s-]*){1,3}"                  # Surname, I. I.
+    r"|\b[A-Z][A-Za-z'’-]+\s+(?:[A-Z]\.\s*){1,3}(?=[&,(\d]|and\b)")  # SURNAME W. A. & / Kaula W. M. 1966
+_BIB_START_RE = re.compile(
+    r"^\s*(?:[-*•]\s*|\[\d{1,3}\]\s*|\d{1,3}[.)]\s+)?"                       # list marker
+    r"(?:(?:van|von|de|der|den|del|di|da|le|la|du|dos|das|te|ter|af|zu)\s+)*"  # name particles
+    r"(?:[A-Z][\w'’\-]+(?:\s+[A-Z][\w'’\-]+)?\s*,"                             # Surname,
+    r"|[A-Z][\w'’\-]+\s+(?:(?:[A-Z]\.\s*){1,3}|[A-Z]{1,3},)"                    # Surname I. I. / Tapley BD,
+    r"|(?:[A-Z]\.\s*){1,3}[A-Z][\w'’\-]+)")                                     # I. Surname
+
+
+def _is_reference_entry_line(line: str) -> bool:
+    return bool(_BIB_START_RE.match(line)) and bool(_BIB_YEAR_RE.search(line)) and bool(
+        _BIB_CUE_RE.search(line) or _BIB_AUTHOR_RE.search(line))
+
+
+def _is_packed_reference_list(line: str) -> bool:
+    return (
+        len(line) > 600
+        and len(_BIB_URL_RE.findall(line)) >= 3
+        and len(_BIB_YEAR_RE.findall(line)) >= BIBLIOGRAPHY_MIN_ENTRIES
+    )
+
+
+def is_bibliography_chunk(content: str) -> bool:
+    """True when a chunk's text is a reference list rather than prose."""
+    entries = 0
+    for line in content.split("\n"):
+        if _is_reference_entry_line(line):
+            if _is_packed_reference_list(line):
+                return True
+            entries += 1
+            if entries >= BIBLIOGRAPHY_MIN_ENTRIES:
+                return True
+    return False
+
+
+def drop_bibliography_chunks(chunks: list[dict]) -> list[dict]:
+    kept = [c for c in chunks if not is_bibliography_chunk(c.get("content") or "")]
+    dropped = len(chunks) - len(kept)
+    if dropped:
+        logger.info(
+            f"Bibliography filter: dropped {dropped} reference-list chunks, {len(kept)} remain"
+        )
+    return kept
+
+
 async def process_chunks_unified(
     query: str,
     unique_chunks: list[dict],
@@ -5924,6 +6000,12 @@ async def process_chunks_unified(
         return []
 
     origin_count = len(unique_chunks)
+
+    # 0. Drop reference-list chunks before they can win the rerank (deployment opt-in)
+    if global_config.get("drop_bibliography_chunks"):
+        unique_chunks = drop_bibliography_chunks(unique_chunks)
+        if not unique_chunks:
+            return []
 
     # 1. Apply reranking if enabled and query is provided
     if query_param.enable_rerank and query and unique_chunks:

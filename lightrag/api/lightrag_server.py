@@ -2783,6 +2783,7 @@ def create_app(args):
                         "max_parallel_insert": args.max_parallel_insert,
                         "cosine_threshold": args.cosine_threshold,
                         "min_rerank_score": args.min_rerank_score,
+                        "drop_bibliography_chunks": args.drop_bibliography_chunks,
                         "related_chunk_number": args.related_chunk_number,
                         "max_async": args.max_async,
                         "llm_timeout": args.llm_timeout,

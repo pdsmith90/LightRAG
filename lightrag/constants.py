@@ -60,6 +60,7 @@ DEFAULT_KG_CHUNK_PICK_METHOD = "VECTOR"
 
 # Rerank configuration defaults
 DEFAULT_MIN_RERANK_SCORE = 0.0
+DEFAULT_DROP_BIBLIOGRAPHY_CHUNKS = False
 DEFAULT_RERANK_BINDING = "null"
 
 # Default source ids limit in meta data for entity and relation

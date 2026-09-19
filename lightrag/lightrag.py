@@ -58,6 +58,7 @@ from lightrag.constants import (
     DEFAULT_RELATED_CHUNK_NUMBER,
     DEFAULT_KG_CHUNK_PICK_METHOD,
     DEFAULT_MIN_RERANK_SCORE,
+    DEFAULT_DROP_BIBLIOGRAPHY_CHUNKS,
     DEFAULT_SUMMARY_MAX_TOKENS,
     DEFAULT_SUMMARY_CONTEXT_SIZE,
     DEFAULT_SUMMARY_LENGTH_RECOMMENDED,
@@ -779,6 +780,14 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         default=get_env_value("MIN_RERANK_SCORE", DEFAULT_MIN_RERANK_SCORE, float)
     )
     """Minimum rerank score threshold for filtering chunks after reranking."""
+
+    drop_bibliography_chunks: bool = field(
+        default=get_env_value(
+            "DROP_BIBLIOGRAPHY_CHUNKS", DEFAULT_DROP_BIBLIOGRAPHY_CHUNKS, bool
+        )
+    )
+    """Drop reference-list chunks from every query's candidate set before reranking
+    (utils.is_bibliography_chunk). Off by default; a per-deployment opt-in."""
 
     # Storage
     # ---
