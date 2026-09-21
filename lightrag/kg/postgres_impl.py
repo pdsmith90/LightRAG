@@ -7252,8 +7252,8 @@ class PGGraphStorage(BaseGraphStorage):
         Normalize node ID to ensure special characters are properly handled in Cypher queries.
 
         Used by write paths that still embed entity IDs in Cypher strings
-        (delete_node, remove_nodes, remove_edges).  The upsert paths now use
-        parameterized Cypher instead.
+        (delete_node, remove_nodes).  The upsert paths use parameterized Cypher
+        and remove_edges binds its endpoints to a plain-SQL statement instead.
 
         Within a Cypher double-quoted string the only recognised escape
         sequences are ``\\"`` and ``\\\\``.  We also strip null bytes which
@@ -8331,25 +8331,76 @@ class PGGraphStorage(BaseGraphStorage):
             logger.error(f"[{self.workspace}] Error during node removal: {e}")
             raise
 
+    def _build_remove_edges_sql(self) -> str:
+        """Plain SQL deleting every edge between each bound (src, tgt) pair.
+
+        Not Cypher on purpose: below AGE 1.8.0 (every version
+        ``AGE_FIRST_UNSUPPORTED_VERSION`` admits), each Cypher ``DELETE``
+        statement ends with a full scan of every edge label table
+        (``check_for_connected_edges`` in ``cypher_delete.c``), even when it
+        deletes only edges or matches nothing, and it locates each deleted
+        entity with a heap scan rather than an index. Both costs grow with the
+        graph's edge count: one statement per edge pays both for every edge,
+        and one ``UNWIND`` statement per chunk still pays the heap scan for
+        every deleted edge. AGE 1.8.0 does both lookups through indexes when
+        they exist. This is one join per chunk instead, and the indexes
+        ``initialize`` creates (``entity_idx_node_id`` on the endpoints,
+        ``(start_id, end_id)`` on the edge tables) let the planner find the
+        edge rows without scanning a label table.
+
+        Semantics match the Cypher pattern ``(a:base)-[r]-(b:base) DELETE r``:
+        every edge of every label between the two vertices, in either
+        direction, with the vertices untouched. ``_ag_label_edge`` is the
+        graph's edge parent table and PostgreSQL inheritance applies the DELETE
+        to each edge label beneath it. Endpoints arrive as two parallel text
+        arrays ($1 sources, $2 targets) and are compared as agtype strings
+        exactly like ``_build_endpoint_exists_sql``, so ids never touch the SQL
+        text.
+
+        On AGE 1.8.0 a SQL write invalidates the VLE cache only through the
+        statement-level ``_age_cache_invalidate`` trigger of the table it
+        names, and the 1.7.0 -> 1.8.0 upgrade script leaves that trigger off
+        ``_ag_label_edge``: on an upgraded graph this DELETE does not bump the
+        graph version. PGGraphStorage issues no VLE queries; revisit this
+        before raising ``AGE_FIRST_UNSUPPORTED_VERSION``.
+        """
+        entity_id = (
+            "ag_catalog.agtype_access_operator("
+            "VARIADIC ARRAY[{alias}.properties, '\"entity_id\"'::ag_catalog.agtype])"
+        )
+        # Quoted: AGE keeps the graph name's case, and an unquoted identifier
+        # would fold a mixed-case workspace's schema name to lower case.
+        graph = f'"{self.graph_name}"'
+        return (
+            f"DELETE FROM {graph}._ag_label_edge AS e "
+            "USING unnest($1::text[], $2::text[]) AS p(src, tgt), "
+            f"{graph}.base AS a, {graph}.base AS b "
+            f"WHERE {entity_id.format(alias='a')} = (to_json(p.src)::text)::ag_catalog.agtype "
+            f"AND {entity_id.format(alias='b')} = (to_json(p.tgt)::text)::ag_catalog.agtype "
+            "AND ((e.start_id = a.id AND e.end_id = b.id) "
+            "OR (e.start_id = b.id AND e.end_id = a.id))"
+        )
+
     async def remove_edges(self, edges: list[tuple[str, str]]) -> None:
         """Remove multiple edges from the graph.
 
-        Endpoint ids are inlined into Cypher, so the edge list is chunked by the
-        delete record cap and the payload-byte budget. Each chunk runs in one
-        transaction (the old path opened one transaction per edge), bounding both
-        the Cypher text and the transaction duration per chunk.
+        Runs one plain-SQL DELETE per chunk (see ``_build_remove_edges_sql``),
+        endpoints bound as arrays. The edge list is chunked by the delete record
+        cap and the payload-byte budget, and each chunk runs in its own
+        transaction, bounding the transaction duration per chunk.
 
         Args:
             edges (list[tuple[str, str]]): A list of edges to remove, where each edge is a tuple of (source_node_id, target_node_id).
         """
         if not edges:
             return
-        normalized = [
-            (self._normalize_node_id(src), self._normalize_node_id(tgt))
-            for src, tgt in edges
+        # Strip NUL bytes as _normalize_node_id does for the other delete paths:
+        # a PostgreSQL text value cannot carry one, so no stored id contains it.
+        pairs = [
+            (src.replace("\x00", ""), tgt.replace("\x00", "")) for src, tgt in edges
         ]
         batches = _chunk_by_budget(
-            normalized,
+            pairs,
             lambda pair: (
                 len(pair[0].encode("utf-8")) + len(pair[1].encode("utf-8")) + 8
             ),
@@ -8359,24 +8410,20 @@ class PGGraphStorage(BaseGraphStorage):
         if len(batches) > 1:
             logger.info(
                 f"[{self.workspace}] {self.namespace} edges: edge removal split "
-                f"into {len(batches)} chunks for {len(normalized)} edges"
+                f"into {len(batches)} chunks for {len(pairs)} edges"
             )
+        sql = self._build_remove_edges_sql()
         for chunk, _estimated_bytes in batches:
-            # Build Cypher with dynamic dollar-quoting to handle entity_id containing $ sequences
-            queries: list[str] = []
-            for src_label, tgt_label in chunk:
-                cypher_query = f"""MATCH (a:base {{entity_id: "{src_label}"}})-[r]-(b:base {{entity_id: "{tgt_label}"}})
-                         DELETE r"""
-                queries.append(
-                    f"SELECT * FROM cypher({_dollar_quote(self.graph_name)}, {_dollar_quote(cypher_query)}) AS (r agtype)"
-                )
+            sources = [src for src, _tgt in chunk]
+            targets = [tgt for _src, tgt in chunk]
 
             async def _operation(
-                connection: asyncpg.Connection, _queries: list[str] = queries
+                connection: asyncpg.Connection,
+                _sources: list[str] = sources,
+                _targets: list[str] = targets,
             ) -> None:
                 async with connection.transaction():
-                    for query in _queries:
-                        await connection.execute(query)
+                    await connection.execute(sql, _sources, _targets)
 
             try:
                 await self.db._run_with_retry(
