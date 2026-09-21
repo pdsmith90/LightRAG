@@ -7227,8 +7227,8 @@ class PGGraphStorage(BaseGraphStorage):
         Normalize node ID to ensure special characters are properly handled in Cypher queries.
 
         Used by write paths that still embed entity IDs in Cypher strings
-        (delete_node, remove_nodes, remove_edges).  The upsert paths now use
-        parameterized Cypher instead.
+        (delete_node, remove_nodes).  The upsert paths use parameterized Cypher
+        and remove_edges binds its endpoints to a plain-SQL statement instead.
 
         Within a Cypher double-quoted string the only recognised escape
         sequences are ``\\"`` and ``\\\\``.  We also strip null bytes which
@@ -8271,25 +8271,55 @@ class PGGraphStorage(BaseGraphStorage):
             logger.error(f"[{self.workspace}] Error during node removal: {e}")
             raise
 
+    def _build_remove_edges_sql(self) -> str:
+        """Plain SQL deleting every edge between each bound (src, tgt) pair.
+
+        Not Cypher on purpose. On AGE 1.6.0 the Cypher delete executor costs
+        ~185 ms per EDGE (measured 2026-09-21 inside rolled-back transactions on
+        a 676k-edge graph, the same whichever way the endpoints are matched: it
+        locates the tuple by scanning the label table), so the 150-300 edges a
+        document deletion removes took 40-60 s. This statement resolves both
+        endpoints through the ``entity_idx_node_id`` btree and the edge rows
+        through ``directed_seid_idx`` in ~4 ms per pair.
+
+        Semantics match the Cypher pattern ``(a)-[r]-(b) DELETE r``: every edge
+        of every label between the two vertices, in either direction.
+        ``_ag_label_edge`` is the graph's edge parent table and PostgreSQL
+        inheritance applies the DELETE to each edge label beneath it. Endpoints
+        arrive as two parallel text arrays ($1 sources, $2 targets) and are
+        compared as agtype strings exactly like ``_build_endpoint_exists_sql``,
+        so ids never touch the SQL text.
+        """
+        entity_id = (
+            "ag_catalog.agtype_access_operator("
+            "VARIADIC ARRAY[{alias}.properties, '\"entity_id\"'::ag_catalog.agtype])"
+        )
+        return (
+            f"DELETE FROM {self.graph_name}._ag_label_edge AS e "
+            "USING unnest($1::text[], $2::text[]) AS p(src, tgt), "
+            f"{self.graph_name}.base AS a, {self.graph_name}.base AS b "
+            f"WHERE {entity_id.format(alias='a')} = (to_json(p.src)::text)::ag_catalog.agtype "
+            f"AND {entity_id.format(alias='b')} = (to_json(p.tgt)::text)::ag_catalog.agtype "
+            "AND ((e.start_id = a.id AND e.end_id = b.id) "
+            "OR (e.start_id = b.id AND e.end_id = a.id))"
+        )
+
     async def remove_edges(self, edges: list[tuple[str, str]]) -> None:
         """Remove multiple edges from the graph.
 
-        Endpoint ids are inlined into Cypher, so the edge list is chunked by the
-        delete record cap and the payload-byte budget. Each chunk runs in one
-        transaction (the old path opened one transaction per edge), bounding both
-        the Cypher text and the transaction duration per chunk.
+        Runs one plain-SQL DELETE per chunk (see ``_build_remove_edges_sql``),
+        endpoints bound as arrays. The edge list is chunked by the delete record
+        cap and the payload-byte budget, and each chunk runs in its own
+        transaction, bounding the transaction duration per chunk.
 
         Args:
             edges (list[tuple[str, str]]): A list of edges to remove, where each edge is a tuple of (source_node_id, target_node_id).
         """
         if not edges:
             return
-        normalized = [
-            (self._normalize_node_id(src), self._normalize_node_id(tgt))
-            for src, tgt in edges
-        ]
+        pairs = [(str(src), str(tgt)) for src, tgt in edges]
         batches = _chunk_by_budget(
-            normalized,
+            pairs,
             lambda pair: (
                 len(pair[0].encode("utf-8")) + len(pair[1].encode("utf-8")) + 8
             ),
@@ -8299,24 +8329,20 @@ class PGGraphStorage(BaseGraphStorage):
         if len(batches) > 1:
             logger.info(
                 f"[{self.workspace}] {self.namespace} edges: edge removal split "
-                f"into {len(batches)} chunks for {len(normalized)} edges"
+                f"into {len(batches)} chunks for {len(pairs)} edges"
             )
+        sql = self._build_remove_edges_sql()
         for chunk, _estimated_bytes in batches:
-            # Build Cypher with dynamic dollar-quoting to handle entity_id containing $ sequences
-            queries: list[str] = []
-            for src_label, tgt_label in chunk:
-                cypher_query = f"""MATCH (a:base {{entity_id: "{src_label}"}})-[r]-(b:base {{entity_id: "{tgt_label}"}})
-                         DELETE r"""
-                queries.append(
-                    f"SELECT * FROM cypher({_dollar_quote(self.graph_name)}, {_dollar_quote(cypher_query)}) AS (r agtype)"
-                )
+            sources = [src for src, _tgt in chunk]
+            targets = [tgt for _src, tgt in chunk]
 
             async def _operation(
-                connection: asyncpg.Connection, _queries: list[str] = queries
+                connection: asyncpg.Connection,
+                _sources: list[str] = sources,
+                _targets: list[str] = targets,
             ) -> None:
                 async with connection.transaction():
-                    for query in _queries:
-                        await connection.execute(query)
+                    await connection.execute(sql, _sources, _targets)
 
             try:
                 await self.db._run_with_retry(

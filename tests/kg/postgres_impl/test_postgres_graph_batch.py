@@ -217,7 +217,7 @@ async def test_remove_nodes_empty_noop():
 
 
 # ---------------------------------------------------------------------------
-# remove_edges — one transaction per chunk
+# remove_edges — one transaction per chunk, one plain-SQL DELETE per chunk
 # ---------------------------------------------------------------------------
 
 
@@ -231,8 +231,36 @@ async def test_remove_edges_one_transaction_per_chunk():
     # 5 edges / cap 2 => 3 chunks, each its own transaction.
     assert cap.run_count == 3
     assert cap.tx_count == 3
-    # One DELETE r statement per edge.
-    assert _sql_count(cap, "DELETE r") == 5
+    # One plain-SQL DELETE on the edge parent table per chunk (no Cypher
+    # ``DELETE r`` per edge), endpoints bound as two parallel text arrays.
+    deletes = [c for c in cap.calls if "_ag_label_edge" in c["sql"]]
+    assert len(deletes) == 3
+    assert _sql_count(cap, "DELETE r") == 0
+    assert [c["args"] for c in deletes] == [
+        (["s0", "s1"], ["t0", "t1"]),
+        (["s2", "s3"], ["t2", "t3"]),
+        (["s4"], ["t4"]),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_remove_edges_binds_ids_never_interpolates():
+    """Entity ids (injection-shaped or unicode) reach the server only as params."""
+    storage, cap = make_graph_storage()
+    src = 'src"}) MATCH (x) DETACH DELETE x; //'
+    tgt = "\u5317\u4eac"
+
+    await storage.remove_edges([(src, tgt)])
+
+    (call,) = [c for c in cap.calls if "_ag_label_edge" in c["sql"]]
+    assert src not in call["sql"]
+    assert tgt not in call["sql"]
+    assert "DETACH DELETE" not in call["sql"]
+    assert call["args"] == ([src], [tgt])
+    # Both directions between the pair, any edge label (parent table).
+    assert "e.start_id = a.id AND e.end_id = b.id" in call["sql"]
+    assert "e.start_id = b.id AND e.end_id = a.id" in call["sql"]
+    assert "test_graph._ag_label_edge" in call["sql"]
 
 
 @pytest.mark.asyncio
