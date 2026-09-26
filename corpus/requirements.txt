@@ -1,0 +1,16 @@
+# corpus/ (build_metadata.py, build_corpus.py, quarantine_junk.py). CPU-only, no torch.
+# build_metadata.py and quarantine_junk.py need only the standard library.
+pymupdf4llm>=0.0.17,<2       # PDF -> Markdown with correct reading order (tested with 1.28.x)
+# --- optional format handlers (needed only if your library has these file types) ---
+python-docx>=1.1.0,<2        # .docx  (fallback if `pandoc` is not installed)
+python-pptx>=0.6.23,<2       # .pptx
+ebooklib>=0.18,<1            # .epub  (fallback if `pandoc` is not installed)
+beautifulsoup4>=4.12,<5      # .html / .epub text extraction fallback
+# --- optional OCR for image-only / scanned PDFs ---
+# ocrmypdf>=15               # needs system `tesseract-ocr` + `ghostscript`
+#
+# System tools that build_corpus.py uses automatically IF present on PATH:
+#   pandoc        -> best .docx/.epub/.html conversion
+#   djvulibre     -> `djvutxt` for .djvu
+#   tesseract-ocr -> OCR (ocrmypdf; recent PyMuPDF also uses it for image pages)
+#   ghostscript   -> required by ocrmypdf
