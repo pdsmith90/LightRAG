@@ -4736,6 +4736,13 @@ async def kg_query(
 
     # Handle cache
     answer_cache_kv = _answer_cache_kv(query_param, hashing_kv)
+    # The dict process_chunks_unified reads on this path (see
+    # _build_query_context): the text-chunk storage's config snapshot. It is
+    # taken at construction, so it can differ from `global_config` once an
+    # attribute is changed on a live instance.
+    retrieval_config = (
+        text_chunks_db.global_config if text_chunks_db is not None else global_config
+    )
     args_hash = compute_args_hash(
         _ANSWER_CACHE_POLICY_VERSION,
         query_param.mode,
@@ -4759,6 +4766,14 @@ async def kg_query(
         effective_user_prompt.text,
         query_param.enable_rerank,
         global_config.get("enable_content_headings", False),
+        # From `retrieval_config`, the dict the filter reads on this path.
+        # Present only when on, so entries written with the filter off keep
+        # their key.
+        *(
+            ("\n<drop_bibliography_chunks>\n",)
+            if retrieval_config.get("drop_bibliography_chunks")
+            else ()
+        ),
         "\n<llm_identity>\n",
         serialize_llm_cache_identity(llm_cache_identity),
     )
@@ -6826,6 +6841,13 @@ async def naive_query(
         effective_user_prompt.text,
         query_param.enable_rerank,
         global_config.get("enable_content_headings", False),
+        # Present only when on, so entries written with the filter off keep
+        # their key.
+        *(
+            ("\n<drop_bibliography_chunks>\n",)
+            if global_config.get("drop_bibliography_chunks")
+            else ()
+        ),
         "\n<llm_identity>\n",
         serialize_llm_cache_identity(llm_cache_identity),
     )

@@ -62,6 +62,11 @@ DEFAULT_MAX_TOTAL_TOKENS = 30000
 DEFAULT_COSINE_THRESHOLD = 0.2
 DEFAULT_RELATED_CHUNK_NUMBER = 5
 DEFAULT_KG_CHUNK_PICK_METHOD = "VECTOR"
+# Query-time counterpart of the chunk-time CHUNK_P_DROP_REFERENCES switch:
+# drop chunks whose text is a reference list from every query's candidates
+# before rerank (env DROP_BIBLIOGRAPHY_CHUNKS). See
+# lightrag.utils.is_bibliography_chunk.
+DEFAULT_DROP_BIBLIOGRAPHY_CHUNKS = False
 
 # Rerank configuration defaults
 DEFAULT_MIN_RERANK_SCORE = 0.0

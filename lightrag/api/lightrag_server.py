@@ -2992,6 +2992,7 @@ def create_app(args):
                         "min_rerank_score": args.min_rerank_score,
                         "related_chunk_number": args.related_chunk_number,
                         "enable_query_budget_ceiling": query_budget_ceiling_enabled,
+                        "drop_bibliography_chunks": args.drop_bibliography_chunks,
                         "max_async": args.max_async,
                         "llm_timeout": args.llm_timeout,
                         "embedding_func_max_async": args.embedding_func_max_async,

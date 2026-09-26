@@ -6293,6 +6293,93 @@ def normalize_rerank_result(
     return {"index": index, "relevance_score": score}, None
 
 
+# Bibliography chunk filter (the DROP_BIBLIOGRAPHY_CHUNKS query option). The
+# thresholds, the evidence behind them and the rejected alternatives are in
+# docs/design/BibliographyChunkFilter.md -- change them together with it.
+_BIBLIOGRAPHY_MIN_ENTRIES = 5
+_PACKED_LIST_MIN_CHARS = 600
+_PACKED_LIST_MIN_LINKS = 3
+_BIB_URL_RE = re.compile(r"\bdoi\b|doi\.org|https?://", re.IGNORECASE)
+_BIB_YEAR_RE = re.compile(r"(?<!\d)(?:1[6-9]\d{2}|20[0-3]\d)[a-z]?(?!\d)")
+_BIB_CUE_RE = re.compile(
+    r"\bdoi\b|doi\.org|https?://|\barxiv\b|\bpp?\.\s*\d|\bvol\.?\s*\d"
+    r"|\d{1,4}\s*\(\s*[A-Za-z]?\d{1,4}\s*\)\s*(?:[,:]\s*)?[A-Za-z]?\d"  # 48(12), 4384
+    r"|\b\d{1,4}\s*,\s*\d{1,5}\s*[–—-]\s*\d{1,5}\b"  # 62, 4384–4399
+    r"|\bIn:\s*[A-Z]|\(eds?\.?\)|\bedited\s+by\b",
+    re.IGNORECASE,
+)
+# The lookbehind lets a name start only where a run of name characters starts.
+# Without it every capital after an inner hyphen or apostrophe opens another
+# attempt that rescans the rest of the run: quadratic in the run length.
+_BIB_AUTHOR_RE = re.compile(
+    r"\b(?<![A-Za-z'’-])[A-Z][A-Za-z'’-]+,\s*(?:[A-Z]\.[\s-]*){1,3}"  # Surname, I. I.
+    r"|\b(?<![A-Za-z'’-])[A-Z][A-Za-z'’-]+\s+(?:[A-Z]\.\s*){1,3}(?=[&,(\d]|and\b)"  # SURNAME W. A. &
+)
+_BIB_START_RE = re.compile(
+    r"^\s*(?:[-*•]\s*|\[\d{1,3}\]\s*|\d{1,3}[.)]\s+)?"  # list marker
+    r"(?:(?:van|von|de|der|den|del|di|da|le|la|du|dos|das|te|ter|af|zu)\s+)*"  # particles
+    r"(?:[A-Z][\w'’\-]+(?:\s+[A-Z][\w'’\-]+)?\s*,"  # Surname,
+    r"|[A-Z][\w'’\-]+\s+(?:(?:[A-Z]\.\s*){1,3}|[A-Z]{1,3},)"  # Surname I. I. / Surname AB,
+    r"|(?:[A-Z]\.\s*){1,3}[A-Z][\w'’\-]+)"  # I. Surname
+)
+
+
+def _is_reference_entry_line(line: str) -> bool:
+    """A line that starts like a reference entry and carries a year plus a
+    citation cue (DOI/URL, pages, volume(issue), "In:", "(eds.)") or an
+    author-initials pattern."""
+    return (
+        bool(_BIB_START_RE.match(line))
+        and bool(_BIB_YEAR_RE.search(line))
+        and bool(_BIB_CUE_RE.search(line) or _BIB_AUTHOR_RE.search(line))
+    )
+
+
+def _is_packed_reference_list(line: str) -> bool:
+    """A whole reference list extracted as one paragraph. Only consulted for a
+    line that already passed :func:`_is_reference_entry_line`."""
+    return (
+        len(line) > _PACKED_LIST_MIN_CHARS
+        and len(_BIB_URL_RE.findall(line)) >= _PACKED_LIST_MIN_LINKS
+        and len(_BIB_YEAR_RE.findall(line)) >= _BIBLIOGRAPHY_MIN_ENTRIES
+    )
+
+
+def is_bibliography_chunk(content: str) -> bool:
+    """Whether a chunk's text is a reference list rather than prose.
+
+    True when the chunk holds at least five reference-entry lines, or one
+    long line that packs a whole reference list into a single paragraph.
+    Prose that cites a few DOIs, a data-availability paragraph, and a chunk
+    that straddles the last prose paragraph and at most four entries are
+    kept. The verdict covers the whole chunk: one that ends in five or more
+    entries, or in a packed line, is flagged together with the prose before
+    them. A heuristic tuned on English-language academic papers; see
+    docs/design/BibliographyChunkFilter.md for its rules and known misses.
+    """
+    entries = 0
+    for line in content.split("\n"):
+        if _is_reference_entry_line(line):
+            if _is_packed_reference_list(line):
+                return True
+            entries += 1
+            if entries >= _BIBLIOGRAPHY_MIN_ENTRIES:
+                return True
+    return False
+
+
+def filter_bibliography_chunks(chunks: list[dict]) -> list[dict]:
+    """Return ``chunks`` without the ones :func:`is_bibliography_chunk` flags,
+    preserving order."""
+    kept = [c for c in chunks if not is_bibliography_chunk(c.get("content") or "")]
+    dropped = len(chunks) - len(kept)
+    if dropped:
+        logger.info(
+            f"Bibliography filter: dropped {dropped} reference-list chunks, {len(kept)} remain"
+        )
+    return kept
+
+
 async def process_chunks_unified(
     query: str,
     unique_chunks: list[dict],
@@ -6320,6 +6407,13 @@ async def process_chunks_unified(
         return []
 
     origin_count = len(unique_chunks)
+
+    # 0. Drop reference-list chunks before they can reach the reranker or take
+    #    a chunk_top_k / token-budget slot (opt-in, DROP_BIBLIOGRAPHY_CHUNKS)
+    if global_config.get("drop_bibliography_chunks"):
+        unique_chunks = filter_bibliography_chunks(unique_chunks)
+        if not unique_chunks:
+            return []
 
     # 1. Apply reranking if enabled and query is provided
     if query_param.enable_rerank and query and unique_chunks:
