@@ -250,6 +250,8 @@ LIGHTRAG_PARSER=pdf:legacy-R(chunk_ts=800,chunk_ol=80);*:legacy-R  # 规则
 文本 API 以 `chunking.strategy="custom"` 暴露同一路径；`params` 使用完整的 fixed-token/legacy 参数契约（`chunk_token_size`、`chunk_overlap_token_size`、`split_by_character`、`split_by_character_only`）。如果没有替换 `LightRAG.chunking_func`，`/documents/text` 与 `/documents/texts` 会返回 422。
 
 > `drop_references` 检测调参 `CHUNK_P_REFERENCES_TAIL_N`（默认 `0`：扫描全部内容块；正数表示只扫描文末最后 N 块）/ `CHUNK_P_REFERENCES_HEADINGS`（竖线分隔，默认 `References\|Bibliography\|参考文献`）仅经环境变量、运行时实时读取。drop_references可以通过环境变量 `CHUNK_P_DROP_REFERENCES` 设置为全局默认值.
+>
+> 分块期删除覆盖不到的参考文献列表——其他分块策略、没有可用 sidecar 的 `P` 文档、标题未匹配的列表、在开启前已完成分块的文档——可以改用 `DROP_BIBLIOGRAPHY_CHUNKS` 在查询时从候选文本块中剔除，见 [BibliographyChunkFilter.md](./design/BibliographyChunkFilter.md)。
 
 ### 2.7 校验、优先级与回退
 
@@ -1312,5 +1314,5 @@ per-file 个性化的典型场景：管理 UI 单独配置某个文件的 separa
 | 目录 | `INPUT_DIR`、`WORKING_DIR`、`SCAN_SPOOL_DIR` | §6、§7.4 |
 | 并发 | `MAX_PARALLEL_*`、`QUEUE_SIZE_*` | §8.6 |
 | 准入与限制 | `MAX_UPLOAD_SIZE`、`MAX_REQUEST_BODY_BYTES`、`MAX_TEXTS_PER_REQUEST`、`MAX_PENDING_DOCUMENTS`、`PIPELINE_*`、`MAX_UNACKED_MANUAL_RETRIES`、`SCAN_ENQUEUE_BATCH_SIZE` | §8.7 |
-| 查询期（不影响分块） | `ENABLE_CONTENT_HEADINGS` —— 组装回答上下文时为每个分块追加其标题路径；它不改变分块边界，也不改变已存储的分块文本 | [LightRAG Server](./LightRAG-API-Server-zh.md) |
+| 查询期（不影响分块） | `ENABLE_CONTENT_HEADINGS` —— 组装回答上下文时为每个分块追加其标题路径；`DROP_BIBLIOGRAPHY_CHUNKS` —— 从查询候选中剔除参考文献列表分块。二者都不改变分块边界，也不改变已存储的分块文本 | [LightRAG Server](./LightRAG-API-Server-zh.md) |
 | 离线 / 分词器 | `TIKTOKEN_CACHE_DIR` | [OfflineDeployment.md](./OfflineDeployment.md) |

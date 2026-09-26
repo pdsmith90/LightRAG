@@ -389,6 +389,7 @@ LightRAG 的默认存储全部都是基于文件进行持久化的内存数据�
 - **ENABLE_CONTENT_HEADINGS**：控制是否把文本块所在的章节标题送给LLM；默认开启，可以为LLM提供更加丰富的上下文信息，提高回答质量。
 - **ENABLE_LLM_CACHE**：是否允许缓存查询结果。默认开启，相同的查询问题、查询模式、LLM模型参数将返回相同的结果。
 - **USER_PROMPT_PREFIX / USER_PROMPT_PREFIX_FILE**：拼接在每个请求的 `user_prompt` 前面的全局指令（对应回答提示词中的"Additional Instructions"部分），为运维方提供一个统一定制LLM输出的入口。拼接是逐字节的、不会自动插入分隔符，请自行在内容结尾加上 `\n\n`。如果请求的 `user_prompt` 为空，该前缀将单独成为送给 LLM 的指令；只有 API 字段 `disable_user_prompt_prefix` 能禁用它，且请求无法读取或替换它。较长或多段落的内容请使用 `USER_PROMPT_PREFIX_FILE`（`PROMPT_DIR/user_prompt` 目录下的 `.md`/`.txt` 文件名），因为 `.env` 中的值必须写在一行内。
+- **DROP_BIBLIOGRAPHY_CHUNKS**：在重排序之前，从每次查询的候选文本块中剔除内容为参考文献列表的文本块；默认关闭。参考文献列表与论文标题的用词高度重合，在学术论文知识库中容易把引用它们的正文挤出上下文。它是 `CHUNK_P_DROP_REFERENCES` 在查询阶段的对应选项：适用于所有分块策略，也适用于已经入库的文档，但无法省去入库时参考文献带来的实体关系抽取开销。详见 [docs/design/BibliographyChunkFilter.md](./docs/design/BibliographyChunkFilter.md)。
 
 ### WebUI 入口与默认入口
 

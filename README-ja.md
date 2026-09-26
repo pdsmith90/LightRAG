@@ -389,6 +389,7 @@ LightRAG は4種類のバックエンドストレージを必要とします:
 - **ENABLE_CONTENT_HEADINGS**: テキストチャンクが存在するセクション見出しを LLM に送信するかどうかを制御します。デフォルトで有効で、LLM により豊富なコンテキストを提供し、回答品質を向上させます。
 - **ENABLE_LLM_CACHE**: クエリ結果をキャッシュするかどうか。デフォルトで有効です。同一のクエリ質問、クエリモード、LLM モデルパラメータであれば同じ結果を返します。
 - **USER_PROMPT_PREFIX / USER_PROMPT_PREFIX_FILE**: すべてのリクエストの `user_prompt` の前に連結されるグローバル指示（回答プロンプトの「Additional Instructions」セクション）で、LLM の出力を運用側から一括してカスタマイズできます。連結は逐語的でセパレータは挿入されないため、値の末尾に `\n\n` を自分で付けてください。リクエストの `user_prompt` が空の場合、この前置きだけが LLM に送られる指示になります。無効化できるのは API フィールド `disable_user_prompt_prefix` のみで、読み取りや置き換えはできません。長文や複数段落には `USER_PROMPT_PREFIX_FILE`（`PROMPT_DIR/user_prompt` 配下の `.md`/`.txt` ファイル名）を使用してください。`.env` の値は 1 行に収める必要があります。
+- **DROP_BIBLIOGRAPHY_CHUNKS**: リランキングの前に、参考文献リストであるテキストチャンクを各クエリの候補から除外します。デフォルトは無効です。参考文献リストは論文タイトルと語彙が大きく重なるため、学術論文のナレッジベースでは、それを引用している本文をコンテキストから押し出しがちです。`CHUNK_P_DROP_REFERENCES` のクエリ時版にあたり、すべてのチャンク戦略と取り込み済みのドキュメントに効きますが、取り込み時に参考文献から行われるエンティティ・関係抽出のコストは削減しません。詳細は [docs/design/BibliographyChunkFilter.md](./docs/design/BibliographyChunkFilter.md) を参照してください。
 
 ### WebUI エントリとデフォルトエントリ
 

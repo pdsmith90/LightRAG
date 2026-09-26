@@ -250,6 +250,8 @@ Currently supported parameters (canonical name / short alias):
 The text APIs expose the same path as `chunking.strategy="custom"`. Its `params` object uses the complete fixed-token/legacy contract (`chunk_token_size`, `chunk_overlap_token_size`, `split_by_character`, and `split_by_character_only`). `/documents/text` and `/documents/texts` return 422 unless `LightRAG.chunking_func` was replaced with a non-default callback.
 
 > `drop_references` detection knobs `CHUNK_P_REFERENCES_TAIL_N` (default `0`: scan all content blocks; a positive value scans only the last N) / `CHUNK_P_REFERENCES_HEADINGS` (pipe-separated, default `References\|Bibliography\|参考文献`) are env-only and read live at run time. Global default can be set via env var `CHUNK_P_DROP_REFERENCES`.
+>
+> Reference lists that this chunk-time drop cannot reach — other chunking strategies, a `P` document without a usable sidecar, a list under an unmatched heading, documents chunked before it was enabled — can be filtered from query candidates instead with `DROP_BIBLIOGRAPHY_CHUNKS`; see [BibliographyChunkFilter.md](./design/BibliographyChunkFilter.md).
 
 ### 2.7 Validation, Priority, and Fallback
 
@@ -1312,5 +1314,5 @@ Where to find each family of file-processing variables. This is an index, not a 
 | Directories | `INPUT_DIR`, `WORKING_DIR`, `SCAN_SPOOL_DIR` | §6, §7.4 |
 | Concurrency | `MAX_PARALLEL_*`, `QUEUE_SIZE_*` | §8.6 |
 | Admission and limits | `MAX_UPLOAD_SIZE`, `MAX_REQUEST_BODY_BYTES`, `MAX_TEXTS_PER_REQUEST`, `MAX_PENDING_DOCUMENTS`, `PIPELINE_*`, `MAX_UNACKED_MANUAL_RETRIES`, `SCAN_ENQUEUE_BATCH_SIZE` | §8.7 |
-| Query-time (not chunking) | `ENABLE_CONTENT_HEADINGS` — appends each chunk's heading path when assembling the answer context; it does not change chunk boundaries or stored chunk text | [LightRAG Server](./LightRAG-API-Server.md) |
+| Query-time (not chunking) | `ENABLE_CONTENT_HEADINGS` — appends each chunk's heading path when assembling the answer context; `DROP_BIBLIOGRAPHY_CHUNKS` — drops reference-list chunks from query candidates. Neither changes chunk boundaries or stored chunk text | [LightRAG Server](./LightRAG-API-Server.md) |
 | Offline / tokenizer | `TIKTOKEN_CACHE_DIR` | [OfflineDeployment.md](./OfflineDeployment.md) |
