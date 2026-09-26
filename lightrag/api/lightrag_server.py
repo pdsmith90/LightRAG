@@ -1662,6 +1662,12 @@ def create_app(args):
     # create_app working for callers that build args programmatically.
     ai_content_notice_enabled = bool(getattr(args, "enable_ai_content_notice", False))
 
+    # ENABLE_QUERY_BUDGET_CEILING: the configured retrieval budgets become
+    # per-request maxima on the query routes. Off when args predates the switch.
+    query_budget_ceiling_enabled = bool(
+        getattr(args, "enable_query_budget_ceiling", False)
+    )
+
     base_description = (
         "Providing API for LightRAG core, Web UI and Ollama Model Emulation"
     )
@@ -2538,7 +2544,14 @@ def create_app(args):
     # root_path is set on the app for reverse proxy support;
     # routes stay at their natural paths and are prefixed by the proxy or uvicorn --root-path
     app.include_router(create_document_routes(rag, doc_manager, api_key))
-    app.include_router(create_query_routes(rag, api_key, args.top_k))
+    app.include_router(
+        create_query_routes(
+            rag,
+            api_key,
+            args.top_k,
+            enable_query_budget_ceiling=query_budget_ceiling_enabled,
+        )
+    )
     app.include_router(create_graph_routes(rag, api_key))
     # Public read-only customization surface — registered unconditionally:
     # without a bundle it answers 200 {"customized": false, ...}.
@@ -2978,6 +2991,7 @@ def create_app(args):
                         "cosine_threshold": args.cosine_threshold,
                         "min_rerank_score": args.min_rerank_score,
                         "related_chunk_number": args.related_chunk_number,
+                        "enable_query_budget_ceiling": query_budget_ceiling_enabled,
                         "max_async": args.max_async,
                         "llm_timeout": args.llm_timeout,
                         "embedding_func_max_async": args.embedding_func_max_async,

@@ -923,6 +923,11 @@ def parse_args() -> argparse.Namespace:
     args.max_total_tokens = get_env_value(
         "MAX_TOTAL_TOKENS", DEFAULT_MAX_TOTAL_TOKENS, int
     )
+    # Opt-in: the five values above become per-request maxima for /query*,
+    # not only defaults (see QUERY_BUDGET_FIELDS in routers/query_routes.py)
+    args.enable_query_budget_ceiling = get_env_value(
+        "ENABLE_QUERY_BUDGET_CEILING", False, bool
+    )
     args.cosine_threshold = get_env_value(
         "COSINE_THRESHOLD", DEFAULT_COSINE_THRESHOLD, float
     )

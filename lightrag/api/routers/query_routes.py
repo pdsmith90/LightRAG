@@ -31,6 +31,38 @@ from lightrag.zotero_citations import (
 )
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+# Retrieval knobs a request may set that also have a server-configured value
+# (TOP_K, CHUNK_TOP_K, MAX_ENTITY_TOKENS, MAX_RELATION_TOKENS, MAX_TOTAL_TOKENS).
+# With ENABLE_QUERY_BUDGET_CEILING that value is a request's maximum as well as
+# its default.
+QUERY_BUDGET_FIELDS = (
+    "top_k",
+    "chunk_top_k",
+    "max_entity_tokens",
+    "max_relation_tokens",
+    "max_total_tokens",
+)
+
+
+def _apply_query_budget_ceiling(param: QueryParam) -> None:
+    """Lower every ``QUERY_BUDGET_FIELDS`` value above its server default to it.
+
+    The ceiling is the ``QueryParam`` field default, i.e. exactly what an
+    omitted field resolves to, so an omitted field can never be clamped. Values
+    at or below it are left alone. One INFO line names each lowered field with
+    its requested and applied value and nothing else: never the query or any
+    other request text.
+    """
+    defaults = QueryParam()
+    lowered = []
+    for name in QUERY_BUDGET_FIELDS:
+        requested, ceiling = getattr(param, name), getattr(defaults, name)
+        if requested > ceiling:
+            setattr(param, name, ceiling)
+            lowered.append(f"{name} {requested}->{ceiling}")
+    if lowered:
+        logger.info(f"Query budget ceiling lowered {', '.join(lowered)}")
+
 
 class QueryRequest(BaseModel):
     query: str = Field(
@@ -68,33 +100,33 @@ class QueryRequest(BaseModel):
         ge=1,
         le=MAX_QUERY_TOP_K,
         default=None,
-        description="Number of top items to retrieve. Represents entities in 'local' mode and relationships in 'global' mode.",
+        description="Number of top items to retrieve. Represents entities in 'local' mode and relationships in 'global' mode. Lowered to the server's TOP_K when ENABLE_QUERY_BUDGET_CEILING is on.",
     )
 
     chunk_top_k: Optional[int] = Field(
         ge=1,
         le=MAX_QUERY_TOP_K,
         default=None,
-        description="Number of text chunks to retrieve initially from vector search and keep after reranking.",
+        description="Number of text chunks to retrieve initially from vector search and keep after reranking. Lowered to the server's CHUNK_TOP_K when ENABLE_QUERY_BUDGET_CEILING is on.",
     )
 
     max_entity_tokens: Optional[int] = Field(
         default=None,
-        description="Maximum number of tokens allocated for entity context in unified token control system.",
+        description="Maximum number of tokens allocated for entity context in unified token control system. Lowered to the server's MAX_ENTITY_TOKENS when ENABLE_QUERY_BUDGET_CEILING is on.",
         ge=1,
         le=MAX_QUERY_TOKEN_BUDGET,
     )
 
     max_relation_tokens: Optional[int] = Field(
         default=None,
-        description="Maximum number of tokens allocated for relationship context in unified token control system.",
+        description="Maximum number of tokens allocated for relationship context in unified token control system. Lowered to the server's MAX_RELATION_TOKENS when ENABLE_QUERY_BUDGET_CEILING is on.",
         ge=1,
         le=MAX_QUERY_TOKEN_BUDGET,
     )
 
     max_total_tokens: Optional[int] = Field(
         default=None,
-        description="Maximum total tokens budget for the entire query context (entities + relations + chunks + system prompt).",
+        description="Maximum total tokens budget for the entire query context (entities + relations + chunks + system prompt). Lowered to the server's MAX_TOTAL_TOKENS when ENABLE_QUERY_BUDGET_CEILING is on.",
         ge=1,
         le=MAX_QUERY_TOKEN_BUDGET,
     )
@@ -261,8 +293,16 @@ class QueryRequest(BaseModel):
             )
         return self
 
-    def to_query_params(self, is_stream: bool) -> "QueryParam":
-        """Converts a QueryRequest instance into a QueryParam instance."""
+    def to_query_params(
+        self, is_stream: bool, apply_budget_ceiling: bool = False
+    ) -> "QueryParam":
+        """Converts a QueryRequest instance into a QueryParam instance.
+
+        Every query route converts through here, so a rule applied here reaches
+        all of them. ``apply_budget_ceiling`` (the server's
+        ``ENABLE_QUERY_BUDGET_CEILING``) caps the ``QUERY_BUDGET_FIELDS`` at
+        their server defaults; off, they pass through as sent.
+        """
         # Use Pydantic's `.model_dump(exclude_none=True)` to remove None values automatically
         # Exclude API-level parameters that don't belong in QueryParam
         request_data = self.model_dump(
@@ -273,6 +313,8 @@ class QueryRequest(BaseModel):
         # Ensure `mode` and `stream` are set explicitly
         param = QueryParam(**request_data)
         param.stream = is_stream
+        if apply_budget_ceiling:
+            _apply_query_budget_ceiling(param)
         return param
 
 
@@ -373,7 +415,12 @@ class StreamChunkResponse(BaseModel):
     )
 
 
-def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
+def create_query_routes(
+    rag,
+    api_key: Optional[str] = None,
+    top_k: int = 60,
+    enable_query_budget_ceiling: bool = False,
+):
     # Fresh router per call. A module-level instance would accumulate
     # duplicate routes when the factory is invoked more than once in the
     # same process (e.g. across tests), which triggers FastAPI's
@@ -602,7 +649,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
         """
         try:
             param = request.to_query_params(
-                False
+                False, apply_budget_ceiling=enable_query_budget_ceiling
             )  # Ensure stream=False for non-streaming endpoint
             # Force stream=False for /query endpoint regardless of include_references setting
             param.stream = False
@@ -1043,7 +1090,9 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
         try:
             # Use the stream parameter from the request, defaulting to True if not specified
             stream_mode = request.stream if request.stream is not None else True
-            param = request.to_query_params(stream_mode)
+            param = request.to_query_params(
+                stream_mode, apply_budget_ceiling=enable_query_budget_ceiling
+            )
 
             from fastapi.responses import StreamingResponse
 
@@ -1585,7 +1634,9 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             as structured data analysis typically requires source attribution.
         """
         try:
-            param = request.to_query_params(False)  # No streaming for data endpoint
+            param = request.to_query_params(
+                False, apply_budget_ceiling=enable_query_budget_ceiling
+            )  # No streaming for data endpoint
             response = await rag.aquery_data(request.query, param=param)
 
             # aquery_data returns the new format with status, message, data, and metadata
