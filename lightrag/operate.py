@@ -4886,6 +4886,14 @@ async def kg_query(
         "\n<kg_chunk_selection>\n",
         related_chunk_number,
         kg_chunk_pick_method,
+        # Also from `retrieval_config`: that is the dict process_chunks_unified
+        # reads on this path. Present only when on, so entries written with
+        # the filter off keep their key.
+        *(
+            ("\n<drop_bibliography_chunks>\n",)
+            if retrieval_config.get("drop_bibliography_chunks")
+            else ()
+        ),
         *(("\n<system_prompt>\n", system_prompt) if system_prompt else ()),
         "\n<llm_identity>\n",
         serialize_llm_cache_identity(llm_cache_identity),
@@ -7049,6 +7057,13 @@ async def naive_query(
         effective_user_prompt.text,
         query_param.enable_rerank,
         global_config.get("enable_content_headings", False),
+        # Present only when on, so entries written with the filter off keep
+        # their key.
+        *(
+            ("\n<drop_bibliography_chunks>\n",)
+            if global_config.get("drop_bibliography_chunks")
+            else ()
+        ),
         *(("\n<system_prompt>\n", system_prompt) if system_prompt else ()),
         "\n<llm_identity>\n",
         serialize_llm_cache_identity(llm_cache_identity),

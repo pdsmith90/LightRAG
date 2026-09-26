@@ -61,6 +61,7 @@ from lightrag.constants import (
     DEFAULT_RELATED_CHUNK_NUMBER,
     DEFAULT_KG_CHUNK_PICK_METHOD,
     DEFAULT_MIN_RERANK_SCORE,
+    DEFAULT_DROP_BIBLIOGRAPHY_CHUNKS,
     DEFAULT_SUMMARY_MAX_TOKENS,
     DEFAULT_SUMMARY_CONTEXT_SIZE,
     DEFAULT_SUMMARY_LENGTH_RECOMMENDED,
@@ -1358,6 +1359,31 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
     order is public API, and a field inserted mid-class silently rebinds every
     positional argument after it. Placing it next to its logical neighbour
     shifted 43 of them. See ``tests/test_dataclass_positional_compatibility.py``.
+    """
+
+    # Declared last for the same reason as `user_prompt_prefix` above.
+    drop_bibliography_chunks: bool = field(
+        default_factory=lambda: get_env_value(
+            "DROP_BIBLIOGRAPHY_CHUNKS", DEFAULT_DROP_BIBLIOGRAPHY_CHUNKS, bool
+        )
+    )
+    """Drop reference-list chunks from every query's chunk candidates.
+
+    Applied in :func:`lightrag.utils.process_chunks_unified` before rerank,
+    ``chunk_top_k`` and token truncation, in every retrieval mode, so a
+    bibliography chunk can neither take a context slot nor be sent to the
+    reranker. KG modes refill the freed slots when their candidate pool
+    exceeds ``chunk_top_k``; ``naive`` fetches exactly ``chunk_top_k`` chunks,
+    so there the context shrinks instead. Detection reads chunk text only
+    (:func:`lightrag.utils.is_bibliography_chunk`), so it covers every chunker
+    and documents ingested before it was enabled. Stored chunks, entities and
+    relations are untouched. Off by default; env ``DROP_BIBLIOGRAPHY_CHUNKS``.
+    The chunk-time counterpart is the paragraph-semantic ``drop_references``
+    option.
+
+    Set it at construction: KG modes read it from the config snapshot the
+    storages take then, so a later assignment on a live instance does not
+    reach them.
     """
 
     def _mark_addon_params_dirty(self) -> None:

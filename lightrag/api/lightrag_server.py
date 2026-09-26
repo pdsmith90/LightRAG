@@ -3034,6 +3034,7 @@ def create_app(args):
                         "cosine_threshold": args.cosine_threshold,
                         "min_rerank_score": args.min_rerank_score,
                         "related_chunk_number": args.related_chunk_number,
+                        "drop_bibliography_chunks": args.drop_bibliography_chunks,
                         "max_async": args.max_async,
                         "llm_timeout": args.llm_timeout,
                         "embedding_func_max_async": args.embedding_func_max_async,
