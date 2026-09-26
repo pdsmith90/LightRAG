@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local configuration and secrets
+.env
+.env.*
+*.env
+
+# Data and generated outputs (keep your library's data out of the repository)
+zotero_metadata.json
+rag_corpus/
+*_junk_quarantine/
+.manifest.jsonl
+dangling_refs_plan.json
+dangling_refs_plan.json.done
+
+# Logs
+*.log
+
+# Editors and OS files
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store

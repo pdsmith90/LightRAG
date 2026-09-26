@@ -1,0 +1,9 @@
+# Everything the offline test suite needs: each component's runtime dependencies plus pytest.
+#   python3 -m pip install -r requirements-dev.txt
+# The PostgreSQL/AGE integration test additionally needs lightrag-hku==1.5.7 and a scratch
+# database; see maintenance/README.md. Without CLEAN_DANGLING_TEST_DSN it is skipped.
+-r corpus/requirements.txt
+-r mcp/requirements.txt
+-r maintenance/requirements.txt
+-r fronts/requirements.txt
+pytest>=7.0,<10
