@@ -75,6 +75,16 @@ edge. Below Apache AGE 1.8.0 every Cypher `DELETE` scans each edge label table, 
 the old path slowed as the graph grew. What is removed is unchanged: every edge
 between each pair, of any label and in either direction, with the vertices kept.
 
+### Tests
+
+The unit tests for these changes, including the upstream tests the branch modifies,
+are marked `offline`, so upstream's
+[.github/workflows/tests.yml](./.github/workflows/tests.yml) runs them; on this branch it
+also triggers on pushes and pull requests to `zlightrag`. The exception is the Apache
+AGE integration test for the edge removal,
+`tests/kg/postgres_impl/test_postgres_remove_edges_age.py`, which needs
+`--run-integration` and a live AGE server; no workflow runs it.
+
 ## `zotero-toolkit/`
 
 Scripts that sit beside LightRAG rather than inside it: a corpus builder that turns a

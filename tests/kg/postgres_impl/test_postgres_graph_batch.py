@@ -221,6 +221,7 @@ async def test_remove_nodes_empty_noop():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.offline
 @pytest.mark.asyncio
 async def test_remove_edges_one_transaction_per_chunk():
     storage, cap = make_graph_storage(max_delete_records=2)
@@ -243,6 +244,7 @@ async def test_remove_edges_one_transaction_per_chunk():
     ]
 
 
+@pytest.mark.offline
 @pytest.mark.asyncio
 async def test_remove_edges_binds_ids_never_interpolates():
     """Entity ids (injection-shaped or unicode) reach the server only as params."""
@@ -264,6 +266,7 @@ async def test_remove_edges_binds_ids_never_interpolates():
     assert '"test_graph"._ag_label_edge' in call["sql"]
 
 
+@pytest.mark.offline
 @pytest.mark.asyncio
 async def test_remove_edges_strips_nul_bytes():
     """NUL bytes are stripped like the other delete paths (text cannot hold one)."""
@@ -275,6 +278,7 @@ async def test_remove_edges_strips_nul_bytes():
     assert call["args"] == (["AB"], ["C"])
 
 
+@pytest.mark.offline
 @pytest.mark.asyncio
 async def test_remove_edges_empty_noop():
     storage, cap = make_graph_storage()

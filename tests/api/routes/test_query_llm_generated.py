@@ -192,6 +192,7 @@ def test_stream_complete_response_line_carries_the_verdict():
     assert content_lines[0]["llm_generated"] is False
 
 
+@pytest.mark.offline
 def test_streamed_chunks_carry_no_verdict():
     """Chunks exist only when the LLM is streaming, so a per-chunk flag would
     be noise — the client's default already reads them as generated."""
