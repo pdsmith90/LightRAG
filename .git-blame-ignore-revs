@@ -4,3 +4,6 @@
 #
 # style: apply ruff 0.15 formatting across repo
 21f4e698e555ace903ffc725e2914fe57b660bb1
+#
+# style(zotero-toolkit): apply the repository's ruff format
+1dd1287cd071f0511c26cd174ebbb89c0c6d5fcf
