@@ -521,6 +521,9 @@ def test_shared_dispatch_uses_the_fallback_as_a_second_worker(
         chat(front, model="extract")[1]["X-LLM-Failover-Backend"] == "primary"
     )  # free primary slot
 
+    # The front releases a slot only after it has sent the reply: wait for that release,
+    # or its late decrement undoes the mark below.
+    assert fakes.wait_until(lambda: fo._inflight["primary"] == 0)
     fo._inflight["primary"] = 1  # the primary's only slot is busy
     assert chat(front, model="extract")[1]["X-LLM-Failover-Backend"] == "fallback"
     assert fo._primary_down_until == 0.0  # sharing is not a failure
