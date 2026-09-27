@@ -47,6 +47,7 @@ Usage:
   python3 quarantine_junk.py --corpus ~/Zotero/rag_corpus [--min-junk 0.90]
                              [--denylist junk_denylist.txt,dupe_denylist.txt] [--dry-run]
 """
+
 from __future__ import annotations
 import argparse, json, os, re, shutil, sys, time
 
@@ -91,19 +92,37 @@ def load_denylist(path: str) -> set[str]:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--corpus", default=os.path.expanduser("~/Zotero/rag_corpus"),
-                    help="Corpus dir; only its top level (pending ingest) is scanned.")
-    ap.add_argument("--quarantine", default=None,
-                    help="Destination (default: <corpus>_junk_quarantine).")
-    ap.add_argument("--denylist", default="",
-                    help="Comma-separated denylist files (keys or exact .md filenames); "
-                         "pass build_corpus.py the same list. Default: none.")
-    ap.add_argument("--min-junk", type=float, default=0.90,
-                    help="Move files at or above this junk ratio (default: 0.90).")
-    ap.add_argument("--min-chars", type=int, default=500,
-                    help="Ignore files smaller than this (default: 500).")
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument(
+        "--corpus",
+        default=os.path.expanduser("~/Zotero/rag_corpus"),
+        help="Corpus dir; only its top level (pending ingest) is scanned.",
+    )
+    ap.add_argument(
+        "--quarantine",
+        default=None,
+        help="Destination (default: <corpus>_junk_quarantine).",
+    )
+    ap.add_argument(
+        "--denylist",
+        default="",
+        help="Comma-separated denylist files (keys or exact .md filenames); "
+        "pass build_corpus.py the same list. Default: none.",
+    )
+    ap.add_argument(
+        "--min-junk",
+        type=float,
+        default=0.90,
+        help="Move files at or above this junk ratio (default: 0.90).",
+    )
+    ap.add_argument(
+        "--min-chars",
+        type=int,
+        default=500,
+        help="Ignore files smaller than this (default: 500).",
+    )
     ap.add_argument("--dry-run", action="store_true", help="Report only; move nothing.")
     a = ap.parse_args()
 
@@ -117,7 +136,7 @@ def main() -> int:
     hits = []
     for name in sorted(os.listdir(corpus)):
         if not name.endswith(".md"):
-            continue                      # skips __parsed__/ too: it is a directory
+            continue  # skips __parsed__/ too: it is a directory
         path = os.path.join(corpus, name)
         if not os.path.isfile(path):
             continue
@@ -133,8 +152,10 @@ def main() -> int:
             hits.append(("ratio", junk_ratio(text), len(text), name))
 
     if not hits:
-        print(f"quarantine_junk: 0 junk files "
-              f"(ratio>={a.min_junk:.0%} or on denylist[{len(deny)}]) in {corpus}")
+        print(
+            f"quarantine_junk: 0 junk files "
+            f"(ratio>={a.min_junk:.0%} or on denylist[{len(deny)}]) in {corpus}"
+        )
         return 0
 
     hits.sort(key=lambda h: -h[1])
@@ -143,10 +164,19 @@ def main() -> int:
     moved, failed, records = 0, 0, []
     stamp = time.strftime("%F %T")
     for reason, r, size, name in hits:
-        print(f"quarantine_junk: {'DRY ' if a.dry_run else ''}[{reason:8s}] "
-              f"{r:6.1%} junk, {size:9d} chars — {name}")
-        records.append({"ts": stamp, "file": name, "reason": reason,
-                        "junk_ratio": round(r, 4), "chars": size})
+        print(
+            f"quarantine_junk: {'DRY ' if a.dry_run else ''}[{reason:8s}] "
+            f"{r:6.1%} junk, {size:9d} chars — {name}"
+        )
+        records.append(
+            {
+                "ts": stamp,
+                "file": name,
+                "reason": reason,
+                "junk_ratio": round(r, 4),
+                "chars": size,
+            }
+        )
         if a.dry_run:
             continue
         try:
@@ -158,7 +188,9 @@ def main() -> int:
 
     if not a.dry_run and records:
         try:
-            with open(os.path.join(qdir, "quarantined.jsonl"), "a", encoding="utf-8") as fh:
+            with open(
+                os.path.join(qdir, "quarantined.jsonl"), "a", encoding="utf-8"
+            ) as fh:
                 for rec in records:
                     fh.write(json.dumps(rec) + "\n")
         except OSError as e:
@@ -169,14 +201,16 @@ def main() -> int:
     byreason = {}
     for reason, *_ in hits:
         byreason[reason] = byreason.get(reason, 0) + 1
-    print(f"quarantine_junk: {verb} {n} file(s) {byreason} -> {qdir}"
-          + (f"; {failed} failed" if failed else ""))
+    print(
+        f"quarantine_junk: {verb} {n} file(s) {byreason} -> {qdir}"
+        + (f"; {failed} failed" if failed else "")
+    )
     return 0
 
 
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except Exception as e:                 # never break a scheduled corpus update
+    except Exception as e:  # never break a scheduled corpus update
         print(f"quarantine_junk: ERROR {type(e).__name__}: {e}")
         sys.exit(0)

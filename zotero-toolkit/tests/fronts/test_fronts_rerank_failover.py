@@ -1,4 +1,5 @@
 """Offline tests for fronts/rerank_failover.py against stdlib fake primary/fallback rerankers."""
+
 from __future__ import annotations
 
 import importlib.util
@@ -8,18 +9,31 @@ from pathlib import Path
 
 import pytest
 
-_spec = importlib.util.spec_from_file_location("fronts_test_fakes", Path(__file__).with_name("_fakes.py"))
+_spec = importlib.util.spec_from_file_location(
+    "fronts_test_fakes", Path(__file__).with_name("_fakes.py")
+)
 fakes = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(fakes)
 
 rr = fakes.load_front("rerank_failover.py", "fronts_rerank_failover", ("RERANK_FO_",))
 
 RERANK = "/v1/rerank"
-REQUEST = {"model": "reranker", "query": "what does a knowledge graph store?", "documents": ["a", "b", "c"], "top_n": 2}
+REQUEST = {
+    "model": "reranker",
+    "query": "what does a knowledge graph store?",
+    "documents": ["a", "b", "c"],
+    "top_n": 2,
+}
 
 
 def ranked(tag):
-    return {"results": [{"index": 1, "relevance_score": 0.9}, {"index": 0, "relevance_score": 0.2}], "by": tag}
+    return {
+        "results": [
+            {"index": 1, "relevance_score": 0.9},
+            {"index": 0, "relevance_score": 0.2},
+        ],
+        "by": tag,
+    }
 
 
 @pytest.fixture(autouse=True)
@@ -44,8 +58,13 @@ def fallback():
 
 @pytest.fixture
 def front(monkeypatch, primary, fallback):
-    for name, value in {"PRIMARY": primary.url, "FALLBACK": fallback.url, "PRIMARY_TIMEOUT": 5.0,
-                        "FALLBACK_TIMEOUT": 5.0, "_primary_down_until": 0.0}.items():
+    for name, value in {
+        "PRIMARY": primary.url,
+        "FALLBACK": fallback.url,
+        "PRIMARY_TIMEOUT": 5.0,
+        "FALLBACK_TIMEOUT": 5.0,
+        "_primary_down_until": 0.0,
+    }.items():
         monkeypatch.setattr(rr, name, value)
     with fakes.serve(rr) as url:
         yield url
@@ -57,8 +76,14 @@ def rerank(front):
 
 def test_defaults_are_loopback():
     assert rr.LISTEN == ("127.0.0.1", 19510)
-    assert rr.PRIMARY == "http://127.0.0.1:8080" and rr.FALLBACK == "http://127.0.0.1:8081"
-    assert (rr.PRIMARY_TIMEOUT, rr.FALLBACK_TIMEOUT, rr.BREAKER_SECS) == (90.0, 290.0, 60.0)
+    assert (
+        rr.PRIMARY == "http://127.0.0.1:8080" and rr.FALLBACK == "http://127.0.0.1:8081"
+    )
+    assert (rr.PRIMARY_TIMEOUT, rr.FALLBACK_TIMEOUT, rr.BREAKER_SECS) == (
+        90.0,
+        290.0,
+        60.0,
+    )
     assert rr.PRIMARY_API_KEY == "" and rr.FALLBACK_API_KEY == "" and rr.LOG == ""
 
 
@@ -80,7 +105,9 @@ def test_refused_connection_falls_back(front, fallback, monkeypatch):
     assert rr._primary_down_until > time.time()
 
 
-def test_http_500_opens_the_breaker_which_closes_after_its_time(front, primary, fallback, monkeypatch, tmp_path):
+def test_http_500_opens_the_breaker_which_closes_after_its_time(
+    front, primary, fallback, monkeypatch, tmp_path
+):
     log = tmp_path / "rr.log"
     monkeypatch.setattr(rr, "LOG", str(log))
     monkeypatch.setattr(rr, "BREAKER_SECS", 0.4)
@@ -89,7 +116,7 @@ def test_http_500_opens_the_breaker_which_closes_after_its_time(front, primary, 
 
     assert json.loads(rerank(front)[2])["by"] == "fallback"
     assert json.loads(rerank(front)[2])["by"] == "fallback"
-    assert len(primary.hits("POST", RERANK)) == 1         # second call skipped the primary
+    assert len(primary.hits("POST", RERANK)) == 1  # second call skipped the primary
     text = log.read_text()
     assert "status=500" in text and "-> fallback" in text and "(breaker)" in text
 
@@ -114,9 +141,13 @@ def test_timeout_falls_back(front, primary, fallback, monkeypatch):
     assert time.time() - t0 < 1.4
 
 
-def test_fallback_status_passes_through_and_both_down_is_502(front, fallback, monkeypatch):
+def test_fallback_status_passes_through_and_both_down_is_502(
+    front, fallback, monkeypatch
+):
     monkeypatch.setattr(rr, "PRIMARY", f"http://127.0.0.1:{fakes.free_port()}")
-    fallback.route("POST", RERANK, lambda h, b: fakes.reply(h, 422, {"error": "input too long"}))
+    fallback.route(
+        "POST", RERANK, lambda h, b: fakes.reply(h, 422, {"error": "input too long"})
+    )
     status, _, body = rerank(front)
     assert status == 422 and json.loads(body) == {"error": "input too long"}
     monkeypatch.setattr(rr, "FALLBACK", f"http://127.0.0.1:{fakes.free_port()}")
@@ -130,16 +161,24 @@ def test_api_keys_travel_as_bearer_headers(front, primary, fallback, monkeypatch
     primary.route("POST", RERANK, lambda h, b: fakes.reply(h, 503, {}))
     fallback.route("POST", RERANK, lambda h, b: fakes.reply(h, 200, ranked("fallback")))
     rerank(front)
-    assert primary.hits("POST", RERANK)[0]["headers"]["authorization"] == "Bearer pk-test"
-    assert fallback.hits("POST", RERANK)[0]["headers"]["authorization"] == "Bearer fk-test"
+    assert (
+        primary.hits("POST", RERANK)[0]["headers"]["authorization"] == "Bearer pk-test"
+    )
+    assert (
+        fallback.hits("POST", RERANK)[0]["headers"]["authorization"] == "Bearer fk-test"
+    )
 
 
 def test_health(front, primary, fallback, monkeypatch):
     primary.route("GET", "/v1/models", lambda h, b: fakes.reply(h, 200, {"data": []}))
     fallback.route("GET", "/health", lambda h, b: fakes.reply(h, 200, {"status": "ok"}))
     status, _, body = fakes.call("GET", front + "/health")
-    assert status == 200 and json.loads(body) == {"status": "ok", "primary": True, "fallback": True,
-                                                  "breaker_open": False}
+    assert status == 200 and json.loads(body) == {
+        "status": "ok",
+        "primary": True,
+        "fallback": True,
+        "breaker_open": False,
+    }
 
     monkeypatch.setattr(rr, "PRIMARY", f"http://127.0.0.1:{fakes.free_port()}")
     status, _, body = fakes.call("GET", front + "/health")
@@ -148,8 +187,12 @@ def test_health(front, primary, fallback, monkeypatch):
     rr._primary_down_until = time.time() + 30
     monkeypatch.setattr(rr, "FALLBACK", f"http://127.0.0.1:{fakes.free_port()}")
     status, _, body = fakes.call("GET", front + "/health")
-    assert status == 503 and json.loads(body) == {"status": "down", "primary": False, "fallback": False,
-                                                  "breaker_open": True}
+    assert status == 503 and json.loads(body) == {
+        "status": "down",
+        "primary": False,
+        "fallback": False,
+        "breaker_open": True,
+    }
 
 
 def test_unknown_paths_are_404(front):

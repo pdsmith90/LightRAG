@@ -3,6 +3,7 @@
 Offline: no database is contacted; the idle check talks to a stub HTTP server on
 127.0.0.1. The PostgreSQL + AGE integration test is test_clean_dangling_refs_pg.py.
 """
+
 import asyncio
 import importlib.util
 import json
@@ -20,7 +21,9 @@ from unittest import mock
 
 MAINTENANCE = Path(__file__).resolve().parents[2] / "maintenance"
 
-spec = importlib.util.spec_from_file_location("clean_dangling_refs", MAINTENANCE / "clean_dangling_refs.py")
+spec = importlib.util.spec_from_file_location(
+    "clean_dangling_refs", MAINTENANCE / "clean_dangling_refs.py"
+)
 clean = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(clean)
 
@@ -99,10 +102,16 @@ class CleanDanglingRefsTests(unittest.TestCase):
         configure(["--sweep", "--workspace", "Team-KB"])
         con = FakeConnection()
         rows = [
-            {"gid": "123", "old_props": '{"source_id":"old"}',
-             "new_props": '{"source_id":"new"}'},
-            {"gid": "456", "old_props": '{"source_id":"old2"}',
-             "new_props": '{"source_id":"new2"}'},
+            {
+                "gid": "123",
+                "old_props": '{"source_id":"old"}',
+                "new_props": '{"source_id":"new"}',
+            },
+            {
+                "gid": "456",
+                "old_props": '{"source_id":"old2"}',
+                "new_props": '{"source_id":"new2"}',
+            },
         ]
         asyncio.run(clean.update_graph_rows(con, "_ag_label_vertex", rows))
         self.assertEqual(len(con.calls), 1)
@@ -117,8 +126,10 @@ class CleanDanglingRefsTests(unittest.TestCase):
         async def unexpected_connect():
             self.fail("busy pipeline must be refused before connecting")
 
-        with mock.patch.object(clean, "pipeline_idle", return_value=False), \
-             mock.patch.object(clean, "connect", unexpected_connect):
+        with (
+            mock.patch.object(clean, "pipeline_idle", return_value=False),
+            mock.patch.object(clean, "connect", unexpected_connect),
+        ):
             self.assertEqual(asyncio.run(clean.sweep(dry=False)), 3)
 
     def test_busy_pipeline_refuses_commit(self):
@@ -128,10 +139,14 @@ class CleanDanglingRefsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             plan = os.path.join(tmp, "plan.json")
             with open(plan, "w") as fh:
-                json.dump({"workspace": "default", "graph": "chunk_entity_relation"}, fh)
+                json.dump(
+                    {"workspace": "default", "graph": "chunk_entity_relation"}, fh
+                )
             configure(["--commit", "--plan", plan])
-            with mock.patch.object(clean, "pipeline_idle", return_value=False), \
-                 mock.patch.object(clean, "connect", unexpected_connect):
+            with (
+                mock.patch.object(clean, "pipeline_idle", return_value=False),
+                mock.patch.object(clean, "connect", unexpected_connect),
+            ):
                 self.assertEqual(asyncio.run(clean.commit(force=False)), 3)
             self.assertTrue(os.path.exists(plan), "a refused commit keeps its plan")
 
@@ -142,7 +157,9 @@ class CleanDanglingRefsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             plan = os.path.join(tmp, "plan.json")
             with open(plan, "w") as fh:
-                json.dump({"workspace": "papers", "graph": "papers_chunk_entity_relation"}, fh)
+                json.dump(
+                    {"workspace": "papers", "graph": "papers_chunk_entity_relation"}, fh
+                )
             configure(["--commit", "--plan", plan], {"POSTGRES_WORKSPACE": "notes"})
             with mock.patch.object(clean, "pipeline_idle", unexpected_idle_check):
                 self.assertEqual(asyncio.run(clean.commit(force=True)), 2)
@@ -152,15 +169,36 @@ class CleanDanglingRefsTests(unittest.TestCase):
         for ws in (None, "", "  ", "default", " Default "):
             self.assertEqual(clean.graph_name(ws), "chunk_entity_relation")
         self.assertEqual(clean.graph_name("papers"), "papers_chunk_entity_relation")
-        self.assertEqual(clean.graph_name(" Team-KB.v2 "), "Team_KB_v2_chunk_entity_relation")
-        self.assertEqual(clean.graph_name("x" * 60), ("x" * 60 + "_chunk_entity_relation")[:63])
+        self.assertEqual(
+            clean.graph_name(" Team-KB.v2 "), "Team_KB_v2_chunk_entity_relation"
+        )
+        self.assertEqual(
+            clean.graph_name("x" * 60), ("x" * 60 + "_chunk_entity_relation")[:63]
+        )
 
     def test_vector_tables_named_like_lightrag_or_left_for_detection(self):
-        configure(["--sweep"], {"EMBEDDING_MODEL": "BAAI/bge-m3", "EMBEDDING_DIM": "1024"})
-        self.assertEqual((clean.T_ENT, clean.T_REL),
-                         ("lightrag_vdb_entity_baai_bge_m3_1024d", "lightrag_vdb_relation_baai_bge_m3_1024d"))
-        configure(["--sweep", "--embedding-model", "nomic-embed-text:latest", "--embedding-dim", "768"])
-        self.assertEqual(clean.T_ENT, "lightrag_vdb_entity_nomic_embed_text_latest_768d")
+        configure(
+            ["--sweep"], {"EMBEDDING_MODEL": "BAAI/bge-m3", "EMBEDDING_DIM": "1024"}
+        )
+        self.assertEqual(
+            (clean.T_ENT, clean.T_REL),
+            (
+                "lightrag_vdb_entity_baai_bge_m3_1024d",
+                "lightrag_vdb_relation_baai_bge_m3_1024d",
+            ),
+        )
+        configure(
+            [
+                "--sweep",
+                "--embedding-model",
+                "nomic-embed-text:latest",
+                "--embedding-dim",
+                "768",
+            ]
+        )
+        self.assertEqual(
+            clean.T_ENT, "lightrag_vdb_entity_nomic_embed_text_latest_768d"
+        )
         # without both, the server's table cannot be named here: connect() detects it
         configure(["--sweep"], {"EMBEDDING_MODEL": "bge-m3"})
         self.assertEqual((clean.T_ENT, clean.T_REL), (None, None))
@@ -182,12 +220,19 @@ class CleanDanglingRefsTests(unittest.TestCase):
             return clean.T_ENT, clean.T_REL
 
         both = ["lightrag_vdb_entity", "lightrag_vdb_entity_bge_m3_1024d"]
-        self.assertEqual(detect(both, ["lightrag_vdb_entity_bge_m3_1024d"]),
-                         ("lightrag_vdb_entity_bge_m3_1024d", "lightrag_vdb_relation_bge_m3_1024d"))
+        self.assertEqual(
+            detect(both, ["lightrag_vdb_entity_bge_m3_1024d"]),
+            ("lightrag_vdb_entity_bge_m3_1024d", "lightrag_vdb_relation_bge_m3_1024d"),
+        )
         # no EMBEDDING_MODEL on the server: LightRAG's tables carry no suffix
-        self.assertEqual(detect(both, ["lightrag_vdb_entity"]), ("lightrag_vdb_entity", "lightrag_vdb_relation"))
-        self.assertEqual(detect(["lightrag_vdb_entity_bge_m3_1024d"], []),
-                         ("lightrag_vdb_entity_bge_m3_1024d", "lightrag_vdb_relation_bge_m3_1024d"))
+        self.assertEqual(
+            detect(both, ["lightrag_vdb_entity"]),
+            ("lightrag_vdb_entity", "lightrag_vdb_relation"),
+        )
+        self.assertEqual(
+            detect(["lightrag_vdb_entity_bge_m3_1024d"], []),
+            ("lightrag_vdb_entity_bge_m3_1024d", "lightrag_vdb_relation_bge_m3_1024d"),
+        )
         for tables, with_rows in ((both, both), (both, []), ([], [])):
             with self.assertRaises(SystemExit) as cm:
                 detect(tables, with_rows)
@@ -197,12 +242,14 @@ class CleanDanglingRefsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             env_file = os.path.join(tmp, ".env")
             with open(env_file, "w") as fh:
-                fh.write("# LightRAG .env\n"
-                         "export POSTGRES_HOST=db.example.com\n"
-                         "POSTGRES_PASSWORD='not-a-secret #1'\n"
-                         "PORT=9700  # server port\n"
-                         "WORKSPACE=papers\n"
-                         "POSTGRES_USER=\n")
+                fh.write(
+                    "# LightRAG .env\n"
+                    "export POSTGRES_HOST=db.example.com\n"
+                    "POSTGRES_PASSWORD='not-a-secret #1'\n"
+                    "PORT=9700  # server port\n"
+                    "WORKSPACE=papers\n"
+                    "POSTGRES_USER=\n"
+                )
             configure(["--sweep", "--env-file", env_file], {"POSTGRES_PORT": "6543"})
             with mock.patch.dict(os.environ, {"POSTGRES_PORT": "6543"}, clear=True):
                 self.assertEqual(clean.setting("POSTGRES_HOST"), "db.example.com")
@@ -210,17 +257,33 @@ class CleanDanglingRefsTests(unittest.TestCase):
                 self.assertEqual(clean.setting("POSTGRES_PORT"), "6543")
                 self.assertEqual(clean.setting("POSTGRES_USER", "postgres"), "postgres")
             self.assertEqual(clean.API_URL, "http://localhost:9700")
-            self.assertEqual((clean.WS, clean.GRAPH), ("papers", "papers_chunk_entity_relation"))
+            self.assertEqual(
+                (clean.WS, clean.GRAPH), ("papers", "papers_chunk_entity_relation")
+            )
 
             # POSTGRES_WORKSPACE overrides WORKSPACE, as in LightRAG; the flag overrides both
             configure(["--sweep", "--env-file", env_file], {"POSTGRES_WORKSPACE": "pg"})
             self.assertEqual(clean.WS, "pg")
-            configure(["--sweep", "--env-file", env_file, "--workspace", "cli",
-                       "--api-url", "http://127.0.0.1:9621/"], {"POSTGRES_WORKSPACE": "pg"})
-            self.assertEqual((clean.WS, clean.API_URL), ("cli", "http://127.0.0.1:9621"))
+            configure(
+                [
+                    "--sweep",
+                    "--env-file",
+                    env_file,
+                    "--workspace",
+                    "cli",
+                    "--api-url",
+                    "http://127.0.0.1:9621/",
+                ],
+                {"POSTGRES_WORKSPACE": "pg"},
+            )
+            self.assertEqual(
+                (clean.WS, clean.API_URL), ("cli", "http://127.0.0.1:9621")
+            )
         configure(["--sweep"])
-        self.assertEqual((clean.WS, clean.GRAPH, clean.API_URL),
-                         ("default", "chunk_entity_relation", "http://localhost:9621"))
+        self.assertEqual(
+            (clean.WS, clean.GRAPH, clean.API_URL),
+            ("default", "chunk_entity_relation", "http://localhost:9621"),
+        )
 
     def test_idle_check_sends_api_key_header(self):
         with IdleStub(busy=False) as stub:
@@ -255,20 +318,33 @@ class RunWhenIdleTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, tmp)
         stub = os.path.join(tmp, "python")
         with open(stub, "w") as fh:
-            fh.write('#!/usr/bin/env bash\n'
-                     'if [ "$1" = -c ]; then\n'
-                     '  [ -z "${STUB_NO_ASYNCPG:-}" ] && exit 0\n'
-                     '  echo "ModuleNotFoundError: No module named \'asyncpg\'" >&2; exit 1\n'
-                     'fi\n'
-                     'echo "$*" >> "$STUB_DIR/calls"\n'
-                     'n=$(wc -l < "$STUB_DIR/calls")\n'
-                     '[ "$n" -le "$STUB_BUSY" ] && { echo "pipeline busy"; exit 3; }\n'
-                     'echo "swept"\n')
+            fh.write(
+                "#!/usr/bin/env bash\n"
+                'if [ "$1" = -c ]; then\n'
+                '  [ -z "${STUB_NO_ASYNCPG:-}" ] && exit 0\n'
+                "  echo \"ModuleNotFoundError: No module named 'asyncpg'\" >&2; exit 1\n"
+                "fi\n"
+                'echo "$*" >> "$STUB_DIR/calls"\n'
+                'n=$(wc -l < "$STUB_DIR/calls")\n'
+                '[ "$n" -le "$STUB_BUSY" ] && { echo "pipeline busy"; exit 3; }\n'
+                'echo "swept"\n'
+            )
         os.chmod(stub, 0o755)
-        full_env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "PYTHON": stub,
-                    "STUB_DIR": tmp, "STUB_BUSY": str(busy), "IDLE_RETRY_INTERVAL": "0", **env}
-        proc = subprocess.run(["bash", str(MAINTENANCE / "run_when_idle.sh"), *args],
-                              env=full_env, capture_output=True, text=True, timeout=60)
+        full_env = {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "PYTHON": stub,
+            "STUB_DIR": tmp,
+            "STUB_BUSY": str(busy),
+            "IDLE_RETRY_INTERVAL": "0",
+            **env,
+        }
+        proc = subprocess.run(
+            ["bash", str(MAINTENANCE / "run_when_idle.sh"), *args],
+            env=full_env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
         calls_file = os.path.join(tmp, "calls")
         calls = []
         if os.path.exists(calls_file):
@@ -279,28 +355,40 @@ class RunWhenIdleTests(unittest.TestCase):
     def test_retries_while_busy_then_returns_the_tool_status(self):
         proc, calls = self.run_wrapper(2)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertEqual(calls, [f"{MAINTENANCE / 'clean_dangling_refs.py'} --sweep"] * 3)
+        self.assertEqual(
+            calls, [f"{MAINTENANCE / 'clean_dangling_refs.py'} --sweep"] * 3
+        )
         self.assertIn("swept", proc.stdout)
 
     def test_passes_arguments_through(self):
         proc, calls = self.run_wrapper(0, "--commit", "--plan", "p.json")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertEqual(calls, [f"{MAINTENANCE / 'clean_dangling_refs.py'} --commit --plan p.json"])
+        self.assertEqual(
+            calls, [f"{MAINTENANCE / 'clean_dangling_refs.py'} --commit --plan p.json"]
+        )
 
     def test_adds_sweep_when_no_mode_flag_is_given(self):
         # The documented `run_when_idle.sh --env-file ...` form must sweep, not die on
         # argparse's "one of the arguments ... is required" (exit 2, never retried).
         proc, calls = self.run_wrapper(0, "--env-file", "x.env")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertEqual(calls, [f"{MAINTENANCE / 'clean_dangling_refs.py'} --sweep --env-file x.env"])
+        self.assertEqual(
+            calls,
+            [f"{MAINTENANCE / 'clean_dangling_refs.py'} --sweep --env-file x.env"],
+        )
 
     def test_leaves_an_explicit_mode_alone(self):
         for args in (["--scan"], ["--commit"], ["--show"], ["--sweep", "--dry-run"]):
             with self.subTest(args=args):
                 proc, calls = self.run_wrapper(0, "--env-file", "x.env", *args)
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-                self.assertEqual(calls, [f"{MAINTENANCE / 'clean_dangling_refs.py'} --env-file x.env "
-                                         + " ".join(args)])
+                self.assertEqual(
+                    calls,
+                    [
+                        f"{MAINTENANCE / 'clean_dangling_refs.py'} --env-file x.env "
+                        + " ".join(args)
+                    ],
+                )
 
     def test_gives_up_with_exit_3(self):
         proc, calls = self.run_wrapper(100, IDLE_MAX_WAIT="0")

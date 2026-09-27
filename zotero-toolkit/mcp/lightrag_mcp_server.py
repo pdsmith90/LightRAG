@@ -35,6 +35,7 @@ Config (environment variables):
 Run:  python3 lightrag_mcp_server.py     (normally launched by the MCP client)
 Deps: pip install -r requirements.txt    (mcp 2.x, httpx)
 """
+
 from __future__ import annotations
 import hashlib
 import json
@@ -43,6 +44,7 @@ import re
 import sys
 import time
 import httpx
+
 # mcp 2.0 removed mcp.server.fastmcp; MCPServer is the successor.
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
@@ -61,16 +63,20 @@ MAX_TOP_K = max(1, int(os.environ.get("LIGHTRAG_MCP_MAX_TOP_K", "40")))
 # compile real citations from the server's structured `references` array
 # (chunk file_paths are "<ZoteroKey>__<slug>.md").
 META_PATH = os.path.expanduser(
-    os.environ.get("ZOTERO_METADATA") or "~/Zotero/zotero_metadata.json")
+    os.environ.get("ZOTERO_METADATA") or "~/Zotero/zotero_metadata.json"
+)
 try:
     with open(META_PATH, encoding="utf-8") as _f:
         _META = json.load(_f)
 except Exception as _e:
     _META = {}
     # stderr, never stdout: stdout carries the MCP protocol.
-    print(f"lightrag_mcp_server: no citation metadata loaded from "
-          f"{os.path.abspath(META_PATH)} ({type(_e).__name__}); citations fall "
-          f"back to file names", file=sys.stderr)
+    print(
+        f"lightrag_mcp_server: no citation metadata loaded from "
+        f"{os.path.abspath(META_PATH)} ({type(_e).__name__}); citations fall "
+        f"back to file names",
+        file=sys.stderr,
+    )
 
 mcp = MCPServer("zotero-lightrag")
 
@@ -86,7 +92,9 @@ def _strip_llm_refs(text: str) -> str:
     """
     out, skipping = [], False
     for line in text.splitlines():
-        if re.match(r"\s*(#{1,6}\s*)?(References|Sources)\s*:?\s*$", line, re.IGNORECASE):
+        if re.match(
+            r"\s*(#{1,6}\s*)?(References|Sources)\s*:?\s*$", line, re.IGNORECASE
+        ):
             skipping = True
             continue
         if skipping:
@@ -100,18 +108,22 @@ def _strip_llm_refs(text: str) -> str:
 def _cite(file_path: str) -> str:
     name = os.path.basename(file_path or "")
     if not re.match(r"^[A-Z0-9]{8}__", name):
-        return name or "(untitled source)"   # notes / non-corpus sources
+        return name or "(untitled source)"  # notes / non-corpus sources
     key = name[:8]
     m = _META.get(key)
     if m:
         authors = ", ".join(m.get("authors") or []) or None
-        parts = [p for p in (
-            authors,
-            f"({m['year']})" if m.get("year") else None,
-            m.get("title") or None,
-            m.get("publication") or None,
-            f"doi:{m['doi']}" if m.get("doi") else None,
-        ) if p]
+        parts = [
+            p
+            for p in (
+                authors,
+                f"({m['year']})" if m.get("year") else None,
+                m.get("title") or None,
+                m.get("publication") or None,
+                f"doi:{m['doi']}" if m.get("doi") else None,
+            )
+            if p
+        ]
         cite = ". ".join(parts)
     else:
         cite = re.sub(r"_+", " ", re.sub(r"\.md$", "", name)[10:]).strip()
@@ -121,8 +133,10 @@ def _cite(file_path: str) -> str:
 def _compiled_refs(references: list, label: str) -> str:
     if not references:
         return ""
-    lines = [f"- [{r.get('reference_id', '?')}] {_cite(r.get('file_path', ''))}"
-             for r in references]
+    lines = [
+        f"- [{r.get('reference_id', '?')}] {_cite(r.get('file_path', ''))}"
+        for r in references
+    ]
     return f"\n\n### {label}\n" + "\n".join(lines)
 
 
@@ -150,8 +164,12 @@ def _error_detail(r: httpx.Response) -> str:
 
 def _post(path: str, payload: dict, timeout: float | None = None) -> dict:
     try:
-        r = httpx.post(f"{BASE}{path}", json=payload, headers=HEADERS,
-                       timeout=QUERY_TIMEOUT if timeout is None else timeout)
+        r = httpx.post(
+            f"{BASE}{path}",
+            json=payload,
+            headers=HEADERS,
+            timeout=QUERY_TIMEOUT if timeout is None else timeout,
+        )
         r.raise_for_status()
     except httpx.HTTPError as e:
         # mcp >= 2.1 shows the client only "Error executing tool <name>" for an
@@ -159,7 +177,9 @@ def _post(path: str, payload: dict, timeout: float | None = None) -> dict:
         msg = f"LightRAG {path} failed: {e}"
         # The status line does not say why; LightRAG's body does (a 409 names the
         # document that already exists, or the scan or deletion blocking inserts).
-        if isinstance(e, httpx.HTTPStatusError) and (detail := _error_detail(e.response)):
+        if isinstance(e, httpx.HTTPStatusError) and (
+            detail := _error_detail(e.response)
+        ):
             msg += f"\nServer response: {detail}"
         raise ToolError(msg) from e
     try:
@@ -172,17 +192,21 @@ def _context(query: str, mode: str, top_k: int) -> str:
     """Retrieval only — no LLM answer. Compiled citations FIRST, then the reranked
     entities/relations/passages, so a client that truncates long tool results
     keeps the citations."""
-    data = _post("/query", {"query": query, "mode": mode, "top_k": top_k,
-                            "only_need_context": True})
+    data = _post(
+        "/query",
+        {"query": query, "mode": mode, "top_k": top_k, "only_need_context": True},
+    )
     ctx = data.get("response") or data.get("context") or str(data)
-    refs = _compiled_refs(data.get("references") or [],
-                          "Retrieved documents (compiled citations)").strip()
+    refs = _compiled_refs(
+        data.get("references") or [], "Retrieved documents (compiled citations)"
+    ).strip()
     return f"{refs}\n\n{ctx}" if refs else ctx
 
 
 @mcp.tool()
-def search_library(query: str, mode: str = "mix", top_k: int = 10,
-                   answer: bool = False) -> str:
+def search_library(
+    query: str, mode: str = "mix", top_k: int = 10, answer: bool = False
+) -> str:
     """Search the user's research library (Zotero papers indexed in LightRAG).
 
     Default (answer=False): returns the RETRIEVED CONTEXT — compiled citations, then
@@ -207,11 +231,16 @@ def search_library(query: str, mode: str = "mix", top_k: int = 10,
     top_k = _top_k(top_k)
     if not answer:
         return _context(query, mode, top_k)
-    data = _post("/query", {
-        "query": query, "mode": mode, "top_k": top_k,
-        "user_prompt": "Do not generate a References section; "
-                       "references are appended programmatically.",
-    })
+    data = _post(
+        "/query",
+        {
+            "query": query,
+            "mode": mode,
+            "top_k": top_k,
+            "user_prompt": "Do not generate a References section; "
+            "references are appended programmatically.",
+        },
+    )
     answer = _strip_llm_refs(data.get("response") or str(data))
     refs = data.get("references") or []
     key = (query, mode, top_k)
@@ -226,9 +255,11 @@ def search_library(query: str, mode: str = "mix", top_k: int = 10,
         refs = _REF_MEMO.get(key) or []
         if not refs:
             try:
-                d2 = _post("/query/data",
-                           {"query": query, "mode": mode, "top_k": top_k},
-                           timeout=REF_FALLBACK_TIMEOUT)
+                d2 = _post(
+                    "/query/data",
+                    {"query": query, "mode": mode, "top_k": top_k},
+                    timeout=REF_FALLBACK_TIMEOUT,
+                )
                 refs = (d2.get("data") or {}).get("references") or []
                 if refs:
                     _REF_MEMO[key] = refs
@@ -244,11 +275,14 @@ def get_sources(query: str, mode: str = "mix", top_k: int = 10) -> str:
     Use this when you need to cite specific papers or inspect what the KB retrieved."""
     mode = mode if mode in VALID_MODES else "mix"
     top_k = _top_k(top_k)
-    data = _post("/query", {"query": query, "mode": mode, "top_k": top_k,
-                            "only_need_context": True})
+    data = _post(
+        "/query",
+        {"query": query, "mode": mode, "top_k": top_k, "only_need_context": True},
+    )
     ctx = data.get("response") or data.get("context") or str(data)
-    return ctx + _compiled_refs(data.get("references") or [],
-                                "Retrieved documents (compiled citations)")
+    return ctx + _compiled_refs(
+        data.get("references") or [], "Retrieved documents (compiled citations)"
+    )
 
 
 @mcp.tool()
@@ -260,13 +294,17 @@ def add_note(text: str, description: str = "") -> str:
     holds, so every note gets a unique name: note-<UTC time>-<hash of the text>.
     An optional short description goes in front of it, as in
     "reading notes (note-20260101T120000Z-1a2b3c4d)"; citations show that name."""
-    name = (f"note-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-"
-            f"{hashlib.sha1(text.encode()).hexdigest()[:8]}")
+    name = (
+        f"note-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-"
+        f"{hashlib.sha1(text.encode()).hexdigest()[:8]}"
+    )
     # LightRAG keeps only the last path segment of a source and refuses control
     # characters, so path separators and control characters become spaces.
     label = re.sub(r"[\s/\\\x00-\x1f\x7f]+", " ", description).strip()
-    data = _post("/documents/text",
-                 {"text": text, "file_source": f"{label} ({name})" if label else name})
+    data = _post(
+        "/documents/text",
+        {"text": text, "file_source": f"{label} ({name})" if label else name},
+    )
     return str(data)
 
 

@@ -1,4 +1,5 @@
 """Stdlib fake backends and helpers for the fronts tests (loaded by path, not imported as a package)."""
+
 from __future__ import annotations
 
 import contextlib
@@ -23,7 +24,9 @@ def load_front(filename: str, module_name: str, env_prefixes: tuple[str, ...]):
     for k in saved:
         del os.environ[k]
     try:
-        spec = importlib.util.spec_from_file_location(module_name, ROOT / "fronts" / filename)
+        spec = importlib.util.spec_from_file_location(
+            module_name, ROOT / "fronts" / filename
+        )
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
     finally:
@@ -61,10 +64,10 @@ def stream(h, chunks, ctype: str) -> None:
 
 class _QuietServer(http.server.ThreadingHTTPServer):
     daemon_threads = True
-    block_on_close = False      # a deliberately slow handler must not hold up teardown
+    block_on_close = False  # a deliberately slow handler must not hold up teardown
 
     def handle_error(self, request, client_address):
-        pass    # a front that timed out closes its socket; the fake's late write is expected to fail
+        pass  # a front that timed out closes its socket; the fake's late write is expected to fail
 
 
 class Fake:
@@ -84,8 +87,14 @@ class Fake:
             def _handle(self, method):
                 n = int(self.headers.get("Content-Length") or 0)
                 body = self.rfile.read(n) if n else b""
-                fake.requests.append({"method": method, "path": self.path,
-                                      "headers": {k.lower(): v for k, v in self.headers.items()}, "body": body})
+                fake.requests.append(
+                    {
+                        "method": method,
+                        "path": self.path,
+                        "headers": {k.lower(): v for k, v in self.headers.items()},
+                        "body": body,
+                    }
+                )
                 fn = fake.routes.get((method, self.path))
                 if fn is None:
                     reply(self, 404, {"error": "no route"})
@@ -100,7 +109,11 @@ class Fake:
 
         self.server = _QuietServer(("127.0.0.1", 0), H)
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
-        threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+        threading.Thread(
+            target=self.server.serve_forever,
+            kwargs={"poll_interval": 0.05},
+            daemon=True,
+        ).start()
 
     def route(self, method: str, path: str, fn) -> None:
         self.routes[(method, path)] = fn
@@ -117,7 +130,9 @@ class Fake:
 def serve(mod):
     """Run a front's Server on an ephemeral loopback port; yields its base URL."""
     srv = mod.Server(("127.0.0.1", 0), mod.Handler)
-    threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+    threading.Thread(
+        target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
+    ).start()
     try:
         yield f"http://127.0.0.1:{srv.server_address[1]}"
     finally:
@@ -127,7 +142,9 @@ def serve(mod):
 
 def call(method: str, url: str, body=None, timeout: float = 10.0):
     """(status, headers, body bytes) -- never raises on an HTTP error status."""
-    data = body if body is None or isinstance(body, bytes) else json.dumps(body).encode()
+    data = (
+        body if body is None or isinstance(body, bytes) else json.dumps(body).encode()
+    )
     headers = {"Content-Type": "application/json"} if data is not None else {}
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
@@ -142,7 +159,7 @@ def sse_events(body: bytes) -> list:
     out = []
     for line in body.decode().splitlines():
         if line.startswith("data: "):
-            data = line[len("data: "):]
+            data = line[len("data: ") :]
             out.append(data if data == "[DONE]" else json.loads(data))
     return out
 

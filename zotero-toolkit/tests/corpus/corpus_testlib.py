@@ -3,12 +3,15 @@
 Every storage key here contains a 0 or a 1, which real Zotero keys never do (their
 alphabet is 23456789ABCDEFGHIJKLMNPQRSTUVWXYZ), so no fixture can name a real item.
 """
+
 import os
 import sqlite3
 import subprocess
 import sys
 
-REPO = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+REPO = os.path.abspath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
+)
 CORPUS_DIR = os.path.join(REPO, "corpus")
 if CORPUS_DIR not in sys.path:
     sys.path.insert(0, CORPUS_DIR)
@@ -52,24 +55,36 @@ def make_zotero_db(zotero_dir, items):
         iid = con.execute("INSERT INTO items (key) VALUES (?)", (it["key"],)).lastrowid
         ids[it["key"]] = iid
         for name, value in (it.get("fields") or {}).items():
-            fid = rowid("SELECT fieldID FROM fields WHERE fieldName=?",
-                        "INSERT INTO fields (fieldName) VALUES (?)", name)
-            vid = rowid("SELECT valueID FROM itemDataValues WHERE value=?",
-                        "INSERT INTO itemDataValues (value) VALUES (?)", value)
+            fid = rowid(
+                "SELECT fieldID FROM fields WHERE fieldName=?",
+                "INSERT INTO fields (fieldName) VALUES (?)",
+                name,
+            )
+            vid = rowid(
+                "SELECT valueID FROM itemDataValues WHERE value=?",
+                "INSERT INTO itemDataValues (value) VALUES (?)",
+                value,
+            )
             con.execute("INSERT INTO itemData VALUES (?,?,?)", (iid, fid, vid))
         # insert creators in reverse so only orderIndex can put them in order
         creators = list(enumerate(it.get("creators") or []))
         for order, (last, first) in reversed(creators):
-            cid = con.execute("INSERT INTO creators (firstName, lastName) VALUES (?,?)",
-                              (first, last)).lastrowid
+            cid = con.execute(
+                "INSERT INTO creators (firstName, lastName) VALUES (?,?)", (first, last)
+            ).lastrowid
             con.execute("INSERT INTO itemCreators VALUES (?,?,?)", (iid, cid, order))
         for name in it.get("tags") or []:
-            tid = rowid("SELECT tagID FROM tags WHERE name=?",
-                        "INSERT INTO tags (name) VALUES (?)", name)
+            tid = rowid(
+                "SELECT tagID FROM tags WHERE name=?",
+                "INSERT INTO tags (name) VALUES (?)",
+                name,
+            )
             con.execute("INSERT INTO itemTags VALUES (?,?)", (iid, tid))
         if "path" in it:
             parent = ids[it["parent"]] if it.get("parent") else None
-            con.execute("INSERT INTO itemAttachments VALUES (?,?,?)", (iid, parent, it["path"]))
+            con.execute(
+                "INSERT INTO itemAttachments VALUES (?,?,?)", (iid, parent, it["path"])
+            )
     con.commit()
     con.close()
     return db
@@ -80,5 +95,10 @@ def run_script(name, *args, env_extra=None, env_drop=("ZOTERO_METADATA",)):
     env = {k: v for k, v in os.environ.items() if k not in env_drop}
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     env.update(env_extra or {})
-    return subprocess.run([sys.executable, os.path.join(CORPUS_DIR, name), *map(str, args)],
-                          capture_output=True, text=True, env=env, timeout=300)
+    return subprocess.run(
+        [sys.executable, os.path.join(CORPUS_DIR, name), *map(str, args)],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=300,
+    )

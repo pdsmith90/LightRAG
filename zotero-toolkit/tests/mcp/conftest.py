@@ -7,6 +7,7 @@ without any network or LightRAG install.
 No __init__.py lives in this directory on purpose: a package named "mcp" here
 would shadow the real mcp SDK.
 """
+
 from __future__ import annotations
 
 import importlib.util
@@ -55,11 +56,18 @@ class FakeLightRAG:
         self.requests: list[dict] = []
         self.routes = {
             ("GET", "/health"): lambda body: (200, {"status": "healthy"}),
-            ("POST", "/query"): lambda body: (200, {"response": "context", "references": []}),
-            ("POST", "/query/data"): lambda body: (200, {"status": "success",
-                                                         "data": {"references": []}}),
-            ("POST", "/documents/text"): lambda body: (200, {"status": "success",
-                                                             "message": "queued"}),
+            ("POST", "/query"): lambda body: (
+                200,
+                {"response": "context", "references": []},
+            ),
+            ("POST", "/query/data"): lambda body: (
+                200,
+                {"status": "success", "data": {"references": []}},
+            ),
+            ("POST", "/documents/text"): lambda body: (
+                200,
+                {"status": "success", "message": "queued"},
+            ),
         }
         fake = self
 
@@ -68,12 +76,23 @@ class FakeLightRAG:
                 n = int(self.headers.get("Content-Length") or 0)
                 raw = self.rfile.read(n) if n else b""
                 body = json.loads(raw) if raw else None
-                fake.requests.append({"method": method, "path": self.path,
-                                      "headers": {k.lower(): v for k, v in self.headers.items()},
-                                      "json": body})
+                fake.requests.append(
+                    {
+                        "method": method,
+                        "path": self.path,
+                        "headers": {k.lower(): v for k, v in self.headers.items()},
+                        "json": body,
+                    }
+                )
                 route = fake.routes.get((method, self.path))
-                status, payload = route(body) if route else (404, {"detail": "Not Found"})
-                data = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
+                status, payload = (
+                    route(body) if route else (404, {"detail": "Not Found"})
+                )
+                data = (
+                    payload
+                    if isinstance(payload, bytes)
+                    else json.dumps(payload).encode()
+                )
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(data)))
@@ -91,8 +110,9 @@ class FakeLightRAG:
 
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}"
-        self.thread = threading.Thread(target=self.httpd.serve_forever,
-                                       kwargs={"poll_interval": 0.05}, daemon=True)
+        self.thread = threading.Thread(
+            target=self.httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
+        )
         self.thread.start()
 
     def calls(self, path):
@@ -132,6 +152,7 @@ def load_server(monkeypatch, fake_lightrag, metadata_file):
     The module reads its configuration at import time, exactly as it does when
     an MCP client launches it, so every test gets its own import.
     """
+
     def load(**env):
         base = {
             "LIGHTRAG_BASE_URL": fake_lightrag.url,
@@ -139,15 +160,22 @@ def load_server(monkeypatch, fake_lightrag, metadata_file):
             "ZOTERO_METADATA": str(metadata_file),
         }
         base.update(env)
-        for name in ("LIGHTRAG_BASE_URL", "LIGHTRAG_API_KEY", "ZOTERO_METADATA",
-                     "LIGHTRAG_MCP_TIMEOUT", "LIGHTRAG_MCP_REF_FALLBACK_TIMEOUT",
-                     "LIGHTRAG_MCP_HEALTH_TIMEOUT", "LIGHTRAG_MCP_MAX_TOP_K"):
+        for name in (
+            "LIGHTRAG_BASE_URL",
+            "LIGHTRAG_API_KEY",
+            "ZOTERO_METADATA",
+            "LIGHTRAG_MCP_TIMEOUT",
+            "LIGHTRAG_MCP_REF_FALLBACK_TIMEOUT",
+            "LIGHTRAG_MCP_HEALTH_TIMEOUT",
+            "LIGHTRAG_MCP_MAX_TOP_K",
+        ):
             monkeypatch.delenv(name, raising=False)
         for name, value in base.items():
             if value is not None:
                 monkeypatch.setenv(name, value)
         spec = importlib.util.spec_from_file_location(
-            f"lightrag_mcp_server_under_test_{next(_counter)}", SERVER_PY)
+            f"lightrag_mcp_server_under_test_{next(_counter)}", SERVER_PY
+        )
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         return mod
