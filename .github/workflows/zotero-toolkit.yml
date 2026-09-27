@@ -1,0 +1,48 @@
+name: Zotero Toolkit Tests
+
+# The toolkit keeps no .github/ directory of its own: GitHub reads workflows
+# only from the repository root, so its offline suite runs from here.
+on:
+  push:
+    paths:
+      - 'zotero-toolkit/**'
+      - '.github/workflows/zotero-toolkit.yml'
+  pull_request:
+    paths:
+      - 'zotero-toolkit/**'
+      - '.github/workflows/zotero-toolkit.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  offline-tests:
+    name: Offline Tests
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12']
+
+    defaults:
+      run:
+        working-directory: zotero-toolkit
+
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v7
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install -r requirements-dev.txt
+
+    - name: Run offline tests
+      # The PostgreSQL + Apache AGE integration test in tests/maintenance skips
+      # itself unless CLEAN_DANGLING_TEST_DSN names a scratch database.
+      run: scripts/test.sh -v --tb=short
