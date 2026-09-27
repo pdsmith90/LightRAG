@@ -1,0 +1,3 @@
+# fronts/ runs on the Python standard library alone (Python >= 3.10): nothing to install.
+# The tests under tests/fronts need only pytest.
+pytest>=7.0,<10

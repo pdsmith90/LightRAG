@@ -1,0 +1,2 @@
+# clean_dangling_refs.py — PostgreSQL driver (the script is otherwise stdlib-only).
+asyncpg>=0.29,<1
