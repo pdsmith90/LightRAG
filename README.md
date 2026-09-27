@@ -1,3 +1,8 @@
+> **This is `zlightrag`, the default branch of a LightRAG fork:** LightRAG v1.5.7
+> plus a few changes and a `zotero-toolkit/` directory for running it over
+> a Zotero library. [ZLIGHTRAG.md](./ZLIGHTRAG.md) lists what differs from upstream.
+> The upstream project is [HKUDS/LightRAG](https://github.com/HKUDS/LightRAG).
+
 <div align="center">
 
 <div style="margin: 20px 0;">
