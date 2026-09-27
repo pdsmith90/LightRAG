@@ -98,11 +98,38 @@ DEFAULT_PG_UPSERT_MAX_PAYLOAD_BYTES = 16 * 1024 * 1024  # 16 MiB
 DEFAULT_PG_UPSERT_MAX_RECORDS_PER_BATCH = 200
 DEFAULT_PG_DELETE_MAX_RECORDS_PER_BATCH = 1000
 
+
+class PoisonedConnectionError(Exception):
+    """A pooled connection answered with a server message asyncpg could not decode.
+
+    Seen with Apache AGE: a backend whose label cache has been corrupted reports
+    ``relation "<graph>.<garbage>" does not exist`` for a ``DETACH DELETE``, and the
+    garbage is not valid UTF-8, so asyncpg raises ``UnicodeDecodeError`` from its
+    protocol parser instead of a ``PostgresError``. The fault follows the backend,
+    not the statement: that connection fails every such statement until it is
+    replaced, while the other connections in the pool keep working.
+    ``_run_with_retry`` terminates the connection and raises this instead, so the
+    retry loop runs the operation again on a fresh backend without resetting the
+    whole pool. The real error text is in the PostgreSQL server log.
+    """
+
+
+def _raised_inside_asyncpg(exc: BaseException) -> bool:
+    """True when *exc* was raised from asyncpg's own frames, e.g. its protocol decoder."""
+    tb = exc.__traceback__
+    while tb is not None:
+        if "asyncpg" in (tb.tb_frame.f_code.co_filename or ""):
+            return True
+        tb = tb.tb_next
+    return False
+
+
 # Connection-level failures that are worth retrying rather than reporting. Module-level
 # so that code without a PostgreSQLDB instance in hand -- notably the static
 # configure_age_extension -- can tell "the connection blipped" from "the server answered
 # something we cannot use", and let the former reach _run_with_retry unwrapped.
 TRANSIENT_DB_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    PoisonedConnectionError,
     asyncio.TimeoutError,
     TimeoutError,
     ConnectionError,
@@ -770,6 +797,16 @@ class PostgreSQLDB:
     async def _before_sleep(self, retry_state: RetryCallState) -> None:
         """Hook invoked by tenacity before sleeping between retries."""
         exc = retry_state.outcome.exception() if retry_state.outcome else None
+        if isinstance(exc, PoisonedConnectionError):
+            # The offending connection was terminated where the error was caught and
+            # the pool replaces it on the next acquire; the other connections are fine.
+            logger.warning(
+                "PostgreSQL poisoned connection discarded on attempt %s/%s, retrying on a fresh backend: %s",
+                retry_state.attempt_number,
+                self.connection_retry_attempts,
+                exc,
+            )
+            return
         logger.warning(
             "PostgreSQL transient connection issue on attempt %s/%s: %r",
             retry_state.attempt_number,
@@ -838,11 +875,30 @@ class PostgreSQLDB:
                             acquire_elapsed,
                             pool_snapshot_after,
                         )
-                    if with_age and graph_name:
-                        await self.configure_age(connection, graph_name)
-                    elif with_age and not graph_name:
-                        raise ValueError("Graph name is required when with_age is True")
-                    return await operation(connection)
+                    try:
+                        if with_age and graph_name:
+                            await self.configure_age(connection, graph_name)
+                        elif with_age and not graph_name:
+                            raise ValueError(
+                                "Graph name is required when with_age is True"
+                            )
+                        return await operation(connection)
+                    except UnicodeDecodeError as exc:
+                        if not _raised_inside_asyncpg(exc):
+                            raise
+                        # asyncpg could not decode a message FROM the server, so the
+                        # PostgresError it carried is lost and this backend cannot be
+                        # trusted (Apache AGE label-cache corruption behaves exactly
+                        # so). Drop the connection -- the pool replaces a closed one on
+                        # the next acquire -- and let the retry loop use a fresh backend.
+                        logger.warning(
+                            "PostgreSQL returned a server message that is not valid UTF-8 (%s); "
+                            "discarding this connection and retrying on a fresh backend. "
+                            "The server log holds the real error at this timestamp.",
+                            exc,
+                        )
+                        connection.terminate()
+                        raise PoisonedConnectionError(str(exc)) from exc
 
     def _get_pool_snapshot(self) -> str:
         """Best-effort snapshot of asyncpg pool state for diagnostics.
