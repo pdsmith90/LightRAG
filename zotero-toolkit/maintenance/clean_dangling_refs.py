@@ -31,7 +31,14 @@ rewriting (see sweep()). Configuration (POSTGRES_*, workspace, vector tables, AP
 URL and key) is described in README.md; `--help` lists the flags.
 """
 
-import argparse, asyncio, json, os, re, sys, time, urllib.request
+import argparse
+import asyncio
+import json
+import os
+import re
+import sys
+import time
+import urllib.request
 
 import asyncpg
 

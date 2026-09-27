@@ -7,7 +7,8 @@ a document that is mostly bibliography is kept whole by the _REF_MAX_SHRINK valv
 which the last test covers explicitly. Every prose line carries a year, so the
 block doubles as a negative test for the entry detector."""
 
-import os, sys
+import os
+import sys
 
 sys.path.insert(
     0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "corpus")
@@ -65,13 +66,15 @@ def test_apa_bulleted_list_removed_following_section_kept():
 
 
 def test_textbook_per_chapter_lists_removed_chapters_kept():
-    ch = lambda k: (
-        f"## Chapter {k}\n\nThe cell is the basic structural unit of every organism.\n"
-        + PROSE
-        + "\n### References\n\n"
-        + AGU_REFS
-        + "\n"
-    )
+    def ch(k):
+        return (
+            f"## Chapter {k}\n\nThe cell is the basic structural unit of every organism.\n"
+            + PROSE
+            + "\n### References\n\n"
+            + AGU_REFS
+            + "\n"
+        )
+
     out = _strip_references(ch(1) + ch(2))
     assert (
         out.count("basic structural unit") == 2
@@ -291,13 +294,15 @@ EMPHASIS_OCR = """- Box, **_G._** E. **P. (1976).** Science and statistics. **_J
 
 
 def test_springer_chapter_lists_removed_two_chapters_kept():
-    ch = lambda k: (
-        f"## {k} Introduction to Cryptography\n\nMachine ciphers began with Enigma in 1918.\n"
-        + PROSE
-        + "\n###### **References**\n\n"
-        + SPRINGER_CHAPTER
-        + "\n"
-    )
+    def ch(k):
+        return (
+            f"## {k} Introduction to Cryptography\n\nMachine ciphers began with Enigma in 1918.\n"
+            + PROSE
+            + "\n###### **References**\n\n"
+            + SPRINGER_CHAPTER
+            + "\n"
+        )
+
     out = _strip_references(ch(1) + ch(2))
     assert (
         out.count("began with Enigma") == 2 and out.count("scheduling heuristics") == 60
@@ -453,8 +458,10 @@ def test_v3_never_edits_text_it_keeps():
 
 
 def test_two_column_interleaved_prose_paragraph_and_its_heading_kept():
-    bold = lambda l: "- **" + l.rstrip() + "**"
-    refs = [bold(l) for l in AGU_REFS.splitlines()]
+    def bold(ln):
+        return "- **" + ln.rstrip() + "**"
+
+    refs = [bold(ln) for ln in AGU_REFS.splitlines()]
     prose = (
         "**Across the four field seasons of 2004-2007 the trap counts rose steadily at the upland sites "
         "while the lowland counts stayed flat, which points to local habitat change rather than regional "
@@ -583,7 +590,9 @@ def test_valve_still_keeps_whole_above_the_relaxed_ceiling():
 
 
 def test_valve_logs_the_document_only_during_a_build():
-    import contextlib, io, build_corpus as bc
+    import contextlib
+    import io
+    import build_corpus as bc
 
     doc = "Short note.\n\n## References\n\n" + AGU_REFS + AGU_REFS
     buf = io.StringIO()

@@ -32,7 +32,15 @@ Run  `python3 build_corpus.py --help`  for all options.
 """
 
 from __future__ import annotations
-import argparse, glob, json, os, re, sys, time, shutil, subprocess, tempfile
+import argparse
+import glob
+import json
+import os
+import re
+import time
+import shutil
+import subprocess
+import tempfile
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # Denylist semantics are shared with quarantine_junk.py, which runs immediately
@@ -126,7 +134,10 @@ _REPEAT_MAX_SHRINK = 0.25  # bail out above this; see SAFETY VALVE below
 
 def _drop_repeats(md: str) -> str:
     lines = md.split("\n")
-    norm = lambda t: re.sub(r"\d+", "#", re.sub(r"\s+", " ", t.strip()))
+
+    def norm(t):
+        return re.sub(r"\d+", "#", re.sub(r"\s+", " ", t.strip()))
+
     counts = {}
     for ln in lines:
         t = ln.strip()

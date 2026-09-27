@@ -17,7 +17,11 @@ Usage:
 """
 
 from __future__ import annotations
-import argparse, json, os, re, sqlite3
+import argparse
+import json
+import os
+import re
+import sqlite3
 
 
 def _fields(con, iid):
