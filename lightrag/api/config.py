@@ -348,14 +348,17 @@ def parse_args() -> argparse.Namespace:
     """
     Parse command line arguments with environment variable fallback
 
-    Args:
-        is_uvicorn_mode: Whether running under uvicorn mode
-
     Returns:
         argparse.Namespace: Parsed arguments
     """
 
     parser = argparse.ArgumentParser(description="LightRAG API Server")
+
+    parser.add_argument(
+        "--custom-chunker",
+        default=get_env_value("CUSTOM_CHUNKER", ""),
+        help="Registered third-party chunker name (CUSTOM_CHUNKER); not a Python import path",
+    )
 
     # Server configuration
     parser.add_argument(
@@ -418,7 +421,7 @@ def parse_args() -> argparse.Namespace:
         default=get_env_value(
             "SUMMARY_LENGTH_RECOMMENDED", DEFAULT_SUMMARY_LENGTH_RECOMMENDED, int
         ),
-        help=f"LLM Summary Context size (default: from env or {DEFAULT_SUMMARY_LENGTH_RECOMMENDED})",
+        help=f"Recommended length of the LLM summary output (default: from env or {DEFAULT_SUMMARY_LENGTH_RECOMMENDED})",
     )
 
     # Logging configuration
@@ -849,8 +852,7 @@ def parse_args() -> argparse.Namespace:
 
     # Single authoritative switch for the interactive API documentation
     # surfaces (/docs, /docs/oauth2-redirect, /redoc, /openapi.json and the
-    # /static/swagger-ui mount). When False all five return 404 (issue #3666,
-    # RFC #3671). Any route audit must condition the same set on this flag.
+    # /static/swagger-ui mount). When False all five return 404 (one flag). Any route audit must condition the same set on this flag.
     args.enable_api_docs = get_env_value("ENABLE_API_DOCS", True, bool)
 
     # AI-generated content notice shown under every answer in the two query

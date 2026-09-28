@@ -34,6 +34,7 @@
       <a href="README-zh.md"><img src="https://img.shields.io/badge/🇨🇳中文版-1a1a2e?style=for-the-badge"></a>
       <a href="README.md"><img src="https://img.shields.io/badge/🇺🇸English-1a1a2e?style=for-the-badge"></a>
       <a href="README-ja.md"><img src="https://img.shields.io/badge/🇯🇵日本語版-1a1a2e?style=for-the-badge"></a>
+      <a href="README-id.md"><img src="https://img.shields.io/badge/🇮🇩Bahasa%20Indonesia-1a1a2e?style=for-the-badge"></a>
     </p>
     <p>
       <a href="https://pepy.tech/projects/lightrag-hku"><img src="https://static.pepy.tech/personalized-badge/lightrag-hku?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads"></a>
@@ -268,7 +269,7 @@ brew install cairo
 4. **支持增量更新与局部删除**：LightRAG 解决了基于图的知识库难以增量更新和局部删除的问题，保证系统在动态数据环境下的时效性。删除文档时，系统可以利用构建阶段的 LLM 缓存快速重建受影响的实体与关系，大幅提升知识库的更新效率。
 5. **支持多种文档解析引擎**：LightRAG 的文件处理管线支持 MinerU、Docling 和 Native 等文档解析引擎，也支持第三方扩展解析引擎。LightRAG 专属的 Native 引擎可高效解析 Word 和 Markdown 文档中的图片、表格和公式，尤其适合处理多模态内容丰富的文档。Native 引擎还支持自动识别和纠正 Word 文档的章节标题，即使文档大纲不规范，也能改善内容提取效果，为后续按章节进行文本分块打下基础。
 6. **支持多种文本分块策略**：LightRAG 支持 4 种文本分块策略，分别是 `固定长度分块(F)`、`递归字符分块(R)`、`向量语义分块(V)` 和 `段落语义分块(P)`。其中，`段落语义分块(P)` 是 LightRAG 专属的分块策略，可以**让分块边界尽可能对齐文档原生的语义边界**（标题、段落和表格），从而减少标题与内容错配、长表格切分后丢失标题行等问题。
-7. **支持多种存储后端**：LightRAG 默认的 KV、向量和图存储均采用基于本地文件持久化的内存数据库，非常适合研究者快速评估项目。LightRAG 还支持多种主流后端存储，可用于大规模数据集的生产部署。
+7. **支持多种存储后端**：LightRAG 默认的 KV、向量和图存储均采用基于本地文件持久化的内存数据库，**仅适合小数据量的测试与效果评估，不适用于生产环境**。LightRAG 还支持多种主流后端存储（推荐 PostgreSQL），可用于大规模数据集的生产部署。
 
 ### 多模态能力的升级
 
@@ -359,7 +360,11 @@ LightRAG 需要使用到 4 种后台存储类型，分别是：
 - **GRAPH_STORAGE**：用于保存知识图谱。
 - **DOC_STATUS_STORAGE**：用于保存文件列表。
 
-LightRAG 的默认存储全部都是基于文件进行持久化的内存数据库。默认存储仅用于开发调试，不适合用于生产环境部署。生产环境如果希望使用同一个后台数据解决 4 种类型的后台存储，可以选择 PostgreSQL、MongoDB 或 OpenSearch。也可以单独为向量存储或图存储选择专业化的数据库，例如使用 Milvus 或 Qdrant 作为向量存储，使用 Neo4j 或 Memgraph 作为图存储。
+**4 种默认存储全部都是内存数据库**（`JsonKVStorage`、`NanoVectorDBStorage`、`NetworkXStorage`、`JsonDocStatusStorage`）：全部数据常驻服务进程的内存中，`WORKING_DIR` 下的本地文件仅用于持久化，因此容量受可用内存限制。默认存储**仅适合小数据量的测试、效果评估与开发调试，不能用于生产环境部署**。
+
+生产环境**推荐使用 PostgreSQL** —— 它可以独自承担全部 4 种类型的后台存储；MongoDB 与 OpenSearch 是另外两个单一后端方案。也可以单独为向量存储或图存储选择专业化的数据库，例如使用 Milvus 或 Qdrant 作为向量存储，使用 Neo4j 或 Memgraph 作为图存储。
+
+各存储类型的完整可选实现列表，请参考 [支持的存储类型](./docs/LightRAG-API-Server-zh.md#支持的存储类型)。
 
 ### 文档处理阶段其他重要配置
 
@@ -443,7 +448,7 @@ python examples/lightrag_openai_demo.py
 
 如需流式响应示例的实现代码，请参阅 `examples/lightrag_openai_compatible_demo.py`。运行前，请确保根据需求修改示例代码中的LLM及嵌入模型配置。
 
-**注意1**：在运行demo程序的时候需要注意，不同的测试程序可能使用的是不同的embedding模型，更换不同的embeding模型的时候需要把清空数据目录（`./dickens`），否则层序执行会出错。如果你想保留LLM缓存，可以在清除数据目录时保留`kv_store_llm_response_cache.json`文件。
+**注意1**：在运行 demo 程序的时候需要注意，不同的测试程序可能使用的是不同的 embedding 模型。一个模型写入的向量对另一个模型不可用，所以更换 embedding 模型后必须重建向量。对 **demo 数据**而言，最简单的做法是直接删除 demo 目录（`./dickens`）后重跑——语料很小且可丢弃；想保留 LLM 缓存可以保留 `kv_store_llm_response_cache.json` 文件。但**生产部署请不要删除工作目录**：它保存着知识图谱和文本块，删掉会把重新嵌入变成全量重新摄取。正确做法是运行 `lightrag-rebuild-vdb`，参见 [Switching embedding models](./docs/ProgramingWithCore.md#switching-embedding-models)。
 
 **注意2**：官方支持的示例代码仅为 `lightrag_openai_demo.py` 和 `lightrag_openai_compatible_demo.py` 两个文件。其他示例文件均为社区贡献内容，尚未经过完整测试与优化。
 
