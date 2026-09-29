@@ -4554,7 +4554,10 @@ def safe_unicode_decode(content):
         replace_unicode_escape, content.decode("utf-8")
     )
 
-    return decoded_content
+    # A character outside the BMP is escaped as a surrogate pair, which the
+    # substitution leaves as two lone surrogates that UTF-8 cannot encode.
+    # Join each pair into one character; an unpaired half becomes U+FFFD.
+    return decoded_content.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
 
 
 def exists_func(obj, func_name: str) -> bool:
