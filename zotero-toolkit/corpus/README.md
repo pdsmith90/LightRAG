@@ -176,7 +176,20 @@ Every body passes through `clean_md`, in this order:
 4. `<br>` soup becomes newlines, and HTML tag markup is stripped. Only real tag
    shapes are stripped, and never the element text, so math like `a<b, c>d`
    survives.
-5. **Reference-list sections are removed.** Detection works line by line. A run of
+5. **Back-of-book indexes are removed.** A subject, name or author index (a heading
+   such as "Index", "Subject Index" or "Index of Programs") in the last quarter of a
+   document is dropped from that heading to the end of the document, or to the first
+   heading that is not part of the index, or to a table: back matter such as a table
+   of constants or a publisher's series page stays. The region goes only when at
+   least 60% of its lines read as index entries (page numbers, or a "see"
+   cross-reference). Index chunks carry no content, and small extraction models tend
+   to loop on them until the request times out. Each decision is printed to the
+   build log:
+
+   ```
+   [build_corpus] INDEX stripped|kept <file>: ...
+   ```
+6. **Reference-list sections are removed.** Detection works line by line. A run of
    at least 5 citation-shaped entries is dropped, together with a
    "References"-style heading directly above it. The detector tolerates wrapped
    entries, running headers and many citation styles. Tables and code fences are
@@ -189,12 +202,12 @@ Every body passes through `clean_md`, in this order:
    ```
    [build_corpus] VALVE relaxed|kept whole <file>: references N% of the text, M chars of body -- ...
    ```
-6. **Repeated page furniture is removed.** A line of 40 or more characters that
+7. **Repeated page furniture is removed.** A line of 40 or more characters that
    repeats 5 or more times (digits normalised) keeps its first occurrence, and the
    later copies are dropped. Markdown structure (tables, lists, headings, quotes)
    is never a candidate. If this would shrink the document by more than 25%, the
    document is left unchanged.
-7. Runs of blank lines are collapsed.
+8. Runs of blank lines are collapsed.
 
 ### When an output counts as up to date
 
@@ -313,6 +326,9 @@ when there is one.
 - The reference-list stripper is tuned on scientific journal articles, books and
   theses in many citation styles. Documents that are mostly bibliography are
   kept whole by the safety valve rather than emptied.
+- The index stripper acts only on the last quarter of a document and stops at the
+  first table row, so an index laid out as a table, or placed earlier by a PDF's
+  page order, is kept.
 
 ## Tests
 

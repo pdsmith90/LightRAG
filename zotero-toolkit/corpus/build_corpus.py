@@ -493,6 +493,172 @@ def _strip_references(md: str) -> str:
     return cleaned
 
 
+# ---- back-of-book indexes ------------------------------------------------------
+# A subject, name or author index is a page-number list of every term in a book.
+# The extraction LLM mints one entity per entry with nothing to say about it, and
+# an index chunk is where a small extraction model loops: one such chunk can
+# generate until its request times out, on every retry, and fail the whole
+# document. Cut the index at the source.
+#
+# A region starts at an index HEADING -- a markdown heading or a bold-only line
+# whose text, without markup and page numbers, is an index title ("Subject Index",
+# "Index", "Index of Programs", "AUTHOR INDEX", "Sachverzeichnis") -- in the last
+# quarter of the document. It runs to the end of the document, or to the first
+# heading that is not index furniture (letter groups "A", "Symbols", page running
+# headers such as "512 Author Index", further index titles, or a short heading
+# whose section still reads as index entries -- an entry with sub-entries rendered
+# as a heading), or to a table row: publisher advertisements and back matter such
+# as a table of constants follow some indexes and stay. A region is cut only when
+# >= _IDX_MIN_DENSITY of its non-blank lines read as index entries (page numbers,
+# or a "see" cross-reference) and it holds at least _IDX_MIN_LINES of them. The
+# position gate bounds any cut to the last quarter of the document (over a few
+# thousand parsed documents the cuts hit books only, the largest about a tenth of
+# one), and the output text is never rewritten -- only whole lines are dropped.
+_IDX_MIN_POS = 0.75
+_IDX_MIN_DENSITY = 0.60
+_IDX_MIN_LINES = 5
+_idx_markup_re = re.compile(r"<[^<>]{1,40}>|[*_#`]+")
+_idx_bold_line_re = re.compile(r"^\s*(?:\*\*|__)(?=\S).{0,80}?(?:\*\*|__)\s*$")
+_idx_md_heading_re = re.compile(r"^\s*#{1,6}\s")
+_idx_title_re = re.compile(
+    r"(?:(?:subject|name|author|keyword|general|notation|symbol|topic|program|cumulative|combined)s?\s+)?"
+    r"(?:index|indices|indexes)"
+    r"|(?:index|indices|indexes)\s+of\s+[a-z][a-z\s-]{1,40}"
+    r"|(?:sach|namens?|stichwort|personen|autoren|schlagwort)(?:-?\s*und\s*(?:sach|namens?))?-?\s*verzeichnis",
+    re.IGNORECASE,
+)
+_idx_furniture_re = re.compile(
+    r"[^\W\d_]{1,3}(?:\s*[-–—]\s*[^\W\d_]{1,3})?|\d*|symbols?|numerics?|numbers|numerals|greek(?:\s+letters)?",
+    re.IGNORECASE,
+)
+_idx_page_re = re.compile(
+    r"(?<![\w.])\d{1,4}(?:\s*[-–—]\s*\d{1,4})?(?:ff?\.?|[a-z])?(?![\w])"
+)
+_idx_word_re = re.compile(r"[^\W\d_]{2,}")
+_idx_see_re = re.compile(r"\bsee(?:\s+also)?\b", re.IGNORECASE)
+_idx_table_re = re.compile(r"^\s*\|")
+_idx_logged = set()
+
+
+def _idx_heading_text(line: str):
+    """The text of a heading or bold-only line without markup, else None."""
+    if not (_idx_md_heading_re.match(line) or _idx_bold_line_re.match(line)):
+        return None
+    return re.sub(r"\s+", " ", _idx_markup_re.sub(" ", line)).strip()
+
+
+def _idx_title(text: str) -> bool:
+    """An index title, allowing a page number on either side (running headers)."""
+    t = re.sub(r"^\d{1,4}\s+|\s+\d{1,4}$", "", text).strip(" .:")
+    return bool(_idx_title_re.fullmatch(t))
+
+
+def _idx_entry_like(line: str) -> bool:
+    t = re.sub(r"\s+", " ", _idx_markup_re.sub(" ", line)).strip()
+    if not t:
+        return False
+    pages = len(_idx_page_re.findall(t))
+    if pages == 0:
+        return len(t) <= 200 and bool(_idx_see_re.search(t))
+    return len(t) <= 160 or pages >= 0.15 * max(len(_idx_word_re.findall(t)), 1)
+
+
+def _idx_continues(lines: list, j: int) -> bool:
+    """A short heading inside an index whose section still reads as index entries --
+    an entry with sub-entries rendered as a heading. Back matter after an index does
+    not pass: a long title (a publisher's series page), a table under the heading (a
+    table of constants), or prose (a list of participants)."""
+    if len(_idx_heading_text(lines[j]).split()) > 4:
+        return False
+    seg = []
+    for ln in lines[j + 1 : j + 61]:
+        if _idx_table_re.match(ln):
+            return False
+        if _idx_heading_text(ln) is not None:
+            break
+        if ln.strip():
+            seg.append(ln)
+    return len(seg) >= 2 and sum(map(_idx_entry_like, seg)) >= 0.7 * len(seg)
+
+
+def _idx_region_end(lines: list, start: int) -> int:
+    """Index of the first line AFTER the index region that starts at `start`."""
+    for j in range(start + 1, len(lines)):
+        ln = lines[j]
+        if _idx_table_re.match(ln):
+            return j
+        text = _idx_heading_text(ln)
+        if text is None:
+            continue
+        if (
+            _idx_title(text)
+            or _idx_furniture_re.fullmatch(re.sub(r"[^\w\s]", "", text).strip())
+            or _idx_entry_like(ln)
+            or _idx_continues(lines, j)
+        ):
+            continue  # letter group, running header, bold page number, next index, sub-entry head
+        return j
+    return len(lines)
+
+
+def _strip_back_index(md: str) -> str:
+    doc = _ref_doc
+    lines = md.split("\n")
+    n, total = len(lines), len(md)
+    if not total:
+        return md
+    pos, offsets = 0, []
+    for ln in lines:
+        offsets.append(pos)
+        pos += len(ln) + 1
+    drop, verdicts, i = [], [], 0
+    while i < n:
+        text = _idx_heading_text(lines[i])
+        if text is None or not _idx_title(text) or offsets[i] < _IDX_MIN_POS * total:
+            i += 1
+            continue
+        end = _idx_region_end(lines, i)
+        body = [
+            ln
+            for ln in lines[i + 1 : end]
+            if ln.strip() and _idx_heading_text(ln) is None
+        ]
+        entries = sum(1 for ln in body if _idx_entry_like(ln))
+        density = entries / len(body) if body else 0.0
+        if entries >= _IDX_MIN_LINES and density >= _IDX_MIN_DENSITY:
+            drop.append((i, end))
+            verdicts.append(
+                f"'{text[:40]}' line {i} ({offsets[i] / total:.1%}), {end - i} lines, density {density:.2f}"
+            )
+        else:
+            verdicts.append(
+                f"KEPT '{text[:40]}' line {i}: {entries} entry lines, density {density:.2f}"
+            )
+        i = end
+    if not drop:
+        if doc and verdicts and doc not in _idx_logged:
+            _idx_logged.add(doc)
+            print(
+                f"[build_corpus] INDEX kept {doc}: " + "; ".join(verdicts), flush=True
+            )
+        return md
+    if doc and doc not in _idx_logged:
+        cut = sum(offsets[e] if e < n else total for _, e in drop) - sum(
+            offsets[s] for s, _ in drop
+        )
+        _idx_logged.add(doc)
+        print(
+            f"[build_corpus] INDEX stripped {doc}: {cut} chars ({cut / total:.1%}); "
+            + "; ".join(verdicts),
+            flush=True,
+        )
+    keep = [True] * n
+    for s, e in drop:
+        for k in range(s, e):
+            keep[k] = False
+    return "\n".join(ln for k, ln in enumerate(lines) if keep[k])
+
+
 def clean_md(md: str) -> str:
     md = _pic_re.sub("", md)  # drop OCR'd figure-scribble noise
     md = _datauri_re.sub("", md)  # embedded data: images
@@ -503,6 +669,7 @@ def clean_md(md: str) -> str:
     md = re.sub(r"(?:<br>\s*){2,}", "\n", md)  # collapse <br> soup
     md = re.sub(r"<br\s*/?>", "\n", md, flags=re.IGNORECASE)  # lone <br> residue
     md = _tag_re.sub("", md)  # HTML tag residue from pandoc raw-html passthrough
+    md = _strip_back_index(md)  # back-of-book subject/name/author indexes
     md = _strip_references(md)  # bibliography / reference-list sections
     md = _drop_repeats(md)  # running headers, page stamps
     md = _manyblank.sub("\n\n", md)
