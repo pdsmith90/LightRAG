@@ -7,7 +7,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from corpus_testlib import run_script
-from quarantine_junk import junk_ratio, load_denylist
+from quarantine_junk import junk_ratio, load_denylist, pua_ratio
 
 PROSE = (
     "The 2014 trial compared three scheduling heuristics on one benchmark suite, and we "
@@ -118,3 +118,54 @@ def test_default_denylist_is_empty_and_missing_corpus_is_not_an_error(tmp_path):
     ) == ["TEST0002__saved_page.md"]  # ratio rule only
     r = run_script("quarantine_junk.py", "--corpus", tmp_path / "nope")
     assert r.returncode == 0 and "nothing to do" in r.stdout
+
+
+# A scanned PDF whose fonts map every glyph into the Private Use Area: eight-character
+# "words" of U+F020.. codes, the shape pymupdf4llm produces from such a text layer.
+GLYPHS = "".join(chr(0xF020 + (i % 90)) for i in range(5000))
+GARBAGE = (
+    "# 978-0-000-00000-0\n\n"
+    + " ".join(GLYPHS[i : i + 8] for i in range(0, 5000, 8))
+    + "\n###### \n"
+)
+# Genuine text whose symbol font puts a few Greek letters into the PUA (about 4 %).
+GREEK_HEAVY = PROSE + " ".join(chr(0xF061 + (i % 20)) for i in range(100))
+
+
+def test_pua_ratio():
+    assert pua_ratio("") == 0.0
+    assert pua_ratio(PROSE) == 0.0
+    assert pua_ratio(GARBAGE) > 0.9
+    assert pua_ratio(GREEK_HEAVY) < 0.05
+    assert pua_ratio(GLYPHS[:300]) == 0.0  # under the 500 non-space floor
+    assert pua_ratio("".join(chr(0xF0000 + i) for i in range(600))) == 1.0  # plane 15
+
+
+def test_glyph_code_files_are_quarantined_and_greek_is_kept(tmp_path):
+    corpus = tmp_path / "rag_corpus"
+    corpus.mkdir()
+    (corpus / "TEST0010__garbled_scan.md").write_text(GARBAGE, encoding="utf-8")
+    (corpus / "TEST0011__greek_paper.md").write_text(GREEK_HEAVY, encoding="utf-8")
+    (corpus / "TEST0012__saved_page.md").write_text(JUNK, encoding="utf-8")
+    r = run_script("quarantine_junk.py", "--corpus", corpus)
+    assert r.returncode == 0, r.stderr
+    assert "[glyphs  ]" in r.stdout and "PUA glyph codes" in r.stdout
+    assert sorted(os.listdir(corpus)) == ["TEST0011__greek_paper.md"]
+    q = tmp_path / "rag_corpus_junk_quarantine"
+    log = {
+        json.loads(line)["file"]: json.loads(line)
+        for line in (q / "quarantined.jsonl").read_text().splitlines()
+    }
+    assert log["TEST0010__garbled_scan.md"]["reason"] == "glyphs"
+    assert log["TEST0010__garbled_scan.md"]["pua_ratio"] > 0.9
+    assert log["TEST0012__saved_page.md"]["reason"] == "ratio"
+    assert log["TEST0012__saved_page.md"]["pua_ratio"] == 0.0
+
+
+def test_min_pua_raises_the_bar(tmp_path):
+    corpus = tmp_path / "rag_corpus"
+    corpus.mkdir()
+    (corpus / "TEST0010__garbled_scan.md").write_text(GARBAGE, encoding="utf-8")
+    r = run_script("quarantine_junk.py", "--corpus", corpus, "--min-pua", "0.999")
+    assert r.returncode == 0 and "0 junk files" in r.stdout
+    assert os.listdir(corpus) == ["TEST0010__garbled_scan.md"]

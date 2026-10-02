@@ -14,7 +14,7 @@ storage/<KEY>/<attachment> ─────────────────�
 |---|---|
 | `build_metadata.py` | Reads `zotero.sqlite` and writes `zotero_metadata.json`, which maps every attachment's storage key to its bibliographic metadata. A rebuild never forgets a key: entries for attachments that Zotero no longer has are carried forward and flagged `"orphan": true`. |
 | `build_corpus.py` | Converts each `storage/<KEY>/` attachment into cleaned Markdown with a metadata header. It is resumable (only missing or outdated outputs are rebuilt), runs in parallel, and records what it did in `.manifest.jsonl`. |
-| `quarantine_junk.py` | Moves webpage-snapshot junk (a high markup/base64 ratio, or a denylist entry) out of the corpus root into `<corpus>_junk_quarantine/`. It never deletes anything and always exits 0. |
+| `quarantine_junk.py` | Moves webpage-snapshot junk (a high markup/base64 ratio, or a denylist entry) and glyph-code files (a text layer that is mostly Private Use Area code points) out of the corpus root into `<corpus>_junk_quarantine/`. It never deletes anything and always exits 0. |
 
 ## Install
 
@@ -75,7 +75,7 @@ all use the same file.
 | `--out DIR` | `<zotero>/rag_corpus` | Output corpus directory. |
 | `--meta FILE` | `$ZOTERO_METADATA`, else `<zotero>/zotero_metadata.json` | Metadata from `build_metadata.py`. If the file is missing, headers carry only the title `(untitled)` and the Zotero link. |
 | `--jobs N` | CPU count − 2 | Worker processes. Each worker can itself use several cores, because recent pymupdf4llm and Tesseract OCR are multi-threaded, so a few workers can keep many cores busy. Lower N on a shared machine. |
-| `--ocr auto\|off\|force` | `auto` | `auto` and `force` both run `ocrmypdf`, if installed, on PDFs with no usable text layer. `off` never runs it. |
+| `--ocr auto\|off\|force` | `auto` | `auto` and `force` both run `ocrmypdf`, if installed, on PDFs with no usable text layer: text shorter than `--min-chars`, or a garbled text layer (see *Converting each format*). `off` never runs it. |
 | `--min-chars N` | `200` | A PDF whose extracted text is shorter than this (whitespace excluded) is treated as image-only. |
 | `--limit N` | `0` (all) | Process only the first N storage folders, sorted by key. |
 | `--force` | off | Rebuild even when the output is up to date. |
@@ -94,6 +94,7 @@ all use the same file.
 | `--denylist FILES` | none | Comma-separated denylist files. |
 | `--min-junk R` | `0.90` | Move files whose junk ratio is at or above R. The ratio is `1 − prose/total`, where prose is the text left after removing base64 runs and HTML tags. |
 | `--min-chars N` | `500` | The ratio rule ignores files smaller than N. |
+| `--min-pua R` | `0.30` | Move files whose non-whitespace text is at least R Private Use Area code points (glyph codes from a font without a Unicode mapping, see *Converting each format*). Files with fewer than 500 non-whitespace characters are left alone. |
 | `--dry-run` | off | Report only. |
 
 **Denylist files.** Put one entry per line. `#` starts a comment, and only the first
@@ -155,8 +156,15 @@ Lines whose fields are empty are left out.
 ### Converting each format
 
 - **PDF.** The file goes through pymupdf4llm. If the text is shorter than
-  `--min-chars`, the fallbacks are tried in order: `--ocr-cache-dir`, then
-  `ocrmypdf` (unless `--ocr off`), then `--fallback-md-dir`.
+  `--min-chars`, or **garbled** — at least 30 % of its non-whitespace characters are
+  Unicode Private Use Area code points, which is what a scanned PDF whose fonts carry
+  no Unicode mapping yields (the log says `GARBLED text layer`) — the fallbacks are
+  tried in order: `--ocr-cache-dir`, then `ocrmypdf` (unless `--ocr off`), then
+  `--fallback-md-dir`. A garbled layer whose fallbacks are glyph codes too is written
+  as `pdf_needs_ocr` with the header only, never the glyph codes. The 30 % bar
+  (`GARBLED_PUA_RATIO`) sits in a measured gap: on a corpus of several thousand
+  academic PDFs, garbled files scored above 0.75 and every genuine file below 0.05,
+  a mathematics handbook with symbol-font Greek being the highest.
 - **HTML snapshot.** Zotero's own `.zotero-ft-cache` in the same folder is used when
   it is non-empty. Otherwise the page is converted with pandoc, or with
   BeautifulSoup if pandoc is missing.
@@ -269,7 +277,7 @@ folder:
 | `pdf+ocr` | OCR'd by `ocrmypdf`. With `--ocr off` and no cached or fallback text, the result is `pdf+ocr_empty`. |
 | `pdf+ocr_cache` | Taken from `--ocr-cache-dir`. |
 | `pdf_legacy_md` | Taken from `--fallback-md-dir`. |
-| `pdf_needs_ocr` | Image-only PDF, and OCR was unavailable or failed. It is indexed by its header only. |
+| `pdf_needs_ocr` | Image-only PDF, or one whose text layer is glyph codes, and OCR was unavailable, off or failed. It is indexed by its header only. |
 | `…_empty` suffix | The body came out shorter than `--min-chars`. |
 | `skip` | Up to date. |
 | `denylist` | Blocked by `--denylist`. |
@@ -322,7 +330,7 @@ when there is one.
   Items in group libraries need `zotero://select/groups/<id>/items/<KEY>`, which is
   not generated.
 - `--ocr force` currently behaves exactly like `auto`: OCR runs only on PDFs without
-  a usable text layer.
+  a usable text layer (empty or glyph codes).
 - The reference-list stripper is tuned on scientific journal articles, books and
   theses in many citation styles. Documents that are mostly bibliography are
   kept whole by the safety valve rather than emptied.

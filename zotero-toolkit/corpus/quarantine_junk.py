@@ -35,6 +35,19 @@ TWO INDEPENDENT RULES, because one is not enough:
    statistically identical; the difference is semantic. So confirmed junk is
    listed by Zotero storage key and quarantined on sight, regardless of score.
 
+3. GLYPH CODES (automatic, independent of 1 and 2). Some scanned PDFs carry a text
+   layer whose fonts map every glyph into the Unicode Private Use Area (U+E000-F8FF,
+   plus planes 15 and 16). PDF text extractors, and Zotero's own full-text index,
+   return those code points as "text", so such a file is neither empty (which would
+   send it to OCR in build_corpus) nor markup (rule 1): one scanned encyclopedia
+   became thousands of chunks of glyph codes that extracted nothing and kept the
+   ingest pipeline busy for a night. On a corpus of several thousand academic PDFs
+   the garbled files scored above 0.75 and every genuine file below 0.05 (symbol-font
+   Greek in a mathematics handbook was the highest), so 0.30 sits in a clean gap.
+   The ratio is PUA code points over NON-whitespace characters; files under 500 such
+   characters are left to --min-chars. build_corpus applies the same bar
+   (looks_garbled) and routes those PDFs to OCR; this rule is the second line.
+
 Scope: the corpus ROOT only. Those files are still pending ingest, so moving one
 keeps it out of the KB. Files already in __parsed__/ have been ingested; moving
 them does not retract them (that needs a doc delete) and would strand them from
@@ -44,7 +57,7 @@ Never deletes: moves to <corpus>_junk_quarantine/ and appends to quarantined.jso
 Always exits 0 so a bad heuristic can never abort a scheduled corpus update.
 
 Usage:
-  python3 quarantine_junk.py --corpus ~/Zotero/rag_corpus [--min-junk 0.90]
+  python3 quarantine_junk.py --corpus ~/Zotero/rag_corpus [--min-junk 0.90] [--min-pua 0.30]
                              [--denylist junk_denylist.txt,dupe_denylist.txt] [--dry-run]
 """
 
@@ -62,6 +75,19 @@ import time
 # 560-796 chars), and this scan finds them.
 _b64_re = re.compile(r"[A-Za-z0-9+/]{200,}={0,2}")
 _tag_re = re.compile(r"<[^>]+>")
+# Private Use Area: the BMP block and the two supplementary planes (U+F0000-10FFFD).
+_pua_re = re.compile(r"[\ue000-\uf8ff\U000f0000-\U0010ffff]")
+_ws_re = re.compile(r"\s+")
+PUA_MIN_NONSPACE = 500  # below this, leave the verdict to --min-chars
+
+
+def pua_ratio(text: str) -> float:
+    """Fraction of non-whitespace characters that are Private Use Area code points
+    (glyph codes from a font with no Unicode mapping). 0.0 for tiny texts."""
+    nonspace = len(_ws_re.sub("", text))
+    if nonspace < PUA_MIN_NONSPACE:
+        return 0.0
+    return len(_pua_re.findall(text)) / nonspace
 
 
 def junk_ratio(text: str) -> float:
@@ -129,6 +155,14 @@ def main() -> int:
         default=500,
         help="Ignore files smaller than this (default: 500).",
     )
+    ap.add_argument(
+        "--min-pua",
+        type=float,
+        default=0.30,
+        help="Move files whose non-whitespace text is at least this fraction Private "
+        "Use Area glyph codes (default: 0.30; garbled scans score above 0.75, "
+        "genuine documents below 0.05).",
+    )
     ap.add_argument("--dry-run", action="store_true", help="Report only; move nothing.")
     a = ap.parse_args()
 
@@ -152,15 +186,19 @@ def main() -> int:
         except OSError as e:
             print(f"quarantine_junk: WARN cannot read {name}: {e}")
             continue
+        jr, pr = junk_ratio(text), pua_ratio(text)
         if key in deny or name in deny:
-            hits.append(("denylist", junk_ratio(text), len(text), name))
-        elif len(text) >= a.min_chars and junk_ratio(text) >= a.min_junk:
-            hits.append(("ratio", junk_ratio(text), len(text), name))
+            hits.append(("denylist", jr, len(text), name, pr))
+        elif len(text) >= a.min_chars and jr >= a.min_junk:
+            hits.append(("ratio", jr, len(text), name, pr))
+        elif pr >= a.min_pua:
+            hits.append(("glyphs", pr, len(text), name, pr))
 
     if not hits:
         print(
             f"quarantine_junk: 0 junk files "
-            f"(ratio>={a.min_junk:.0%} or on denylist[{len(deny)}]) in {corpus}"
+            f"(ratio>={a.min_junk:.0%}, glyphs>={a.min_pua:.0%} or on "
+            f"denylist[{len(deny)}]) in {corpus}"
         )
         return 0
 
@@ -169,10 +207,11 @@ def main() -> int:
         os.makedirs(qdir, exist_ok=True)
     moved, failed, records = 0, 0, []
     stamp = time.strftime("%F %T")
-    for reason, r, size, name in hits:
+    for reason, r, size, name, pr in hits:
+        what = "PUA glyph codes" if reason == "glyphs" else "junk"
         print(
             f"quarantine_junk: {'DRY ' if a.dry_run else ''}[{reason:8s}] "
-            f"{r:6.1%} junk, {size:9d} chars — {name}"
+            f"{r:6.1%} {what}, {size:9d} chars — {name}"
         )
         records.append(
             {
@@ -180,6 +219,7 @@ def main() -> int:
                 "file": name,
                 "reason": reason,
                 "junk_ratio": round(r, 4),
+                "pua_ratio": round(pr, 4),
                 "chars": size,
             }
         )

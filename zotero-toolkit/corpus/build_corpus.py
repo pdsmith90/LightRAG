@@ -680,6 +680,27 @@ def looks_empty(text: str, min_chars: int) -> bool:
     return len(re.sub(r"\s+", "", text)) < min_chars
 
 
+# A text layer whose fonts map every glyph into the Unicode Private Use Area (U+E000-F8FF
+# and planes 15-16) is not empty, so looks_empty never sent it to OCR: PDF extractors and
+# Zotero's own full-text index return the glyph codes as "text", and one scanned
+# encyclopedia became thousands of chunks of them. On a corpus of several thousand
+# academic PDFs the garbled files scored above 0.75 and every genuine file below 0.05
+# (symbol-font Greek in a mathematics handbook was the highest), so 0.30 sits in a clean
+# gap. quarantine_junk.py applies the same bar to the corpus root as a second line.
+GARBLED_PUA_RATIO = 0.30
+_pua_re = re.compile(r"[\ue000-\uf8ff\U000f0000-\U0010ffff]")
+
+
+def pua_share(text: str) -> float:
+    """Private Use Area code points over non-whitespace characters (0.0 under 500 of them)."""
+    nonspace = len(re.sub(r"\s+", "", text))
+    return len(_pua_re.findall(text)) / nonspace if nonspace >= 500 else 0.0
+
+
+def looks_garbled(text: str) -> bool:
+    return pua_share(text) >= GARBLED_PUA_RATIO
+
+
 # ---------- per-format extractors ----------
 def pdf_to_md(path: str) -> str:
     import pymupdf4llm
@@ -951,7 +972,15 @@ def convert(key: str):
     try:
         if kind == PDF:
             body = pdf_to_md(src)
-            if looks_empty(body, CFG["min_chars"]):
+            garbled = looks_garbled(body)
+            if garbled:
+                print(
+                    f"[build_corpus] GARBLED text layer {os.path.basename(src)}: "
+                    f"{pua_share(body):.0%} of the text is Private Use Area glyph codes "
+                    "-> OCR route",
+                    flush=True,
+                )
+            if looks_empty(body, CFG["min_chars"]) or garbled:
                 method = "pdf+ocr"
                 # 1) reuse pre-OCR'd text
                 pre = (
@@ -971,6 +1000,10 @@ def convert(key: str):
                     old = os.path.join(CFG["fallback_md"], stem + ".md")
                     if os.path.exists(old):
                         body, method = txt_to_md(old), "pdf_legacy_md"
+            if garbled and looks_garbled(body):
+                # OCR unavailable or failed, and every fallback is the same glyph codes:
+                # write the header only, never the garbage.
+                body, method = "", "pdf_needs_ocr"
         elif kind == DOCX:
             body = docx_to_md(src)
         elif kind == PPTX:
