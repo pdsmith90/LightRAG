@@ -42,14 +42,14 @@ Zotero data directory (zotero.sqlite + storage/)
     │
     │  corpus/build_metadata.py   ──▶  zotero_metadata.json
     │  corpus/build_corpus.py     ──▶  rag_corpus/<KEY>__<slug>.md
-    │  corpus/quarantine_junk.py       optional: moves web-snapshot junk aside
+    │  corpus/quarantine_junk.py       optional: moves web-snapshot and glyph-code junk aside
     ▼
 rag_corpus/  ──INPUT_DIR, scan──▶  LightRAG Server  ──▶  LLM and reranker servers
                                       ▲       │         (optionally via fronts/:
                                       │       ▼         primary, else fallback)
            REST: /query, /query/data, │   PostgreSQL + pgvector + Apache AGE
            /documents/text            │       ▲
-                                      │       └── maintenance/clean_dangling_refs.py
+                                      │       └── maintenance/clean_dangling_refs.py, pua_scan.py
                           mcp/lightrag_mcp_server.py  ◀──  zotero_metadata.json
                                       ▲
                                       │  MCP over stdio
@@ -60,7 +60,7 @@ rag_corpus/  ──INPUT_DIR, scan──▶  LightRAG Server  ──▶  LLM and
 | --- | --- | --- |
 | [`corpus/`](corpus/README.md) | Converts every Zotero attachment into Markdown with a metadata header, strips reference lists and page furniture, and names each file `<KEY>__<slug>.md` after its Zotero storage key. Resumable and parallel. | Python ≥ 3.10, `pymupdf4llm`; optional format handlers, `pandoc`, `djvutxt`, `ocrmypdf` |
 | [`mcp/`](mcp/README.md) | A stdio MCP server that proxies the LightRAG Server API. It compiles citations (authors, year, title, venue, DOI, `zotero://` link) from LightRAG's `references` array and `zotero_metadata.json`, and replaces any reference list the answering model wrote. | `mcp` 2.x, `httpx`; LightRAG Server ≥ 1.4.9 |
-| [`maintenance/`](maintenance/README.md) | Finds and removes references to chunks that no longer exist, across the vector tables, chunk maps and AGE graph of a PostgreSQL workspace. Dry run, in-place sweep, or an auditable scan/commit with backups. Refuses to write while the ingest pipeline is busy. | `asyncpg`; the schema of lightrag-hku 1.5.7 |
+| [`maintenance/`](maintenance/README.md) | Finds and removes references to chunks that no longer exist, across the vector tables, chunk maps and AGE graph of a PostgreSQL workspace. Dry run, in-place sweep, or an auditable scan/commit with backups. Refuses to write while the ingest pipeline is busy. Also lists documents whose stored text is glyph codes from a font without a Unicode mapping (`pua_scan.py`). | `asyncpg`; the schema of lightrag-hku 1.5.7 |
 | [`fronts/`](fronts/README.md) | Two small HTTP fronts, one for OpenAI-compatible chat completions and one for `/v1/rerank`. Each tries a primary backend and replays the request against a fallback, with a circuit breaker and health endpoint. | Python standard library only |
 
 The components are independent. Each is a directory of scripts with its own README and
@@ -126,7 +126,9 @@ cd zotero-toolkit
    if you have a second place to run a model. Run
    [`maintenance/clean_dangling_refs.py`](maintenance/README.md) with `--sweep --dry-run`
    if your workspace lives in PostgreSQL and documents were ever removed behind LightRAG's
-   back. It needs its own requirements in the same virtual environment first:
+   back, and [`maintenance/pua_scan.py`](maintenance/README.md#finding-glyph-code-documents-pua_scanpy)
+   once, to find documents ingested from scanned PDFs whose text layer is glyph codes.
+   Both need their own requirements in the same virtual environment first:
    `python3 -m pip install -r maintenance/requirements.txt`.
 
 When the library changes, re-run step 1 and scan again. Only new or changed attachments

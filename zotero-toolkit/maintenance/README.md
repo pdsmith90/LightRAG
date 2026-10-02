@@ -184,6 +184,38 @@ backstop sweep, something like:
 @daily  PYTHON=/path/to/venv/bin/python /path/to/LightRAG/zotero-toolkit/maintenance/run_when_idle.sh --env-file /path/to/lightrag/.env >> /path/to/sweep.log 2>&1
 ```
 
+## Finding glyph-code documents: `pua_scan.py`
+
+A scanned PDF whose fonts map every glyph into the Unicode Private Use Area (U+E000-F8FF
+and planes 15-16) passes every text extractor as text, so it can reach the knowledge
+base as thousands of chunks of glyph codes that extract nothing and keep the ingest
+pipeline busy for hours. `corpus/build_corpus.py` now routes such text layers to OCR and
+`corpus/quarantine_junk.py` catches them at the corpus root; `pua_scan.py` is the audit
+for documents that were ingested before those checks existed.
+
+```bash
+python maintenance/pua_scan.py --env-file /path/to/lightrag/.env
+```
+
+Read-only. One pass over `lightrag_doc_full` of the workspace, joined to
+`lightrag_doc_status`, prints one `WARN` line per document whose PUA code points make up
+at least `--min-ratio` (default `0.30`) of its content, with its status, chunk count and
+length, then a summary line. Garbled scans score 0.70-0.95; genuine documents with a
+symbol font stay under 0.05. It needs only `POSTGRES_*` and the workspace from the
+configuration above — not the vector tables or the server — and it never writes.
+
+| code | meaning |
+| --- | --- |
+| 0 | no document at or above the bar |
+| 1 | documents reported |
+| 2 | database error |
+
+To remove a reported document, use LightRAG's own delete path (`DELETE
+/documents/delete_document` with its id; it rebuilds the entities the document shared
+with others, which takes minutes for a large book), then either add its storage key to
+the corpus denylist so the next build does not regenerate it, or remove its parsed
+output and let the build re-convert it through OCR.
+
 ## Tests
 
 From the `zotero-toolkit/` directory, in a virtualenv with `maintenance/requirements.txt` and `pytest`:
@@ -192,7 +224,7 @@ From the `zotero-toolkit/` directory, in a virtualenv with `maintenance/requirem
 python -m pytest tests/maintenance
 ```
 
-The unit tests run offline. The integration test
+The unit tests run offline (`pua_scan.py`'s replace the database driver with a fake). The integration test
 (`tests/maintenance/test_clean_dangling_refs_pg.py`) is skipped unless
 `CLEAN_DANGLING_TEST_DSN` points at a **scratch** PostgreSQL database with Apache AGE and
 `lightrag-hku==1.5.7` is installed. It writes a workspace through LightRAG's own storages,
