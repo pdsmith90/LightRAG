@@ -701,12 +701,149 @@ def looks_garbled(text: str) -> bool:
     return pua_share(text) >= GARBLED_PUA_RATIO
 
 
+# ---------- pages pymupdf4llm drops: repair them from the PDF's own text layer ----------
+# Two failure classes, measured on a corpus of several thousand academic PDFs:
+#
+# 1. Scans whose invisible OCR text is drawn BEFORE the full-page image (common in
+#    publishers' legacy journal scans; page.get_texttrace() shows the text spans at
+#    sequence 0-2 with type 3 and the image after them). pymupdf4llm 1.28, built on
+#    pymupdf-layout, treats text under a later image as hidden, so such a page comes out
+#    as its visible download watermark only: a few hundred characters of a
+#    3,000-6,000-character layer, once per page. Scans drawn image-first are fine.
+# 2. Born-digital papers lose whole pages that carry a figure: with its default
+#    use_ocr=True the engine OCRs such a page and keeps the Tesseract text instead of
+#    the real layer (one 14-page paper kept 6-39 % on 7 pages). Not caught by any
+#    document-level size check, because the document as a whole keeps 50-70 %.
+#
+# page.get_text() reads the layer in both cases. Every PDF therefore goes through one
+# per-page pass (page_chunks=True; joined with "" it is byte-identical to the plain
+# output) with the engine's own OCR off -- it helps neither class, costs about a second
+# per page, and on ordinary pages it swapped the real text for a worse OCR of the page
+# image -- and a page that kept less than TEXTLAYER_PAGE_KEEP of a text layer of at
+# least TEXTLAYER_PAGE_MIN characters is replaced by that layer as paragraphs. Pages
+# the engine handled keep their markdown. Image-only PDFs (full-page images, no text
+# layer at all) return "" so convert() takes its OCR route; before, a visible watermark
+# alone kept such a scan from looking empty.
+TEXTLAYER_PAGE_KEEP = 0.4  # a page that kept less than this of its layer is repaired
+TEXTLAYER_PAGE_MIN = 400  # ...if the layer has at least this many non-space characters
+TEXTLAYER_IMAGE_COVER = 0.7  # image area / page area for a page to count as a scan
+_pdf_method = (
+    ""  # "pdf+textlayer" when pages were repaired; convert() labels the method
+)
+_sentence_end = re.compile(r"[.!?:;]['\")\]]?$")
+
+
+def _nonws_len(text: str) -> int:
+    return len(re.sub(r"\s+", "", text))
+
+
+def _image_only_doc(doc) -> tuple[bool, int, int]:
+    """(image_only, hits, sampled): most sampled pages are a full-page image with
+    fewer than TEXTLAYER_PAGE_MIN characters of text."""
+    import pymupdf
+
+    n = doc.page_count
+    idx = (
+        sorted({round(i * (n - 1) / 7) for i in range(8)}) if n > 8 else list(range(n))
+    )
+    hits = 0
+    for i in idx:
+        page = doc[i]
+        area = abs(page.rect) or 1.0
+        try:
+            imgs = page.get_image_info()
+        except Exception:
+            imgs = []
+        cover = (
+            sum(abs(pymupdf.Rect(im["bbox"])) for im in imgs) / area if imgs else 0.0
+        )
+        if (
+            cover >= TEXTLAYER_IMAGE_COVER
+            and _nonws_len(page.get_text("text")) < TEXTLAYER_PAGE_MIN
+        ):
+            hits += 1
+    return (bool(idx) and hits / len(idx) >= 0.5), hits, len(idx)
+
+
+def _textlayer_page_md(page) -> str:
+    """One page's text layer as paragraphs. OCR layers often make every LINE its own
+    block, so a block is merged into the previous one unless that one ends a sentence
+    and this one starts a new one."""
+    paras: list[str] = []
+    for b in page.get_text("blocks"):
+        if len(b) > 6 and b[6] != 0:  # image blocks
+            continue
+        t = re.sub(
+            r"-\n(?=[a-z])", "", b[4]
+        )  # re-join words hyphenated at a line break
+        t = re.sub(r"\s*\n\s*", " ", t).strip()
+        if not t:
+            continue
+        if paras and not (
+            _sentence_end.search(paras[-1]) and (t[0].isupper() or t[0].isdigit())
+        ):
+            if paras[-1].endswith("-") and t[0].islower():
+                paras[-1] = paras[-1][:-1] + t
+            else:
+                paras[-1] += " " + t
+        else:
+            paras.append(t)
+    return "\n\n".join(paras)
+
+
 # ---------- per-format extractors ----------
 def pdf_to_md(path: str) -> str:
+    import pymupdf
     import pymupdf4llm
 
+    global _pdf_method
+    _pdf_method = ""
+    name = os.path.basename(path)
     try:
-        return clean_md(pymupdf4llm.to_markdown(path, show_progress=False))
+        doc = pymupdf.open(path)
+        empty, hits, sampled = _image_only_doc(doc)
+        if empty:
+            doc.close()
+            print(
+                f"[build_corpus] IMAGE-ONLY {name}: {hits}/{sampled} sampled pages are a "
+                "full-page image with no text layer -> OCR route",
+                flush=True,
+            )
+            return ""
+        chunks = pymupdf4llm.to_markdown(
+            path, page_chunks=True, show_progress=False, use_ocr=False
+        )
+        out: list[str] = []
+        repaired = regained = total = kept = 0
+        for i, ch in enumerate(chunks):
+            text = ch.get("text", "") if isinstance(ch, dict) else str(ch)
+            pno = (
+                ((ch.get("metadata") or {}).get("page_number") or (i + 1)) - 1
+                if isinstance(ch, dict)
+                else i
+            )
+            if not (0 <= pno < doc.page_count):
+                out.append(text)
+                continue
+            layer, got = _nonws_len(doc[pno].get_text("text")), _nonws_len(text)
+            total += layer
+            kept += got
+            if layer >= TEXTLAYER_PAGE_MIN and got < TEXTLAYER_PAGE_KEEP * layer:
+                text = _textlayer_page_md(doc[pno])
+                repaired += 1
+                regained += layer
+            out.append(text)
+        doc.close()
+        md = "".join(out)
+        if repaired:
+            _pdf_method = "pdf+textlayer"
+            print(
+                f"[build_corpus] TEXTLAYER {name}: pymupdf4llm kept {kept} of {total} text-layer "
+                f"chars ({kept / max(total, 1):.0%}); {repaired}/{len(chunks)} page(s) replaced by "
+                f"their text layer (+{regained} chars)",
+                flush=True,
+            )
+        return clean_md(md)
     except Exception as e:
         # pymupdf4llm raises on some malformed PDFs instead of degrading. Seen
         # on a large scanned PDF: a table is detected but its grid is not, and
@@ -972,6 +1109,8 @@ def convert(key: str):
     try:
         if kind == PDF:
             body = pdf_to_md(src)
+            if _pdf_method:
+                method = _pdf_method
             garbled = looks_garbled(body)
             if garbled:
                 print(

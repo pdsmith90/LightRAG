@@ -155,7 +155,16 @@ Lines whose fields are empty are left out.
 
 ### Converting each format
 
-- **PDF.** The file goes through pymupdf4llm. If the text is shorter than
+- **PDF.** The file goes through pymupdf4llm, one page at a time with the engine's
+  own OCR off. A page the engine emptied — it kept less than 40 % of a text layer of
+  at least 400 characters, which happens to scans whose OCR text is drawn under the
+  page image (the page comes back as its download watermark only) and to figure pages
+  of born-digital papers — is replaced by that page's text layer as paragraphs; the
+  other pages keep their markdown. Such files are labelled `pdf+textlayer` in the
+  summary and the log says `TEXTLAYER <file>: pymupdf4llm kept N of M text-layer
+  chars; k/n page(s) replaced`. A PDF whose pages are full-page images with no text
+  layer at all (`IMAGE-ONLY` in the log) goes straight to the OCR fallbacks below. If
+  the text is shorter than
   `--min-chars`, or **garbled** — at least 30 % of its non-whitespace characters are
   Unicode Private Use Area code points, which is what a scanned PDF whose fonts carry
   no Unicode mapping yields (the log says `GARBLED text layer`) — the fallbacks are
