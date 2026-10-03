@@ -216,6 +216,30 @@ with others, which takes minutes for a large book), then either add its storage 
 the corpus denylist so the next build does not regenerate it, or remove its parsed
 output and let the build re-convert it through OCR.
 
+## Finding conversions that lost their text layer: `textlayer_audit.py`
+
+A markdown file that holds far less text than its PDF's own text layer is the signature
+of pages pymupdf4llm dropped — scans whose OCR text sits under the page image, or figure
+pages of born-digital papers that its built-in OCR replaced with a worse pass — or of an
+extractor failure that left a header-only file. `corpus/build_corpus.py` repairs the
+first two from the text layer since the text-layer route; this is the audit for files
+converted before that, and the backstop to run after every build.
+
+    python3 maintenance/textlayer_audit.py --zotero ~/Zotero \
+        --corpus ~/Zotero/rag_corpus ~/Zotero/rag_corpus/__parsed__ --keys-out /tmp/lost.txt
+
+Read-only; needs `pymupdf`. For every `<KEY>__*.md` it opens `<zotero>/storage/<KEY>/*.pdf`,
+estimates the text layer from up to six sampled pages times the page count, and compares
+it with the markdown body (after the metadata header). A document is listed when kept /
+layer is below `--max-ratio` (default 0.35; lossy conversions measured so far kept
+0.01–0.16, clean ones 0.6–1.1) and the layer holds at least `--min-layer` non-space
+characters (default 3,000). `--since-hours H` restricts the audit to files changed
+recently (a daily build's output), `--json-out` keeps every measurement. Exit 0 = none,
+1 = documents listed, 2 = a directory could not be read. To fix a listed file that is not
+yet ingested, remove it and run `build_corpus.py` again; for one already in the workspace,
+delete it through LightRAG's own delete path first, then remove the parsed copy, so the
+rebuild is ingested under the same id.
+
 ## Tests
 
 From the `zotero-toolkit/` directory, in a virtualenv with `maintenance/requirements.txt` and `pytest`:

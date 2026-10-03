@@ -1,2 +1,4 @@
 # clean_dangling_refs.py — PostgreSQL driver (the script is otherwise stdlib-only).
 asyncpg>=0.29,<1
+# textlayer_audit.py — reads PDF text layers (the corpus requirements bring it in too).
+pymupdf>=1.24,<2
