@@ -199,6 +199,33 @@ def citation_for(file_path: str) -> str:
         return ""
 
 
+_WORK_TITLE_MIN = (
+    20  # shorter normalised titles ("Preface", "Introduction") name no single work
+)
+
+
+def work_key(file_path: str) -> str:
+    """Identity of the work a corpus file holds, for treating copies of one paper
+    filed under several Zotero items as one.
+
+    The normalised title (markup, case and punctuation dropped) when it is long
+    enough to name a single work, else the DOI, else the path itself -- a file
+    the metadata cannot resolve is its own work. Title before DOI because copies
+    of a paper often carry different DOIs (an arXiv preprint and the journal
+    version), while a short generic title would merge unrelated works.
+    """
+    entry = _entry(file_path)
+    if entry:
+        title = re.sub(r"<[^>]+>", "", entry.get("title") or "")
+        title = re.sub(r"[^0-9a-z]", "", title.lower())
+        if len(title) >= _WORK_TITLE_MIN:
+            return "title:" + title
+        doi = (entry.get("doi") or "").strip().lower()
+        if doi:
+            return "doi:" + doi
+    return "path:" + (file_path or "")
+
+
 def citation_short(file_path: str, max_chars: int = SHORT_MAX) -> str:
     """Compact "Authors (Year). Title" for the LLM's Reference Document List.
 

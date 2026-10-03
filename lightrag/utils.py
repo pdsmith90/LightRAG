@@ -42,7 +42,7 @@ import numpy as np
 from dotenv import load_dotenv
 import json_repair
 
-from lightrag.zotero_citations import citation_for
+from lightrag.zotero_citations import citation_for, work_key
 from lightrag.exceptions import (
     ChunkBlockMatchError,
     CommitBookkeepingError,
@@ -7143,6 +7143,31 @@ def filter_bibliography_chunks(chunks: list[dict]) -> list[dict]:
     return kept
 
 
+def cap_chunks_per_work(chunks: list[dict], max_per_work: int) -> list[dict]:
+    """Keep at most ``max_per_work`` chunks of each work, preserving order.
+
+    ``chunks`` arrive in rerank order, so each work keeps its best chunks and the
+    dropped ones make room for the next works. A work is what
+    :func:`lightrag.zotero_citations.work_key` makes of the chunk's file path:
+    one document, or every copy of one paper.
+    """
+    if max_per_work <= 0:
+        return chunks
+    seen: dict[str, int] = {}
+    kept = []
+    for chunk in chunks:
+        key = work_key(chunk.get("file_path") or "")
+        if seen.get(key, 0) < max_per_work:
+            seen[key] = seen.get(key, 0) + 1
+            kept.append(chunk)
+    if len(kept) < len(chunks):
+        logger.info(
+            f"Per-work cap: dropped {len(chunks) - len(kept)} chunks beyond "
+            f"{max_per_work} per work, {len(kept)} remain from {len(seen)} works"
+        )
+    return kept
+
+
 async def process_chunks_unified(
     query: str,
     unique_chunks: list[dict],
@@ -7178,11 +7203,19 @@ async def process_chunks_unified(
         if not unique_chunks:
             return []
 
+    max_per_work = global_config.get("max_chunks_per_doc") or 0
+
     # 1. Apply reranking if enabled and query is provided
     if query_param.enable_rerank and query and unique_chunks:
         if progress_callback:
             await progress_callback("reranking")
-        rerank_top_k = query_param.chunk_top_k or len(unique_chunks)
+        # With the per-work cap on, keep every candidate in score order: the cap
+        # needs the ones ranked below chunk_top_k to refill the slots it frees.
+        rerank_top_k = (
+            len(unique_chunks)
+            if max_per_work
+            else query_param.chunk_top_k or len(unique_chunks)
+        )
         unique_chunks = await apply_rerank_if_enabled(
             query=query,
             retrieved_docs=unique_chunks,
@@ -7215,6 +7248,10 @@ async def process_chunks_unified(
                 )
             if not unique_chunks:
                 return []
+
+    # 2b. At most MAX_CHUNKS_PER_DOC chunks of one work (opt-in)
+    if max_per_work:
+        unique_chunks = cap_chunks_per_work(unique_chunks, max_per_work)
 
     # 3. Apply chunk_top_k limiting if specified
     if query_param.chunk_top_k is not None and query_param.chunk_top_k > 0:

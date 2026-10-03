@@ -62,6 +62,8 @@ from lightrag.constants import (
     DEFAULT_KG_CHUNK_PICK_METHOD,
     DEFAULT_MIN_RERANK_SCORE,
     DEFAULT_DROP_BIBLIOGRAPHY_CHUNKS,
+    DEFAULT_MAX_CHUNKS_PER_DOC,
+    DEFAULT_LEXICAL_CHUNK_TOP_K,
     DEFAULT_SUMMARY_MAX_TOKENS,
     DEFAULT_SUMMARY_CONTEXT_SIZE,
     DEFAULT_SUMMARY_LENGTH_RECOMMENDED,
@@ -1384,6 +1386,41 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
     Set it at construction: KG modes read it from the config snapshot the
     storages take then, so a later assignment on a live instance does not
     reach them.
+    """
+
+    # Declared last for the same reason as `admin_write_max_hold_seconds` above.
+    max_chunks_per_doc: int = field(
+        default_factory=lambda: get_env_value(
+            "MAX_CHUNKS_PER_DOC", DEFAULT_MAX_CHUNKS_PER_DOC, int
+        )
+    )
+    """At most this many chunks of one work in a query's final context; 0 = no cap.
+
+    Applied in :func:`lightrag.utils.process_chunks_unified` after reranking and
+    the rerank-score floor, before ``chunk_top_k`` and token truncation, so the
+    slots a capped work would have taken go to the next works in rerank order
+    (the reranker then scores every candidate, not just the first
+    ``chunk_top_k``). A work is one document, or every copy of one paper when
+    :func:`lightrag.zotero_citations.work_key` identifies them. Env
+    ``MAX_CHUNKS_PER_DOC``; set it at construction, like
+    ``drop_bibliography_chunks``.
+    """
+
+    lexical_chunk_top_k: int = field(
+        default_factory=lambda: get_env_value(
+            "LEXICAL_CHUNK_TOP_K", DEFAULT_LEXICAL_CHUNK_TOP_K, int
+        )
+    )
+    """Chunks a full-text search adds to ``mix`` and ``naive`` candidates; 0 = off.
+
+    Dense retrieval misses queries made of names, years and acronyms (an author
+    and year are a few tokens of one chunk; an acronym a paper never spells out
+    is invisible to it). The lexical leg weights each query term by its rarity
+    across the chunks and is merged with the vector chunks before the
+    bibliography filter and the reranker, which decide what is kept. Requires a
+    text-chunk storage with ``lexical_search`` (PostgreSQL, with the GIN index
+    described there); other backends log once and skip it. Env
+    ``LEXICAL_CHUNK_TOP_K``; set it at construction.
     """
 
     def _mark_addon_params_dirty(self) -> None:

@@ -67,6 +67,14 @@ DEFAULT_KG_CHUNK_PICK_METHOD = "VECTOR"
 # before rerank (env DROP_BIBLIOGRAPHY_CHUNKS). See
 # lightrag.utils.is_bibliography_chunk.
 DEFAULT_DROP_BIBLIOGRAPHY_CHUNKS = False
+# At most this many chunks of one work (one document, or several copies of one
+# paper when citation metadata identifies them) in a query's final context;
+# 0 = no cap (env MAX_CHUNKS_PER_DOC). See lightrag.utils.cap_chunks_per_work.
+DEFAULT_MAX_CHUNKS_PER_DOC = 0
+# Chunks a PostgreSQL full-text search adds to mix and naive queries' candidates
+# before reranking; 0 = off (env LEXICAL_CHUNK_TOP_K). See
+# lightrag.kg.postgres_impl.PGKVStorage.lexical_search.
+DEFAULT_LEXICAL_CHUNK_TOP_K = 0
 
 # Rerank configuration defaults
 DEFAULT_MIN_RERANK_SCORE = 0.0

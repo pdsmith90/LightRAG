@@ -31,6 +31,8 @@ from lightrag.constants import (
     DEFAULT_COSINE_THRESHOLD,
     DEFAULT_RELATED_CHUNK_NUMBER,
     DEFAULT_DROP_BIBLIOGRAPHY_CHUNKS,
+    DEFAULT_MAX_CHUNKS_PER_DOC,
+    DEFAULT_LEXICAL_CHUNK_TOP_K,
     DEFAULT_MIN_RERANK_SCORE,
     DEFAULT_FORCE_LLM_SUMMARY_ON_MERGE,
     DEFAULT_MAX_ASYNC,
@@ -942,6 +944,12 @@ def parse_args() -> argparse.Namespace:
     )
     args.drop_bibliography_chunks = get_env_value(
         "DROP_BIBLIOGRAPHY_CHUNKS", DEFAULT_DROP_BIBLIOGRAPHY_CHUNKS, bool
+    )
+    args.max_chunks_per_doc = get_env_value(
+        "MAX_CHUNKS_PER_DOC", DEFAULT_MAX_CHUNKS_PER_DOC, int
+    )
+    args.lexical_chunk_top_k = get_env_value(
+        "LEXICAL_CHUNK_TOP_K", DEFAULT_LEXICAL_CHUNK_TOP_K, int
     )
 
     # Add missing environment variables for health endpoint

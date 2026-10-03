@@ -18,6 +18,8 @@ starting with [README.md](./README.md), applies as written.
 | [Ceiling on per-request retrieval budgets](#ceiling-on-per-request-retrieval-budgets) | `ENABLE_QUERY_BUDGET_CEILING` | `false` |
 | [Query journal](#query-journal) | `QUERY_JOURNAL_FILE` | unset (off) |
 | [Bibliography chunk filter](#bibliography-chunk-filter) | `DROP_BIBLIOGRAPHY_CHUNKS` | `false` |
+| [Per-work chunk cap](#per-work-chunk-cap) | `MAX_CHUNKS_PER_DOC` | `0` (off) |
+| [Lexical retrieval leg](#lexical-retrieval-leg) | `LEXICAL_CHUNK_TOP_K` | `0` (off) |
 | [PostgreSQL edge removal in plain SQL](#postgresql-edge-removal-in-plain-sql) | none | always active |
 
 ### Reference lists compiled from Zotero metadata
@@ -80,6 +82,35 @@ changed. While it is on, the query-answer cache key carries it, so answers cache
 without the filter are not served with it. The switch is reported in the `/health`
 configuration. Rules, evidence and known misses:
 [docs/design/BibliographyChunkFilter.md](./docs/design/BibliographyChunkFilter.md).
+
+### Per-work chunk cap
+
+With `MAX_CHUNKS_PER_DOC=N`, a query's final context holds at most N chunks of one
+work. The cap applies after reranking and the rerank-score floor, before
+`chunk_top_k` and token truncation; the reranker then returns every candidate in
+score order, so the slots a capped work would have taken go to the next works.
+A work is one document, or every copy of one paper filed under several Zotero items:
+the same normalised title when that is long enough to name a single work, else the
+same DOI (`lightrag/zotero_citations.py`, `work_key`). The setting is part of the
+query-answer cache key, reported in the `/health` configuration, and documented in
+`env.example`. Off by default.
+
+### Lexical retrieval leg
+
+Dense retrieval misses queries made of names, years and acronyms: an author and a
+year are a few tokens of one chunk, and an acronym a paper never spells out is
+invisible to it. With `LEXICAL_CHUNK_TOP_K=K`, `mix` and `naive` queries also take up
+to K chunks from a PostgreSQL full-text search and interleave them with the vector
+chunks, ahead of the bibliography filter and the reranker, which decide what is
+kept. Each query term (English stemming, stop words dropped) weighs
+`ln(N / (df + 1))`; candidates are the chunks holding one of the three rarest terms,
+and each scores the summed weight of every query term it contains, so a query of
+common words only adds nothing. Reference lists are removed before the cut to K when
+the bibliography filter is on. Needs a GIN index on
+`to_tsvector('english', content)` of `LIGHTRAG_DOC_CHUNKS`; without it the leg logs
+once and stays off. Code: `PGKVStorage.lexical_search` in
+`lightrag/kg/postgres_impl.py`, `_get_lexical_context` in `lightrag/operate.py`. Part
+of the query-answer cache key; reported in `/health`. Off by default.
 
 ### PostgreSQL edge removal in plain SQL
 

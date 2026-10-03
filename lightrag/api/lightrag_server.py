@@ -3053,6 +3053,8 @@ def create_app(args):
                         "enable_query_budget_ceiling": query_budget_ceiling_enabled,
                         "query_journal_file": query_journal_file,
                         "drop_bibliography_chunks": args.drop_bibliography_chunks,
+                        "max_chunks_per_doc": args.max_chunks_per_doc,
+                        "lexical_chunk_top_k": args.lexical_chunk_top_k,
                         "max_async": args.max_async,
                         "llm_timeout": args.llm_timeout,
                         "embedding_func_max_async": args.embedding_func_max_async,

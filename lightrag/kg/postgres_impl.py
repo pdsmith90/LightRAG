@@ -3542,6 +3542,40 @@ class PGKVStorage(BaseKVStorage):
 
         return _order_results(results)
 
+    async def lexical_search(self, query: str, top_k: int) -> list[dict[str, Any]]:
+        """Full-text search over this workspace's chunks, best first (fork).
+
+        Text-chunk namespace only. Rows carry ``id``, ``full_doc_id``,
+        ``file_path``, ``content``, ``chunk_order_index`` and ``score``; the
+        scoring is described at ``SQL_TEMPLATES["lexical_search_text_chunks"]``.
+        A query made only of common words returns nothing -- the vector leg
+        covers those. Without the GIN index every call would parse every chunk,
+        so then this logs once and returns nothing:
+
+            CREATE INDEX CONCURRENTLY idx_lightrag_doc_chunks_content_fts
+                ON lightrag_doc_chunks USING gin (to_tsvector('english', content));
+        """
+        if top_k <= 0 or not (query or "").strip():
+            return []
+        if not is_namespace(self.namespace, NameSpace.KV_STORE_TEXT_CHUNKS):
+            return []
+        if getattr(self, "_lexical_index_ok", None) is None:
+            found = await self.db.query(SQL_TEMPLATES["lexical_index_text_chunks"])
+            self._lexical_index_ok = bool(found)
+            if not found:
+                logger.warning(
+                    f"[{self.workspace}] lexical chunk search is off: no GIN index on "
+                    "to_tsvector('english', content) of LIGHTRAG_DOC_CHUNKS"
+                )
+        if not self._lexical_index_ok:
+            return []
+        rows = await self.db.query(
+            SQL_TEMPLATES["lexical_search_text_chunks"],
+            [self.workspace, query, top_k],
+            multirows=True,
+        )
+        return [dict(row, score=float(row["score"] or 0.0)) for row in rows or []]
+
     async def filter_keys(self, keys: set[str]) -> set[str]:
         """Filter out duplicated content"""
         if not keys:
@@ -9904,6 +9938,51 @@ SQL_TEMPLATES = {
                                  parse_engine
                                  FROM LIGHTRAG_DOC_FULL WHERE workspace=$1 AND id = ANY($2)
                             """,
+    # Fork: the lexical leg of mix/naive retrieval (PGKVStorage.lexical_search).
+    # $1 workspace, $2 query text, $3 limit. Each query term (english stemming,
+    # stop words dropped) weighs ln(N / (df + 1)); df is counted only up to 2% of
+    # the chunks (at least 500) -- past that a term is common and gets the floor
+    # weight anyway. Candidates are the chunks holding one of the three rarest
+    # terms below that bar (at most 3000); each scores the summed weight of every
+    # query term it contains. MATERIALIZED makes each candidate's text parse once,
+    # not once per query term (measured: 18 s -> 1.4 s on a 15-term query).
+    "lexical_search_text_chunks": """WITH q AS (
+                    SELECT DISTINCT lex FROM unnest(tsvector_to_array(to_tsvector('english', $2))) AS lex
+                ),
+                n AS (SELECT count(*)::float AS total FROM LIGHTRAG_DOC_CHUNKS WHERE workspace = $1),
+                cap AS (SELECT GREATEST(500, ((SELECT total FROM n) * 0.02)::int) AS v),
+                w AS (
+                    SELECT q.lex,
+                           (SELECT count(*) FROM (SELECT 1 FROM LIGHTRAG_DOC_CHUNKS c
+                              WHERE c.workspace = $1
+                                AND to_tsvector('english', c.content) @@ quote_literal(q.lex)::tsquery
+                              LIMIT (SELECT v FROM cap)) s) AS df
+                    FROM q
+                ),
+                idf AS (SELECT lex, df, ln((SELECT total FROM n) / (df + 1)) AS weight FROM w WHERE df > 0),
+                gen AS (
+                    SELECT string_agg(quote_literal(lex), ' | ')::tsquery AS tq
+                    FROM (SELECT lex FROM idf WHERE df < (SELECT v FROM cap) ORDER BY df LIMIT 3) r
+                ),
+                cand AS MATERIALIZED (
+                    SELECT c.id, c.full_doc_id, c.file_path, c.content, c.chunk_order_index,
+                           to_tsvector('english', c.content) AS tsv
+                    FROM LIGHTRAG_DOC_CHUNKS c, gen
+                    WHERE c.workspace = $1 AND gen.tq IS NOT NULL
+                      AND to_tsvector('english', c.content) @@ gen.tq
+                    LIMIT 3000
+                )
+                SELECT id, full_doc_id, file_path, COALESCE(content, '') AS content, chunk_order_index,
+                       (SELECT sum(weight) FROM idf WHERE cand.tsv @@ quote_literal(idf.lex)::tsquery) AS score
+                FROM cand
+                ORDER BY score DESC, chunk_order_index ASC
+                LIMIT $3
+            """,
+    # The GIN index lexical_search_text_chunks needs; matched by definition, not name.
+    "lexical_index_text_chunks": """SELECT 1 FROM pg_indexes
+                WHERE tablename = 'lightrag_doc_chunks'
+                  AND indexdef ILIKE '%gin (to_tsvector(''english''::regconfig, content))%'
+            """,
     "get_by_ids_text_chunks": """SELECT id, tokens, COALESCE(content, '') as content,
                                   chunk_order_index, full_doc_id, file_path,
                                   COALESCE(llm_cache_list, '[]'::jsonb) as llm_cache_list,

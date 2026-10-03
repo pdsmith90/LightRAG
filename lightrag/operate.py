@@ -48,6 +48,7 @@ from lightrag.utils import (
     pick_by_weighted_polling,
     pick_by_vector_similarity,
     process_chunks_unified,
+    is_bibliography_chunk,
     safe_vdb_operation_with_exception,
     create_prefixed_exception,
     fix_tuple_delimiter_corruption,
@@ -4895,6 +4896,17 @@ async def kg_query(
             if retrieval_config.get("drop_bibliography_chunks")
             else ()
         ),
+        # Same rule for the per-work cap and the lexical leg: keyed only when on.
+        *(
+            ("\n<max_chunks_per_doc>\n", retrieval_config.get("max_chunks_per_doc"))
+            if retrieval_config.get("max_chunks_per_doc")
+            else ()
+        ),
+        *(
+            ("\n<lexical_chunk_top_k>\n", retrieval_config.get("lexical_chunk_top_k"))
+            if retrieval_config.get("lexical_chunk_top_k")
+            else ()
+        ),
         *(("\n<system_prompt>\n", system_prompt) if system_prompt else ()),
         "\n<llm_identity>\n",
         serialize_llm_cache_identity(llm_cache_identity),
@@ -5286,6 +5298,67 @@ async def _get_vector_context(
     return valid_chunks
 
 
+_lexical_unsupported_warned = False
+
+
+async def _get_lexical_context(
+    query: str, text_chunks_db: BaseKVStorage | None
+) -> list[dict]:
+    """Chunks a full-text search finds for ``query`` (fork; LEXICAL_CHUNK_TOP_K).
+
+    The storage ranks chunks by the rarity-weighted query terms they contain;
+    reference lists are dropped here, before the cut to ``lexical_chunk_top_k``,
+    when DROP_BIBLIOGRAPHY_CHUNKS is on -- a paper's citations of the very
+    authors and years asked for would otherwise take the leg's slots. Off, or a
+    storage without ``lexical_search``, yields nothing. Like the vector leg, a
+    backend error propagates rather than reading as "no matches".
+    """
+    global _lexical_unsupported_warned
+    if text_chunks_db is None:
+        return []
+    config = text_chunks_db.global_config
+    top_k = config.get("lexical_chunk_top_k") or 0
+    if top_k <= 0:
+        return []
+    search = getattr(text_chunks_db, "lexical_search", None)
+    if search is None:
+        if not _lexical_unsupported_warned:
+            logger.warning(
+                f"LEXICAL_CHUNK_TOP_K={top_k} ignored: {type(text_chunks_db).__name__} "
+                "has no lexical_search"
+            )
+            _lexical_unsupported_warned = True
+        return []
+    rows = await search(query, top_k * 3)
+    chunks = [
+        {
+            "content": row["content"],
+            "file_path": row.get("file_path") or "unknown_source",
+            "source_type": "lexical",
+            "chunk_id": row["id"],
+        }
+        for row in rows
+    ]
+    if config.get("drop_bibliography_chunks"):
+        chunks = [c for c in chunks if not is_bibliography_chunk(c["content"])]
+    chunks = chunks[:top_k]
+    logger.info(f"Lexical query: {len(chunks)} chunks (lexical_chunk_top_k:{top_k})")
+    return chunks
+
+
+def _interleave_chunks(first: list[dict], second: list[dict]) -> list[dict]:
+    """Alternate two ranked chunk lists, dropping repeated chunk ids."""
+    merged, seen = [], set()
+    for i in range(max(len(first), len(second))):
+        for source in (first, second):
+            if i < len(source):
+                chunk_id = source[i].get("chunk_id") or source[i].get("id")
+                if chunk_id not in seen:
+                    seen.add(chunk_id)
+                    merged.append(source[i])
+    return merged
+
+
 async def _perform_kg_search(
     query: str,
     ll_keywords: str,
@@ -5309,6 +5382,7 @@ async def _perform_kg_search(
     global_entities = []
     global_relations = []
     vector_chunks = []
+    lexical_chunks = []
     chunk_tracking = {}
 
     # Handle different query modes
@@ -5438,6 +5512,17 @@ async def _perform_kg_search(
                 else:
                     logger.warning(f"Vector chunk missing chunk_id: {chunk}")
 
+        # Lexical leg for mix mode (opt-in, LEXICAL_CHUNK_TOP_K)
+        if query_param.mode == "mix":
+            lexical_chunks = await _get_lexical_context(query, text_chunks_db)
+            for i, chunk in enumerate(lexical_chunks):
+                if chunk["chunk_id"] not in chunk_tracking:
+                    chunk_tracking[chunk["chunk_id"]] = {
+                        "source": "L",
+                        "frequency": 1,
+                        "order": i + 1,
+                    }
+
     # Round-robin merge entities
     final_entities = []
     seen_entities = set()
@@ -5502,6 +5587,7 @@ async def _perform_kg_search(
         "final_entities": final_entities,
         "final_relations": final_relations,
         "vector_chunks": vector_chunks,
+        "lexical_chunks": lexical_chunks,
         "chunk_tracking": chunk_tracking,
         "query_embedding": query_embedding,
     }
@@ -5782,10 +5868,14 @@ async def _merge_all_chunks(
     chunks_vdb: BaseVectorStorage = None,
     chunk_tracking: dict = None,
     query_embedding: list[float] = None,
+    lexical_chunks: list[dict] | None = None,
 ) -> list[dict]:
     """
-    Merge chunks from different sources: vector_chunks + entity_chunks + relation_chunks.
+    Merge chunks from different sources: vector_chunks + entity_chunks + relation_chunks,
+    plus the fork's lexical chunks interleaved with the vector ones.
     """
+    if lexical_chunks:
+        vector_chunks = _interleave_chunks(vector_chunks, lexical_chunks)
     if chunk_tracking is None:
         chunk_tracking = {}
 
@@ -6151,6 +6241,7 @@ async def _build_query_context(
         chunks_vdb=chunks_vdb,
         chunk_tracking=search_result["chunk_tracking"],
         query_embedding=search_result["query_embedding"],
+        lexical_chunks=search_result.get("lexical_chunks"),
     )
 
     if (
@@ -6912,6 +7003,9 @@ async def naive_query(
     if progress_callback:
         await progress_callback(QueryProgress.RETRIEVING_CHUNKS)
     chunks = await _get_vector_context(query, chunks_vdb, query_param, None)
+    lexical_chunks = await _get_lexical_context(query, text_chunks_db)
+    if lexical_chunks:
+        chunks = _interleave_chunks(chunks or [], lexical_chunks)
 
     if chunks is None or len(chunks) == 0:
         logger.info(
@@ -7075,6 +7169,16 @@ async def naive_query(
         *(
             ("\n<drop_bibliography_chunks>\n",)
             if global_config.get("drop_bibliography_chunks")
+            else ()
+        ),
+        *(
+            ("\n<max_chunks_per_doc>\n", global_config.get("max_chunks_per_doc"))
+            if global_config.get("max_chunks_per_doc")
+            else ()
+        ),
+        *(
+            ("\n<lexical_chunk_top_k>\n", global_config.get("lexical_chunk_top_k"))
+            if global_config.get("lexical_chunk_top_k")
             else ()
         ),
         *(("\n<system_prompt>\n", system_prompt) if system_prompt else ()),
