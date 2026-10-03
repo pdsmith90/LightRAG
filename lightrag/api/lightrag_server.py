@@ -1720,6 +1720,8 @@ def create_app(args):
     query_budget_ceiling_enabled = bool(
         getattr(args, "enable_query_budget_ceiling", False)
     )
+    # QUERY_JOURNAL_FILE: one JSON line per /query and /query/stream request.
+    query_journal_file = getattr(args, "query_journal_file", None) or None
 
     # The WebUI mount path is fixed at "/webui" — see
     # docs/MultiSiteDeployment.md for the rationale. Computed before
@@ -2605,6 +2607,7 @@ def create_app(args):
             api_key,
             args.top_k,
             enable_query_budget_ceiling=query_budget_ceiling_enabled,
+            query_journal_file=query_journal_file,
         )
     )
     app.include_router(create_graph_routes(rag, api_key))
@@ -3048,6 +3051,7 @@ def create_app(args):
                         "min_rerank_score": args.min_rerank_score,
                         "related_chunk_number": args.related_chunk_number,
                         "enable_query_budget_ceiling": query_budget_ceiling_enabled,
+                        "query_journal_file": query_journal_file,
                         "drop_bibliography_chunks": args.drop_bibliography_chunks,
                         "max_async": args.max_async,
                         "llm_timeout": args.llm_timeout,

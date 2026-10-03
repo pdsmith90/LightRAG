@@ -931,6 +931,9 @@ def parse_args() -> argparse.Namespace:
     args.enable_query_budget_ceiling = get_env_value(
         "ENABLE_QUERY_BUDGET_CEILING", False, bool
     )
+    # Opt-in: append every /query and /query/stream request (prompt, applied
+    # settings, delivered answer, sources) to this JSONL file for later review
+    args.query_journal_file = get_env_value("QUERY_JOURNAL_FILE", None)
     args.cosine_threshold = get_env_value(
         "COSINE_THRESHOLD", DEFAULT_COSINE_THRESHOLD, float
     )

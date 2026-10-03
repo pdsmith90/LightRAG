@@ -5,8 +5,9 @@ This module contains all query-related routes for the LightRAG API.
 import asyncio
 import json
 import time
+from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from lightrag.base import QueryParam
 from lightrag.api.input_limits import count_conversation_input_chars
 from lightrag.api.utils_api import get_combined_auth_dependency, internal_server_error
@@ -415,11 +416,88 @@ class StreamChunkResponse(BaseModel):
     )
 
 
+# Settings recorded beside each journaled answer, as applied (after the budget
+# ceiling), so a later review sees what retrieval was actually given.
+JOURNAL_PARAM_FIELDS = (
+    "mode",
+    "top_k",
+    "chunk_top_k",
+    "max_entity_tokens",
+    "max_relation_tokens",
+    "max_total_tokens",
+    "response_type",
+    "enable_rerank",
+    "only_need_context",
+    "only_need_prompt",
+    "user_prompt",
+)
+
+
+def _journal_entry(
+    endpoint: str,
+    http_request: Optional[Request],
+    request: QueryRequest,
+    param: Optional[QueryParam],
+    result: Optional[dict[str, Any]],
+    *,
+    response: str,
+    response_time: float,
+    references: Optional[List[Dict[str, Any]]] = None,
+    llm_generated: Optional[bool] = None,
+    error: Optional[str] = None,
+    complete: bool = True,
+) -> dict[str, Any]:
+    """One QUERY_JOURNAL_FILE line: who asked what, with which settings, and
+    what came back (the answer as delivered, sources included)."""
+    if references is None:
+        references = ((result or {}).get("data") or {}).get("references") or []
+    client = http_request.client if http_request is not None else None
+    return {
+        "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "endpoint": endpoint,
+        "client": client.host if client else None,
+        "user_agent": (
+            http_request.headers.get("user-agent") if http_request is not None else None
+        ),
+        "query": request.query,
+        "params": (
+            {name: getattr(param, name, None) for name in JOURNAL_PARAM_FIELDS}
+            if param is not None
+            else None
+        ),
+        "history_messages": len(request.conversation_history or []),
+        "keywords": ((result or {}).get("metadata") or {}).get("keywords"),
+        "response": response,
+        "references": [
+            {
+                key: ref[key]
+                for key in ("reference_id", "file_path", "citation")
+                if key in ref
+            }
+            for ref in references
+        ],
+        "llm_generated": llm_generated,
+        "response_time": response_time,
+        "complete": complete,
+        "error": error,
+    }
+
+
+def _append_journal(path: str, entry: dict[str, Any]) -> None:
+    """Append one JSON line. A journal that cannot be written never fails the query."""
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+    except Exception as e:
+        logger.warning(f"Query journal: cannot append to {path}: {e}")
+
+
 def create_query_routes(
     rag,
     api_key: Optional[str] = None,
     top_k: int = 60,
     enable_query_budget_ceiling: bool = False,
+    query_journal_file: Optional[str] = None,
 ):
     # Fresh router per call. A module-level instance would accumulate
     # duplicate routes when the factory is invoked more than once in the
@@ -571,7 +649,7 @@ def create_query_routes(
             },
         },
     )
-    async def query_text(request: QueryRequest):
+    async def query_text(request: QueryRequest, http_request: Request = None):
         """
         Comprehensive RAG query endpoint with non-streaming response. Parameter "stream" is ignored.
 
@@ -647,6 +725,7 @@ def create_query_routes(
                 - 422: Request validation failed (e.g., query empty or too short)
                 - 500: Internal processing error (e.g., LLM service unavailable)
         """
+        param, start_time = None, time.perf_counter()
         try:
             param = request.to_query_params(
                 False, apply_budget_ceiling=enable_query_budget_ceiling
@@ -715,6 +794,22 @@ def create_query_routes(
                 if references:
                     response_content += format_reference_block(references)
 
+            if query_journal_file:
+                _append_journal(
+                    query_journal_file,
+                    _journal_entry(
+                        "/query",
+                        http_request,
+                        request,
+                        param,
+                        result,
+                        response=response_content,
+                        response_time=response_time,
+                        references=references,
+                        llm_generated=llm_generated,
+                    ),
+                )
+
             # Return response with or without references based on request
             if request.include_references:
                 return QueryResponse(
@@ -732,6 +827,21 @@ def create_query_routes(
                 )
         except Exception as e:
             logger.error(f"Error processing query: {str(e)}", exc_info=True)
+            if query_journal_file:
+                _append_journal(
+                    query_journal_file,
+                    _journal_entry(
+                        "/query",
+                        http_request,
+                        request,
+                        param,
+                        None,
+                        response="",
+                        response_time=round(time.perf_counter() - start_time, 3),
+                        error=str(e),
+                        complete=False,
+                    ),
+                )
             raise internal_server_error(e)
 
     def _build_stream_generator(
@@ -844,6 +954,53 @@ def create_query_routes(
 
         return _generate
 
+    def _journaled(lines, http_request, request, param, start_time, get_result):
+        """Relay the NDJSON lines unchanged and journal what the client was sent.
+
+        ``get_result`` returns the ``aquery_llm`` result, or None when there is
+        none (the query failed or was cancelled); it supplies the keywords, and
+        the sources when the client did not ask for the references line. A
+        client that disconnects mid-answer still leaves an entry, marked
+        incomplete.
+        """
+        if not query_journal_file:
+            return lines
+
+        async def _relay():
+            parts, references, error, llm_generated = [], None, None, None
+            complete = False
+            try:
+                async for line in lines:
+                    obj = json.loads(line)
+                    parts.append(obj.get("response", ""))
+                    references = obj.get("references", references)
+                    error = obj.get("error", error)
+                    llm_generated = obj.get("llm_generated", llm_generated)
+                    yield line
+                complete = error is None
+            finally:
+                # Close the inner generator first: its own cleanup (cancelling
+                # the query task on a disconnect) must not wait for GC.
+                await lines.aclose()
+                _append_journal(
+                    query_journal_file,
+                    _journal_entry(
+                        "/query/stream",
+                        http_request,
+                        request,
+                        param,
+                        get_result(),
+                        response="".join(parts),
+                        response_time=round(time.perf_counter() - start_time, 3),
+                        references=references,
+                        llm_generated=llm_generated,
+                        error=error,
+                        complete=complete,
+                    ),
+                )
+
+        return _relay()
+
     @router.post(
         "/query/stream",
         dependencies=[Depends(combined_auth)],
@@ -936,7 +1093,7 @@ def create_query_routes(
             },
         },
     )
-    async def query_text_stream(request: QueryRequest):
+    async def query_text_stream(request: QueryRequest, http_request: Request = None):
         """
         Advanced RAG query endpoint with flexible streaming response.
 
@@ -1087,6 +1244,7 @@ def create_query_routes(
             This endpoint is ideal for applications requiring flexible response delivery.
             Use streaming mode for real-time interfaces and non-streaming for batch processing.
         """
+        param, start_time = None, time.perf_counter()
         try:
             # Use the stream parameter from the request, defaulting to True if not specified
             stream_mode = request.stream if request.stream is not None else True
@@ -1183,8 +1341,24 @@ def create_query_routes(
                             # outlive the response generator after disconnect.
                             await asyncio.gather(query_task, return_exceptions=True)
 
+                def settled_result():
+                    if (
+                        query_task.done()
+                        and not query_task.cancelled()
+                        and query_task.exception() is None
+                    ):
+                        return query_task.result()
+                    return None
+
                 return StreamingResponse(
-                    merged_generator(),
+                    _journaled(
+                        merged_generator(),
+                        http_request,
+                        request,
+                        param,
+                        start_time,
+                        settled_result,
+                    ),
                     media_type="application/x-ndjson",
                     headers={
                         "Cache-Control": "no-cache",
@@ -1208,7 +1382,14 @@ def create_query_routes(
                 )
 
                 return StreamingResponse(
-                    stream_gen(),
+                    _journaled(
+                        stream_gen(),
+                        http_request,
+                        request,
+                        param,
+                        start_time,
+                        lambda: result,
+                    ),
                     media_type="application/x-ndjson",
                     headers={
                         "Cache-Control": "no-cache",
@@ -1219,6 +1400,21 @@ def create_query_routes(
                 )
         except Exception as e:
             logger.error(f"Error processing streaming query: {str(e)}", exc_info=True)
+            if query_journal_file:
+                _append_journal(
+                    query_journal_file,
+                    _journal_entry(
+                        "/query/stream",
+                        http_request,
+                        request,
+                        param,
+                        None,
+                        response="",
+                        response_time=round(time.perf_counter() - start_time, 3),
+                        error=str(e),
+                        complete=False,
+                    ),
+                )
             raise internal_server_error(e)
 
     @router.post(
