@@ -16,6 +16,7 @@ starting with [README.md](./README.md), applies as written.
 |---|---|---|
 | [Reference lists compiled from Zotero metadata](#reference-lists-compiled-from-zotero-metadata) | none; metadata file via `ZOTERO_METADATA` | always active |
 | [Ceiling on per-request retrieval budgets](#ceiling-on-per-request-retrieval-budgets) | `ENABLE_QUERY_BUDGET_CEILING` | `false` |
+| [Query journal](#query-journal) | `QUERY_JOURNAL_FILE` | unset (off) |
 | [Bibliography chunk filter](#bibliography-chunk-filter) | `DROP_BIBLIOGRAPHY_CHUNKS` | `false` |
 | [PostgreSQL edge removal in plain SQL](#postgresql-edge-removal-in-plain-sql) | none | always active |
 
@@ -55,6 +56,19 @@ on `/query`, `/query/stream` and `/query/data`: an omitted value gets the config
 one, a value at or below it is honoured, and a larger one is lowered to it, with one
 INFO log line per such request. Off, nothing changes. The switch is reported in the
 `/health` configuration and documented in `env.example`.
+
+### Query journal
+
+With `QUERY_JOURNAL_FILE` set to a path, every `/query` and `/query/stream` request
+appends one JSON line to that file: time, endpoint, client address and user agent
+(which tells WebUI queries from scripted ones), the query, the retrieval settings as
+applied (after the ceiling above), the high- and low-level keywords retrieval searched
+with, the answer exactly as the client received it (with its `### Sources` block),
+the sources, the response time, and whether the answer completed. Streamed lines are
+relayed unchanged and the entry is written when the stream ends, so an answer that
+failed or that the client abandoned is recorded too, as incomplete. A file that cannot
+be written logs a warning and never fails the query. Unset, the routes behave as
+upstream. The path is reported in the `/health` configuration.
 
 ### Bibliography chunk filter
 
