@@ -32,7 +32,7 @@ from lightrag.utils import Tokenizer, TokenizerInterface
 pytestmark = pytest.mark.offline
 
 SURNAMES = frozenset({"doe", "roe", "moe", "quill"})
-VENUES = frozenset({fold("Journal of Invented Studies")})
+VENUES = frozenset({fold("Journal of Invented Studies"), fold("Imaginary Problems")})
 
 
 @pytest.fixture(autouse=True)
@@ -60,6 +60,12 @@ def _library(monkeypatch):
         ("Roe and Moe", "other", "citation"),
         ("Ann. Imag. Lett.", "content", "citation"),
         ("Journal of Invented Studies", "content", "citation"),
+        (
+            "Journal of Invented Studies",
+            "other",
+            "citation",
+        ),  # a journal word in the title
+        ("Imaginary Problems", "journal", "citation"),
         ("https://example.org/data", "other", "citation"),
         ("10.9999/abc.123", "other", "citation"),
         ("Table 2", "other", "label"),
@@ -89,6 +95,8 @@ def test_apparatus_names(name, raw_type, cls):
         ("Hayford (1909)", "model"),  # an ellipsoid named after its year
         ("Hayford 1909", "other"),  # bare year: product names look like this
         ("Journal of Invented Studies", "concept"),
+        ("Imaginary Problems", "other"),  # a journal title that also names a field
+        ("Doe and Roe", "dataset"),  # a data set named after its authors
         ("Example Archive (https://example.org)", "dataset"),
         ("N. Imaginaria", "location"),
         ("Satellite", "artifact"),
@@ -122,8 +130,10 @@ def test_trailing_citation(name, raw_type, cls):
 def test_untyped_endpoint_uses_the_name_alone():
     assert junk_entity_class("Doe, J.", None) == "person"
     assert junk_entity_class("Ann. Imag. Lett.", None) == "citation"
-    # a full venue name is only junk when typed as one: "Nature" may be a concept
-    assert junk_entity_class("Journal of Invented Studies", None) is None
+    assert junk_entity_class("Journal of Invented Studies", None) == "citation"
+    # without a type, a bare title or a surname pair may be a field or a data set
+    assert junk_entity_class("Imaginary Problems", None) is None
+    assert junk_entity_class("Doe and Roe", None) is None
 
 
 def _json_result(entities, relationships):

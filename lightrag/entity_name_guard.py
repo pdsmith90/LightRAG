@@ -87,6 +87,16 @@ VENUE_TYPES = frozenset(
 )
 
 
+BIBLIOGRAPHIC_TYPES = frozenset(
+    {"journal", "publication", "content", "periodical", "source"}
+)
+_JOURNAL_WORD = re.compile(
+    r"\b(journal|letters?|transactions|proceedings|bulletin|annals|annales|reviews?|reports"
+    r"|acta|advances|notices|communications|magazine|international)\b",
+    re.IGNORECASE,
+)
+
+
 def fold(name: str) -> str:
     """Case- and punctuation-insensitive key that keeps letters of every script."""
     s = unicodedata.normalize("NFKC", name or "").casefold()
@@ -267,13 +277,27 @@ def junk_entity_class(name: str, raw_type: str | None = None) -> str | None:
     ):
         return "citation"
     surnames, venues = _library_lists()
+    # "Doe and Roe" with no year is often a model or data set named after its
+    # authors, so the pair counts only under a type that is not one of those, and
+    # never for an untyped endpoint.
     pair = _PAIR.match(plain)
-    if pair and all(_surname_known(pair.group(i), surnames) for i in (1, 2)):
+    if (
+        pair
+        and raw_type is not None
+        and typ not in PROTECTED_TYPES
+        and all(_surname_known(pair.group(i), surnames) for i in (1, 2))
+    ):
         return "citation"
-    if raw_type is None:
-        if _journal_abbreviation(plain):
+    if _journal_abbreviation(plain):
+        if raw_type is None or typ in VENUE_TYPES:
             return "citation"
-    elif typ in VENUE_TYPES and (f in venues or _journal_abbreviation(plain)):
+    elif f in venues and (
+        typ in BIBLIOGRAPHIC_TYPES
+        or (typ in VENUE_TYPES and _JOURNAL_WORD.search(plain))
+    ):
+        # A journal title can also name a field ("Inverse Problems", "Space
+        # Weather"): spelled out, it counts only when typed as a publication or
+        # when the title carries a journal word.
         return "citation"
     if typ in PERSON_TYPES:
         return "person"
