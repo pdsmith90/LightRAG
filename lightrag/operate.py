@@ -18,6 +18,7 @@ from lightrag.exceptions import (
 )
 from lightrag.zotero_citations import cited_works_in, citation_short, find_works
 from lightrag.entity_name_guard import junk_entity_class
+from lightrag.entity_name_fold import alias_chunk_result, fold_chunk_result
 from lightrag.utils import (
     logger,
     compute_mdhash_id,
@@ -1377,6 +1378,9 @@ async def rebuild_knowledge_from_chunks(
                     timestamp=result[1],
                     chunk_data=chunk_data_by_id.get(chunk_id),
                 )
+                # Fork (ENTITY_NAME_FOLD): cached results carry the spelling the
+                # LLM wrote; file them under the canonical name as well.
+                entities, relationships = alias_chunk_result(entities, relationships)
 
                 # Merge entities and relationships from this extraction result
                 # Compare description lengths and keep the better version for the same chunk_id
@@ -4810,6 +4814,10 @@ async def extract_entities(
         # already been recorded. Await-free, called exactly once.
         _publish_truncation_summary()
         _publish_cache_skip_summary()
+
+    # Fork (ENTITY_NAME_FOLD): canonical spellings before the results reach the
+    # write-ahead anchors and the merge, which must name the same nodes.
+    chunk_results = [fold_chunk_result(nodes, edges) for nodes, edges in chunk_results]
 
     # If all tasks completed successfully, chunk_results already contains the results
     # Return the chunk_results for later processing in merge_nodes_and_edges

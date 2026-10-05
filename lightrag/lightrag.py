@@ -72,6 +72,7 @@ from lightrag.constants import (
     DEFAULT_ENTITY_TYPE_STRICT,
     DEFAULT_DROP_SYMBOL_ENTITIES,
     DEFAULT_DROP_JUNK_ENTITIES,
+    DEFAULT_ENTITY_NAME_FOLD,
     DEFAULT_SUMMARY_MAX_TOKENS,
     DEFAULT_SUMMARY_CONTEXT_SIZE,
     DEFAULT_SUMMARY_LENGTH_RECOMMENDED,
@@ -1537,6 +1538,17 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
     that names one (``lightrag.entity_name_guard``). Env ``DROP_JUNK_ENTITIES``.
     """
 
+    entity_name_fold: bool = field(
+        default_factory=lambda: get_env_value(
+            "ENTITY_NAME_FOLD", DEFAULT_ENTITY_NAME_FOLD, bool
+        )
+    )
+    """Map every extracted entity name to the spelling the graph already uses for
+    the same name up to case, spacing and punctuation, so "Kalman filter" and
+    "Kalman Filter" share one node (``lightrag.entity_name_fold``; Postgres graph
+    storage only). Env ``ENTITY_NAME_FOLD``.
+    """
+
     def _mark_addon_params_dirty(self) -> None:
         self._addon_params_dirty = True
 
@@ -2221,6 +2233,25 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
 
             self._storages_status = StoragesStatus.INITIALIZED
             logger.debug("All storage types initialized")
+
+            # Fork (ENTITY_NAME_FOLD): read the graph's spellings in the
+            # background; folding arms when the map is complete, names pass
+            # unchanged until then.
+            from lightrag import entity_name_fold
+
+            entity_name_fold.disarm()
+            if self.entity_name_fold:
+                self._fold_map_task = asyncio.create_task(
+                    self._build_entity_name_fold_map()
+                )
+
+    async def _build_entity_name_fold_map(self) -> None:
+        from lightrag import entity_name_fold
+
+        try:
+            await entity_name_fold.build_fold_map(self.chunk_entity_relation_graph)
+        except Exception as e:  # folding stays off; extraction is unaffected
+            logger.error(f"ENTITY_NAME_FOLD map build failed, folding stays off: {e}")
 
     def _get_parse_native_executor(self) -> ThreadPoolExecutor:
         """Lazily build the per-instance native-parser thread pool.
