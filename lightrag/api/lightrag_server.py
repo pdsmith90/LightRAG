@@ -3062,6 +3062,7 @@ def create_app(args):
                         "sidecar_relations": args.sidecar_relations,
                         "entity_type_strict": args.entity_type_strict,
                         "drop_symbol_entities": args.drop_symbol_entities,
+                        "drop_junk_entities": args.drop_junk_entities,
                         "max_async": args.max_async,
                         "llm_timeout": args.llm_timeout,
                         "embedding_func_max_async": args.embedding_func_max_async,

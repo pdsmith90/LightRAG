@@ -71,6 +71,7 @@ from lightrag.constants import (
     DEFAULT_SIDECAR_RELATIONS,
     DEFAULT_ENTITY_TYPE_STRICT,
     DEFAULT_DROP_SYMBOL_ENTITIES,
+    DEFAULT_DROP_JUNK_ENTITIES,
     DEFAULT_SUMMARY_MAX_TOKENS,
     DEFAULT_SUMMARY_CONTEXT_SIZE,
     DEFAULT_SUMMARY_LENGTH_RECOMMENDED,
@@ -152,6 +153,8 @@ from lightrag.query_validation import validate_query_not_empty, validate_rag_que
 from lightrag.chunker import chunking_by_token_size
 from lightrag.operate import (
     KGRebuildReport,
+    _configure_junk_entity_filter,
+    _configure_symbol_entity_filter,
     _truncate_vdb_content,
     collect_kg_merge_candidates,
     extract_entities,
@@ -1523,6 +1526,17 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
     ``DROP_SYMBOL_ENTITIES``.
     """
 
+    drop_junk_entities: bool = field(
+        default_factory=lambda: get_env_value(
+            "DROP_JUNK_ENTITIES", DEFAULT_DROP_JUNK_ENTITIES, bool
+        )
+    )
+    """Drop extracted entities that are bibliography or document apparatus --
+    cited authors, citations, journal names, DOIs and URLs, numbered figure,
+    table and equation labels, placeholder words -- and every extracted relation
+    that names one (``lightrag.entity_name_guard``). Env ``DROP_JUNK_ENTITIES``.
+    """
+
     def _mark_addon_params_dirty(self) -> None:
         self._addon_params_dirty = True
 
@@ -1814,6 +1828,15 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         self._replace_addon_params(addon_params, mark_dirty=False)
         self._apply_chunk_size_overlay()
         self._refresh_addon_params_cache()
+
+        # Fork: arm the extraction name filters for the process now, not on the
+        # first extract_entities call -- the knowledge rebuild after a document
+        # delete parses cached extraction results through the same parsers, and
+        # can run before any extraction does after a restart.
+        _configure_symbol_entity_filter(
+            {"drop_symbol_entities": self.drop_symbol_entities}
+        )
+        _configure_junk_entity_filter({"drop_junk_entities": self.drop_junk_entities})
 
         # Bounded scheduling page size: 0 disables paging (single-scan legacy
         # behaviour); a negative value is a misconfiguration, fail fast.

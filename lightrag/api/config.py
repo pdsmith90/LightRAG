@@ -40,6 +40,7 @@ from lightrag.constants import (
     DEFAULT_SIDECAR_RELATIONS,
     DEFAULT_ENTITY_TYPE_STRICT,
     DEFAULT_DROP_SYMBOL_ENTITIES,
+    DEFAULT_DROP_JUNK_ENTITIES,
     DEFAULT_MIN_RERANK_SCORE,
     DEFAULT_FORCE_LLM_SUMMARY_ON_MERGE,
     DEFAULT_MAX_ASYNC,
@@ -978,6 +979,9 @@ def parse_args() -> argparse.Namespace:
     )
     args.drop_symbol_entities = get_env_value(
         "DROP_SYMBOL_ENTITIES", DEFAULT_DROP_SYMBOL_ENTITIES, bool
+    )
+    args.drop_junk_entities = get_env_value(
+        "DROP_JUNK_ENTITIES", DEFAULT_DROP_JUNK_ENTITIES, bool
     )
 
     # Add missing environment variables for health endpoint

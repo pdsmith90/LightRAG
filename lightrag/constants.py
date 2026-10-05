@@ -94,6 +94,9 @@ DEFAULT_SIDECAR_RELATIONS = "all"
 DEFAULT_ENTITY_TYPE_STRICT = False
 # Fork: drop extracted entities named by a lone symbol or variable, and their relations.
 DEFAULT_DROP_SYMBOL_ENTITIES = False
+# Fork: drop extracted bibliography/document apparatus entities (cited authors,
+# citations, journal names, numbered labels, placeholder words), and their relations.
+DEFAULT_DROP_JUNK_ENTITIES = False
 
 # Rerank configuration defaults
 DEFAULT_MIN_RERANK_SCORE = 0.0

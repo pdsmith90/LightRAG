@@ -17,6 +17,7 @@ from lightrag.exceptions import (
     PipelineCancelledException,
 )
 from lightrag.zotero_citations import cited_works_in, citation_short, find_works
+from lightrag.entity_name_guard import junk_entity_class
 from lightrag.utils import (
     logger,
     compute_mdhash_id,
@@ -793,6 +794,47 @@ def _dropped_as_symbol(*names: str) -> bool:
     return _DROP_SYMBOL_ENTITIES and any(is_symbol_entity_name(n) for n in names)
 
 
+# Fork (DROP_JUNK_ENTITIES): set for the process like the symbol filter. Cited
+# authors, citations, journal names, numbered labels and placeholder words come out
+# of a paper corpus whatever the entity-type guidance says (entity_name_guard).
+_DROP_JUNK_ENTITIES = False
+
+
+def _configure_junk_entity_filter(global_config: dict) -> bool:
+    """Arm or disarm the apparatus entity-name filter for this process."""
+    global _DROP_JUNK_ENTITIES
+    _DROP_JUNK_ENTITIES = bool(global_config.get("drop_junk_entities"))
+    return _DROP_JUNK_ENTITIES
+
+
+def _drop_junk_records(maybe_nodes: dict, maybe_edges: dict, chunk_key: str) -> None:
+    """Remove one chunk's apparatus entities and every relation that names one.
+
+    An entity is judged on its name and on the type the LLM wrote (``_raw_type``,
+    which the parsers attach while the filter is armed and which is always removed
+    here). A relation goes when an endpoint was dropped, or when an endpoint the
+    chunk lists no entity for is apparatus by name alone; otherwise the merge would
+    recreate the endpoint as an untyped node.
+    """
+    dropped = set()
+    for name in list(maybe_nodes):
+        raw_types = {record.pop("_raw_type", None) for record in maybe_nodes[name]}
+        if any(junk_entity_class(name, t) for t in raw_types):
+            dropped.add(name)
+            del maybe_nodes[name]
+
+    def _junk_endpoint(name: str) -> bool:
+        return name in dropped or (
+            name not in maybe_nodes and junk_entity_class(name) is not None
+        )
+
+    for pair in list(maybe_edges):
+        if _junk_endpoint(pair[0]) or _junk_endpoint(pair[1]):
+            del maybe_edges[pair]
+    if dropped:
+        logger.debug(f"{chunk_key}: apparatus entities dropped: {sorted(dropped)}")
+
+
 def _handle_single_entity_extraction(
     record_attributes: list[str],
     chunk_key: str,
@@ -825,6 +867,7 @@ def _handle_single_entity_extraction(
         entity_type = sanitize_and_normalize_extracted_text(
             record_attributes[2], remove_inner_quotes=True
         )
+        raw_entity_type = entity_type.replace(" ", "").lower()
         entity_type = _normalize_and_validate_entity_type(
             entity_type, f"record {record_attributes}"
         )
@@ -840,7 +883,7 @@ def _handle_single_entity_extraction(
             )
             return None
 
-        return dict(
+        entity_data = dict(
             entity_name=entity_name,
             entity_type=entity_type,
             description=entity_description,
@@ -848,6 +891,10 @@ def _handle_single_entity_extraction(
             file_path=file_path,
             timestamp=timestamp,
         )
+        if _DROP_JUNK_ENTITIES:
+            # Read and removed by _drop_junk_records at the end of the parse.
+            entity_data["_raw_type"] = raw_entity_type
+        return entity_data
 
     except ValueError as e:
         logger.error(
@@ -1082,6 +1129,7 @@ async def _process_json_extraction_result(
             entity_type = sanitize_and_normalize_extracted_text(
                 str(entity_data.get("type", "")), remove_inner_quotes=True
             )
+            raw_entity_type = entity_type.replace(" ", "").lower()
             entity_type = _normalize_and_validate_entity_type(
                 entity_type, f"{chunk_key}: entity '{entity_name}'"
             )
@@ -1112,6 +1160,9 @@ async def _process_json_extraction_result(
                 file_path=file_path,
                 timestamp=timestamp,
             )
+            if _DROP_JUNK_ENTITIES:
+                # Read and removed by _drop_junk_records at the end of the parse.
+                node_data["_raw_type"] = raw_entity_type
             maybe_nodes[truncated_name].append(node_data)
 
         except Exception as e:
@@ -1202,6 +1253,8 @@ async def _process_json_extraction_result(
             )
             continue
 
+    if _DROP_JUNK_ENTITIES:
+        _drop_junk_records(maybe_nodes, maybe_edges, chunk_key)
     return dict(maybe_nodes), dict(maybe_edges)
 
 
@@ -1749,6 +1802,8 @@ async def _process_extraction_result(
             maybe_edges[(truncated_source, truncated_target)].append(relationship_data)
         await _cooperative_yield(i, every=8)
 
+    if _DROP_JUNK_ENTITIES:
+        _drop_junk_records(maybe_nodes, maybe_edges, chunk_key)
     return dict(maybe_nodes), dict(maybe_edges)
 
 
@@ -4125,6 +4180,7 @@ async def extract_entities(
     entity_types_guidance = prompt_profile["entity_types_guidance"]
     _configure_entity_type_allowlist(global_config, entity_types_guidance)
     _configure_symbol_entity_filter(global_config)
+    _configure_junk_entity_filter(global_config)
 
     max_total_records = global_config["entity_extract_max_records"]
     max_entity_records = global_config["entity_extract_max_entities"]
