@@ -358,3 +358,147 @@ class ReferenceStripper:
     def text(self) -> str:
         """Everything fed so far, references heading and all."""
         return "".join(self._acc)
+
+
+# ---------------------------------------------------------------------------
+# Author-year lookup (fork): which library works does a query or a citation name?
+# ---------------------------------------------------------------------------
+
+_AY_YEAR_RE = re.compile(r"(?<!\d)((?:19|20)\d{2})(?!\d)")
+_AY_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z'\u2019\-]{2,}")
+# "Okafor (2019)", "Okafor and Lindqvist 2019", "Okafor et al., 2019a", "(Okafor, 2019)".
+_CITE_RE = re.compile(
+    r"(?<![A-Za-z])([A-Z][A-Za-z'\u2019\-]{2,})"
+    r"(?:\s+(?:and|&)\s+([A-Z][A-Za-z'\u2019\-]{2,})|\s+et\s+al\.?)?"
+    r"[\s,]*\(?\s*((?:19|20)\d{2})[a-z]?\)?"
+)
+# When one surname and one year still name more works than this, the query is
+# too ambiguous to act on (a common surname); the other legs keep running.
+_AY_MAX_TIES = 9
+_CITE_MAX_WORKS_PER_MENTION = 3
+
+_ay_index: tuple | None = (
+    None  # (mtime, surname -> keys, year -> keys, key -> (surnames, year))
+)
+
+
+def _surname_forms(author: str) -> set[str]:
+    """Lower-case surname forms of a creator string ("Last First" or "Last, First").
+
+    The whole surname, plus each hyphen- or space-separated part of at least
+    four letters, so "Ghobadi-Far Khosro" answers to "ghobadi-far" and "ghobadi".
+    """
+    author = (author or "").strip()
+    if not author:
+        return set()
+    if "," in author:
+        last = author.split(",", 1)[0]
+    else:
+        parts = author.split()
+        last = " ".join(parts[:-1]) if len(parts) > 1 else parts[0]
+    last = last.lower().strip()
+    forms = {last} if len(last) >= 3 else set()
+    forms.update(p for p in re.split(r"[\s\-]+", last) if len(p) >= 4)
+    return forms
+
+
+def _author_year_index() -> tuple:
+    """Surname and year indexes over the metadata, rebuilt when the file changes."""
+    global _ay_index
+    meta = _load()
+    if _ay_index is not None and _ay_index[0] == _mtime:
+        return _ay_index
+    by_surname: dict[str, set[str]] = {}
+    by_year: dict[str, set[str]] = {}
+    works: dict[str, tuple[frozenset[str], str]] = {}
+    for key, entry in meta.items():
+        if not isinstance(entry, dict):
+            continue
+        year = str(entry.get("year") or "").strip()[:4]
+        names: set[str] = set()
+        for author in entry.get("authors") or []:
+            if isinstance(author, str):
+                names |= _surname_forms(author)
+        for name in names:
+            by_surname.setdefault(name, set()).add(key)
+        if year:
+            by_year.setdefault(year, set()).add(key)
+        works[key] = (frozenset(names), year)
+    _ay_index = (_mtime, by_surname, by_year, works)
+    return _ay_index
+
+
+def find_works(query: str, max_works: int = 3) -> list[tuple[str, int]]:
+    """Zotero keys of the works a query names by author surname(s) and year,
+    best first, each with its match score (surnames matched, +1 for the year).
+
+    A year in the query must match. Without a year, a single surname counts only
+    when it names at most two works (a rare name), two or more surnames always.
+    When the best score is shared by more than ``_AY_MAX_TIES`` works the query
+    is too ambiguous and nothing is returned. Empty when the metadata is absent.
+    """
+    _, by_surname, _by_year, works = _author_year_index()
+    if not works or not query:
+        return []
+    years = set(_AY_YEAR_RE.findall(query))
+    tokens = {t.lower() for t in _AY_TOKEN_RE.findall(query)}
+    surnames = {t for t in tokens if t in by_surname}
+    if not surnames:
+        return []
+    matched: dict[str, int] = {}
+    for name in surnames:
+        for key in by_surname[name]:
+            matched[key] = matched.get(key, 0) + 1
+    scored: list[tuple[str, int]] = []
+    for key, hits in matched.items():
+        names, year = works[key]
+        if years:
+            if year not in years:
+                continue
+            scored.append((key, hits + 1))
+        else:
+            if hits == 1:
+                name = next(n for n in surnames if n in names)
+                if len(by_surname[name]) > 2:
+                    continue
+            scored.append((key, hits))
+    if not scored:
+        return []
+    scored.sort(key=lambda item: (-item[1], item[0]))
+    best = scored[0][1]
+    if sum(1 for _, score in scored if score == best) > _AY_MAX_TIES:
+        return []
+    return scored[:max_works]
+
+
+def cited_works_in(
+    text: str, exclude: set[str] | None = None, max_works: int = 4
+) -> list[str]:
+    """Zotero keys of the library works ``text`` cites by author and year, the
+    most-cited first.
+
+    A mention resolves when its first surname and year name at most
+    ``_CITE_MAX_WORKS_PER_MENTION`` works (a second surname narrows further);
+    ambiguous mentions are skipped. ``exclude`` drops works already in hand.
+    """
+    _, by_surname, by_year, works = _author_year_index()
+    if not works or not text:
+        return []
+    counts: dict[str, int] = {}
+    for match in _CITE_RE.finditer(text):
+        first, second, year = (
+            match.group(1).lower(),
+            (match.group(2) or "").lower(),
+            match.group(3),
+        )
+        candidates = by_surname.get(first, set()) & by_year.get(year, set())
+        if second:
+            candidates = {k for k in candidates if second in works[k][0]}
+        if not candidates or len(candidates) > _CITE_MAX_WORKS_PER_MENTION:
+            continue
+        for key in candidates:
+            counts[key] = counts.get(key, 0) + 1
+    if exclude:
+        counts = {k: c for k, c in counts.items() if k not in exclude}
+    ordered = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    return [key for key, _ in ordered[:max_works]]

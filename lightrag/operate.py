@@ -16,7 +16,7 @@ from lightrag.exceptions import (
     IndexFlushError,
     PipelineCancelledException,
 )
-from lightrag.zotero_citations import citation_short
+from lightrag.zotero_citations import cited_works_in, citation_short, find_works
 from lightrag.utils import (
     logger,
     compute_mdhash_id,
@@ -90,6 +90,7 @@ from lightrag.constants import (
     DEFAULT_SUMMARY_PRIORITY,
     DEFAULT_RELATED_CHUNK_NUMBER,
     DEFAULT_KG_CHUNK_PICK_METHOD,
+    DEFAULT_SIDECAR_RELATIONS,
     DEFAULT_SUMMARY_LANGUAGE,
     SOURCE_IDS_LIMIT_METHOD_KEEP,
     SOURCE_IDS_LIMIT_METHOD_FIFO,
@@ -350,6 +351,14 @@ _MM_DISPLAY_NAME_PATTERN = re.compile(
     r"^\[(?:Image|Table|Equation) Name\](.+)$",
     flags=re.MULTILINE,
 )
+
+
+def _sidecar_fanout_enabled(global_config: dict) -> bool:
+    """Whether a sidecar entity is linked to every entity of its chunk (fork;
+    SIDECAR_RELATIONS). ``none`` keeps the entity and adds no edges."""
+    return (
+        global_config.get("sidecar_relations") or DEFAULT_SIDECAR_RELATIONS
+    ) != "none"
 
 
 def _parse_mm_display_name(content: str, fallback: str) -> str:
@@ -660,6 +669,42 @@ async def _summarize_descriptions(
 # They are never valid entity types, so reject them at the extraction source.
 _RESERVED_ENTITY_TYPES = frozenset({"__proto__", "constructor", "prototype"})
 
+# Fork (ENTITY_TYPE_STRICT): the types the active extraction guidance lists, or
+# None when strict mode is off. Set by extract_entities for the process; the
+# extraction LLM invents types freely otherwise (hundreds of distinct values).
+_ENTITY_TYPE_ALLOWLIST: frozenset[str] | None = None
+_TYPE_LINE_RE = re.compile(
+    r"^[ \t]*[-*][ \t]*`?([A-Za-z][A-Za-z0-9_ -]*?)`?[ \t]*:", re.MULTILINE
+)
+
+
+def entity_types_in_guidance(guidance: str) -> frozenset[str]:
+    """The type names a guidance text lists as ``- Name: ...`` lines, normalised
+    the way stored entity types are (spaces removed, lower case)."""
+    return frozenset(
+        m.group(1).replace(" ", "").lower()
+        for m in _TYPE_LINE_RE.finditer(guidance or "")
+    )
+
+
+def _configure_entity_type_allowlist(
+    global_config: dict, guidance: str
+) -> frozenset[str] | None:
+    """Arm or disarm the strict entity-type check for this process."""
+    global _ENTITY_TYPE_ALLOWLIST
+    if not global_config.get("entity_type_strict"):
+        _ENTITY_TYPE_ALLOWLIST = None
+        return None
+    types = entity_types_in_guidance(guidance)
+    if not types:
+        logger.warning(
+            "ENTITY_TYPE_STRICT ignored: the entity-type guidance lists no `- Type:` lines"
+        )
+        _ENTITY_TYPE_ALLOWLIST = None
+        return None
+    _ENTITY_TYPE_ALLOWLIST = types | {"other"}
+    return _ENTITY_TYPE_ALLOWLIST
+
 
 def _normalize_and_validate_entity_type(entity_type: str, context: str) -> str | None:
     """Validate and normalize a sanitized entity_type extracted from an LLM.
@@ -705,6 +750,14 @@ def _normalize_and_validate_entity_type(entity_type: str, context: str) -> str |
             f"Entity extraction error: reserved entity type '{entity_type}' rejected in {context}"
         )
         return None
+
+    # Fork: a type the guidance does not list is stored as "other" (ENTITY_TYPE_STRICT).
+    allowlist = _ENTITY_TYPE_ALLOWLIST
+    if allowlist is not None and entity_type not in allowlist:
+        logger.debug(
+            f"Entity type '{entity_type}' is not in the guidance's list; stored as 'other' ({context})"
+        )
+        return "other"
 
     return entity_type
 
@@ -4019,6 +4072,7 @@ async def extract_entities(
             addon_params, use_json_extraction
         )
     entity_types_guidance = prompt_profile["entity_types_guidance"]
+    _configure_entity_type_allowlist(global_config, entity_types_guidance)
 
     max_total_records = global_config["entity_extract_max_records"]
     max_entity_records = global_config["entity_extract_max_entities"]
@@ -4469,27 +4523,31 @@ async def extract_entities(
                 mm_display_name = _parse_mm_display_name(
                     chunk_dp.get("content", "") or "", sidecar_id
                 )
-                for tgt in list(maybe_nodes.keys()):
-                    if tgt == mm_entity_name:
-                        continue
-                    edge_key = (mm_entity_name, tgt)
-                    edge_list = maybe_edges.setdefault(edge_key, [])
-                    edge_list.append(
-                        {
-                            "src_id": mm_entity_name,
-                            "tgt_id": tgt,
-                            "weight": 1.0,
-                            "description": (
-                                f"{tgt} is associated with {sidecar_type} "
-                                f"{mm_display_name} {location} "
-                                f'"{file_path}"'
-                            ),
-                            "keywords": "associated with, contained in",
-                            "source_id": chunk_key,
-                            "file_path": file_path,
-                            "timestamp": now_ts,
-                        }
-                    )
+                # Fork: SIDECAR_RELATIONS=none keeps the sidecar entity without the
+                # one-edge-per-entity fan-out (about a tenth of all edges on a
+                # paper corpus, every one generic).
+                if _sidecar_fanout_enabled(global_config):
+                    for tgt in list(maybe_nodes.keys()):
+                        if tgt == mm_entity_name:
+                            continue
+                        edge_key = (mm_entity_name, tgt)
+                        edge_list = maybe_edges.setdefault(edge_key, [])
+                        edge_list.append(
+                            {
+                                "src_id": mm_entity_name,
+                                "tgt_id": tgt,
+                                "weight": 1.0,
+                                "description": (
+                                    f"{tgt} is associated with {sidecar_type} "
+                                    f"{mm_display_name} {location} "
+                                    f'"{file_path}"'
+                                ),
+                                "keywords": "associated with, contained in",
+                                "source_id": chunk_key,
+                                "file_path": file_path,
+                                "timestamp": now_ts,
+                            }
+                        )
 
         processed_chunks += 1
         entities_count = len(maybe_nodes)
@@ -4764,6 +4822,9 @@ async def kg_query(
             ll_keywords = [query]
         else:
             return QueryResult(content=PROMPTS["fail_response"], llm_generated=False)
+    ll_keywords = _fallback_low_level_keywords(
+        hl_keywords, ll_keywords, query_param.mode, global_config
+    )
 
     ll_keywords_str = ", ".join(ll_keywords) if ll_keywords else ""
     hl_keywords_str = ", ".join(hl_keywords) if hl_keywords else ""
@@ -4905,6 +4966,21 @@ async def kg_query(
         *(
             ("\n<lexical_chunk_top_k>\n", retrieval_config.get("lexical_chunk_top_k"))
             if retrieval_config.get("lexical_chunk_top_k")
+            else ()
+        ),
+        *(
+            ("\n<metadata_chunk_top_k>\n", retrieval_config.get("metadata_chunk_top_k"))
+            if retrieval_config.get("metadata_chunk_top_k")
+            else ()
+        ),
+        *(
+            ("\n<citation_hop_top_k>\n", retrieval_config.get("citation_hop_top_k"))
+            if retrieval_config.get("citation_hop_top_k")
+            else ()
+        ),
+        *(
+            ("\n<min_rerank_score>\n", query_param.min_rerank_score)
+            if query_param.min_rerank_score is not None
             else ()
         ),
         *(("\n<system_prompt>\n", system_prompt) if system_prompt else ()),
@@ -5359,6 +5435,123 @@ def _interleave_chunks(first: list[dict], second: list[dict]) -> list[dict]:
     return merged
 
 
+def _prepend_chunks(first: list[dict], second: list[dict]) -> list[dict]:
+    """``first`` then ``second``, dropping repeated chunk ids."""
+    merged, seen = [], set()
+    for source in (first, second):
+        for chunk in source:
+            chunk_id = chunk.get("chunk_id") or chunk.get("id")
+            if chunk_id not in seen:
+                seen.add(chunk_id)
+                merged.append(chunk)
+    return merged
+
+
+def _fallback_low_level_keywords(
+    hl_keywords: list[str], ll_keywords: list[str], mode: str, global_config: dict
+) -> list[str]:
+    """The entity leg's keywords when the extractor returned none (fork;
+    LL_KEYWORDS_FALLBACK): the high-level keywords stand in, else the leg is
+    skipped as before."""
+    if ll_keywords or not hl_keywords or mode not in ("local", "hybrid", "mix"):
+        return ll_keywords
+    if not global_config.get("ll_keywords_fallback"):
+        return ll_keywords
+    logger.info(
+        "low_level_keywords is empty: the entity leg reuses the high-level keywords "
+        "(LL_KEYWORDS_FALLBACK)"
+    )
+    return list(hl_keywords)
+
+
+_METADATA_MAX_WORKS = 3
+_CITATION_HOP_SOURCE_CHUNKS = 12
+_CITATION_HOP_CHUNKS_PER_WORK = 2
+_metadata_unsupported_warned = False
+
+
+def _work_rows_to_chunks(rows: list[dict], source_type: str) -> list[dict]:
+    return [
+        {
+            "content": row.get("content") or "",
+            "file_path": row.get("file_path") or "unknown_source",
+            "source_type": source_type,
+            "chunk_id": row["id"],
+        }
+        for row in rows
+        if row.get("id")
+    ]
+
+
+async def _get_metadata_context(
+    query: str,
+    text_chunks_db: BaseKVStorage | None,
+    hop_sources: list[dict] | None = None,
+) -> list[dict]:
+    """Chunks of the works a query names by author and year, and of the works
+    the best candidate chunks cite (fork; METADATA_CHUNK_TOP_K, CITATION_HOP_TOP_K).
+
+    A paper named by surnames and a year is found through the Zotero metadata
+    (:func:`lightrag.zotero_citations.find_works`), not through its text: its
+    author line is one chunk and its method words are others, so no single
+    chunk of the paper matches the whole query, while the papers citing it
+    match well. ``hop_sources`` (the vector and lexical candidates) are scanned
+    for citations of library works
+    (:func:`lightrag.zotero_citations.cited_works_in`); the most-cited join with
+    two chunks each, which reaches a paper the corpus names only by citation.
+    Each work contributes its first chunk, then its best full-text matches
+    (``get_chunks_for_works``). Reference lists are dropped when the bibliography
+    filter is on. Both legs are off at 0; a storage without
+    ``get_chunks_for_works`` logs once and yields nothing.
+    """
+    global _metadata_unsupported_warned
+    if text_chunks_db is None:
+        return []
+    config = text_chunks_db.global_config
+    top_k = config.get("metadata_chunk_top_k") or 0
+    hop_k = config.get("citation_hop_top_k") or 0
+    if top_k <= 0 and hop_k <= 0:
+        return []
+    fetch = getattr(text_chunks_db, "get_chunks_for_works", None)
+    if fetch is None:
+        if not _metadata_unsupported_warned:
+            logger.warning(
+                f"METADATA_CHUNK_TOP_K/CITATION_HOP_TOP_K ignored: "
+                f"{type(text_chunks_db).__name__} has no get_chunks_for_works"
+            )
+            _metadata_unsupported_warned = True
+        return []
+    named = (
+        [key for key, _ in find_works(query, max_works=_METADATA_MAX_WORKS)]
+        if top_k > 0
+        else []
+    )
+    cited: list[str] = []
+    if hop_k > 0 and hop_sources:
+        text = "\n".join(
+            (chunk.get("content") or "")
+            for chunk in hop_sources[:_CITATION_HOP_SOURCE_CHUNKS]
+        )
+        cited = cited_works_in(text, exclude=set(named), max_works=hop_k)
+    if not named and not cited:
+        return []
+    chunks: list[dict] = []
+    if named:
+        per_work = max(1, -(-top_k // len(named)))
+        rows = await fetch(named, query, per_work)
+        chunks.extend(_work_rows_to_chunks(rows[:top_k], "metadata"))
+    if cited:
+        rows = await fetch(cited, query, _CITATION_HOP_CHUNKS_PER_WORK)
+        chunks.extend(_work_rows_to_chunks(rows, "citation"))
+    if config.get("drop_bibliography_chunks"):
+        chunks = [c for c in chunks if not is_bibliography_chunk(c["content"])]
+    logger.info(
+        f"Metadata query: {len(chunks)} chunks from {len(named)} named and "
+        f"{len(cited)} cited works (metadata_chunk_top_k:{top_k}, citation_hop_top_k:{hop_k})"
+    )
+    return chunks
+
+
 async def _perform_kg_search(
     query: str,
     ll_keywords: str,
@@ -5383,6 +5576,7 @@ async def _perform_kg_search(
     global_relations = []
     vector_chunks = []
     lexical_chunks = []
+    metadata_chunks = []
     chunk_tracking = {}
 
     # Handle different query modes
@@ -5522,6 +5716,17 @@ async def _perform_kg_search(
                         "frequency": 1,
                         "order": i + 1,
                     }
+            # Author-year and citation legs (opt-in, METADATA_CHUNK_TOP_K / CITATION_HOP_TOP_K)
+            metadata_chunks = await _get_metadata_context(
+                query, text_chunks_db, hop_sources=vector_chunks + lexical_chunks
+            )
+            for i, chunk in enumerate(metadata_chunks):
+                if chunk["chunk_id"] not in chunk_tracking:
+                    chunk_tracking[chunk["chunk_id"]] = {
+                        "source": "M",
+                        "frequency": 1,
+                        "order": i + 1,
+                    }
 
     # Round-robin merge entities
     final_entities = []
@@ -5588,6 +5793,7 @@ async def _perform_kg_search(
         "final_relations": final_relations,
         "vector_chunks": vector_chunks,
         "lexical_chunks": lexical_chunks,
+        "metadata_chunks": metadata_chunks,
         "chunk_tracking": chunk_tracking,
         "query_embedding": query_embedding,
     }
@@ -5869,11 +6075,15 @@ async def _merge_all_chunks(
     chunk_tracking: dict = None,
     query_embedding: list[float] = None,
     lexical_chunks: list[dict] | None = None,
+    metadata_chunks: list[dict] | None = None,
 ) -> list[dict]:
     """
     Merge chunks from different sources: vector_chunks + entity_chunks + relation_chunks,
-    plus the fork's lexical chunks interleaved with the vector ones.
+    plus the fork's lexical chunks interleaved with the vector ones and its
+    metadata/citation chunks ahead of them.
     """
+    if metadata_chunks:
+        vector_chunks = _prepend_chunks(metadata_chunks, vector_chunks or [])
     if lexical_chunks:
         vector_chunks = _interleave_chunks(vector_chunks, lexical_chunks)
     if chunk_tracking is None:
@@ -6242,6 +6452,7 @@ async def _build_query_context(
         chunk_tracking=search_result["chunk_tracking"],
         query_embedding=search_result["query_embedding"],
         lexical_chunks=search_result.get("lexical_chunks"),
+        metadata_chunks=search_result.get("metadata_chunks"),
     )
 
     if (
@@ -7006,6 +7217,11 @@ async def naive_query(
     lexical_chunks = await _get_lexical_context(query, text_chunks_db)
     if lexical_chunks:
         chunks = _interleave_chunks(chunks or [], lexical_chunks)
+    metadata_chunks = await _get_metadata_context(
+        query, text_chunks_db, hop_sources=chunks or []
+    )
+    if metadata_chunks:
+        chunks = _prepend_chunks(metadata_chunks, chunks or [])
 
     if chunks is None or len(chunks) == 0:
         logger.info(
@@ -7179,6 +7395,21 @@ async def naive_query(
         *(
             ("\n<lexical_chunk_top_k>\n", global_config.get("lexical_chunk_top_k"))
             if global_config.get("lexical_chunk_top_k")
+            else ()
+        ),
+        *(
+            ("\n<metadata_chunk_top_k>\n", global_config.get("metadata_chunk_top_k"))
+            if global_config.get("metadata_chunk_top_k")
+            else ()
+        ),
+        *(
+            ("\n<citation_hop_top_k>\n", global_config.get("citation_hop_top_k"))
+            if global_config.get("citation_hop_top_k")
+            else ()
+        ),
+        *(
+            ("\n<min_rerank_score>\n", query_param.min_rerank_score)
+            if query_param.min_rerank_score is not None
             else ()
         ),
         *(("\n<system_prompt>\n", system_prompt) if system_prompt else ()),

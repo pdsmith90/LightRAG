@@ -75,6 +75,23 @@ DEFAULT_MAX_CHUNKS_PER_DOC = 0
 # before reranking; 0 = off (env LEXICAL_CHUNK_TOP_K). See
 # lightrag.kg.postgres_impl.PGKVStorage.lexical_search.
 DEFAULT_LEXICAL_CHUNK_TOP_K = 0
+# Fork: the lexical leg counts a term's document frequency only up to this share of
+# the chunks (at least 500); past it the term is common and never generates
+# candidates. 2 means 2 %.
+DEFAULT_LEXICAL_DF_CAP_PCT = 2.0
+# Fork: chunks the author-year leg adds for the works a query names; 0 = off.
+DEFAULT_METADATA_CHUNK_TOP_K = 0
+# Fork: works cited by the best candidate chunks whose own chunks join the
+# candidates; 0 = off.
+DEFAULT_CITATION_HOP_TOP_K = 0
+# Fork: reuse the high-level keywords for the entity leg when the extractor
+# returned no low-level keywords.
+DEFAULT_LL_KEYWORDS_FALLBACK = False
+# Fork: "all" links a table/equation/drawing sidecar entity to every entity of its
+# chunk (upstream behaviour); "none" creates the sidecar entity only.
+DEFAULT_SIDECAR_RELATIONS = "all"
+# Fork: store an entity type the extraction guidance does not list as "other".
+DEFAULT_ENTITY_TYPE_STRICT = False
 
 # Rerank configuration defaults
 DEFAULT_MIN_RERANK_SCORE = 0.0

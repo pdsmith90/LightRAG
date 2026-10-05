@@ -64,6 +64,12 @@ from lightrag.constants import (
     DEFAULT_DROP_BIBLIOGRAPHY_CHUNKS,
     DEFAULT_MAX_CHUNKS_PER_DOC,
     DEFAULT_LEXICAL_CHUNK_TOP_K,
+    DEFAULT_LEXICAL_DF_CAP_PCT,
+    DEFAULT_METADATA_CHUNK_TOP_K,
+    DEFAULT_CITATION_HOP_TOP_K,
+    DEFAULT_LL_KEYWORDS_FALLBACK,
+    DEFAULT_SIDECAR_RELATIONS,
+    DEFAULT_ENTITY_TYPE_STRICT,
     DEFAULT_SUMMARY_MAX_TOKENS,
     DEFAULT_SUMMARY_CONTEXT_SIZE,
     DEFAULT_SUMMARY_LENGTH_RECOMMENDED,
@@ -1421,6 +1427,87 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
     text-chunk storage with ``lexical_search`` (PostgreSQL, with the GIN index
     described there); other backends log once and skip it. Env
     ``LEXICAL_CHUNK_TOP_K``; set it at construction.
+    """
+
+    lexical_df_cap_pct: float = field(
+        default_factory=lambda: get_env_value(
+            "LEXICAL_DF_CAP_PCT", DEFAULT_LEXICAL_DF_CAP_PCT, float
+        )
+    )
+    """Share of the chunks (percent) above which a lexical query term is common.
+
+    The lexical leg counts a term's document frequency only up to this share (at
+    least 500 chunks); a term past it keeps the floor weight and never generates
+    candidates. In a corpus where a field's central authors are cited in more than
+    2 % of the chunks, raise it so their surnames still select candidates. Env
+    ``LEXICAL_DF_CAP_PCT``.
+    """
+
+    metadata_chunk_top_k: int = field(
+        default_factory=lambda: get_env_value(
+            "METADATA_CHUNK_TOP_K", DEFAULT_METADATA_CHUNK_TOP_K, int
+        )
+    )
+    """Chunks the author-year leg adds for the works a query names; 0 = off.
+
+    A query that names a paper by author surnames and year ("Okafor and Lindqvist
+    2019 ...") is resolved against the Zotero metadata
+    (:func:`lightrag.zotero_citations.find_works`), and up to this many chunks of
+    the named works -- each work's first chunk, then its best full-text matches --
+    join the ``mix`` and ``naive`` candidates ahead of the reranker. Requires a
+    text-chunk storage with ``get_chunks_for_works`` (PostgreSQL). Env
+    ``METADATA_CHUNK_TOP_K``.
+    """
+
+    citation_hop_top_k: int = field(
+        default_factory=lambda: get_env_value(
+            "CITATION_HOP_TOP_K", DEFAULT_CITATION_HOP_TOP_K, int
+        )
+    )
+    """Works cited by the best candidate chunks whose own chunks join the
+    candidates; 0 = off.
+
+    The vector and lexical candidates are scanned for author-year citations
+    ("Okafor (2019)", "Okafor et al., 2019") that resolve to library works
+    (:func:`lightrag.zotero_citations.cited_works_in`); the most-cited ones
+    contribute two chunks each. This reaches a paper that the corpus names only
+    by citation -- an acronym the paper itself never spells out. Env
+    ``CITATION_HOP_TOP_K``.
+    """
+
+    ll_keywords_fallback: bool = field(
+        default_factory=lambda: get_env_value(
+            "LL_KEYWORDS_FALLBACK", DEFAULT_LL_KEYWORDS_FALLBACK, bool
+        )
+    )
+    """Reuse the high-level keywords for the entity leg when the keyword
+    extractor returned no low-level keywords.
+
+    Without it a ``local``, ``hybrid`` or ``mix`` query whose extraction put every
+    term in the high-level list skips the entity search entirely. Env
+    ``LL_KEYWORDS_FALLBACK``.
+    """
+
+    sidecar_relations: str = field(
+        default_factory=lambda: get_env_value(
+            "SIDECAR_RELATIONS", DEFAULT_SIDECAR_RELATIONS, str
+        )
+    )
+    """How a table/equation/drawing sidecar entity is linked: ``all`` (upstream)
+    adds one "associated with, contained in" edge to every entity extracted from
+    the chunk; ``none`` keeps the sidecar entity and adds no edges. Env
+    ``SIDECAR_RELATIONS``.
+    """
+
+    entity_type_strict: bool = field(
+        default_factory=lambda: get_env_value(
+            "ENTITY_TYPE_STRICT", DEFAULT_ENTITY_TYPE_STRICT, bool
+        )
+    )
+    """Store an extracted entity type that the active entity-type guidance does
+    not list (its ``- Type: ...`` lines) as ``other`` instead of as written.
+    Ignored, with a warning, when the guidance lists no types. Env
+    ``ENTITY_TYPE_STRICT``.
     """
 
     def _mark_addon_params_dirty(self) -> None:

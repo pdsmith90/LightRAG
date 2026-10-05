@@ -306,7 +306,7 @@ def _storage(db, namespace=NameSpace.KV_STORE_TEXT_CHUNKS):
 async def test_storage_searches_with_workspace_query_and_limit():
     db = _FakeDB()
     rows = await _storage(db).lexical_search("okafor 2019", 6)
-    assert db.calls[-1][1] == ["ws", "okafor 2019", 6]
+    assert db.calls[-1][1] == ["ws", "okafor 2019", 6, 2.0]
     assert rows[0]["score"] == 3.0 and isinstance(rows[0]["score"], float)
 
 

@@ -112,6 +112,59 @@ once and stays off. Code: `PGKVStorage.lexical_search` in
 `lightrag/kg/postgres_impl.py`, `_get_lexical_context` in `lightrag/operate.py`. Part
 of the query-answer cache key; reported in `/health`. Off by default.
 
+### Author-year and citation legs
+
+A query that names a paper by surnames and year ("Okafor and Lindqvist 2019 ...") is
+hard for every text leg: the paper's author line is one chunk and its method words
+are others, so no single chunk of it matches the whole query, while the papers that
+cite it match well. With `METADATA_CHUNK_TOP_K=N`, `mix` and `naive` queries resolve
+the surnames and year against the Zotero metadata (`find_works` in
+`lightrag/zotero_citations.py`: a year in the query must match; without one a single
+surname counts only when it names at most two works) and add up to N chunks of the
+named works -- each work's first chunk, then its best full-text matches -- ahead of
+the vector chunks. With `CITATION_HOP_TOP_K=M`, the vector and lexical candidates are
+scanned for author-year citations of library works (`cited_works_in`), and the M
+most-cited works contribute two chunks each; this reaches a paper the corpus names
+only by citation, such as the origin of an acronym the paper itself never spells
+out. Both need a text-chunk storage with `get_chunks_for_works` (PostgreSQL). Code:
+`_get_metadata_context` in `lightrag/operate.py`. Part of the query-answer cache key;
+reported in `/health`. Off by default.
+
+### Low-level keyword fallback
+
+With `LL_KEYWORDS_FALLBACK=true`, a `local`, `hybrid` or `mix` query whose keyword
+extraction returned no low-level keywords runs its entity leg on the high-level
+keywords instead of skipping it (`_fallback_low_level_keywords` in
+`lightrag/operate.py`). Off by default.
+
+### Per-request rerank floor
+
+`QueryParam.min_rerank_score` (and the same field on `/query`, `/query/stream` and
+`/query/data`) replaces the server's `MIN_RERANK_SCORE` for one request, so an
+evaluation can sweep the floor without restarts. Part of the cache key when set.
+
+### Lexical document-frequency cap
+
+`LEXICAL_DF_CAP_PCT` (default 2) is the share of the chunks above which the lexical
+leg treats a query term as common: it keeps the floor weight and never generates
+candidates. Raise it when a field's central authors are cited in more than that
+share of the chunks.
+
+### Strict entity types
+
+With `ENTITY_TYPE_STRICT=true`, an extracted entity type that the active entity-type
+guidance does not list (its `- Type: ...` lines) is stored as `other`
+(`_configure_entity_type_allowlist` / `_normalize_and_validate_entity_type` in
+`lightrag/operate.py`). The extraction LLM otherwise invents types freely. Ignored,
+with a warning, when the guidance lists no types. Off by default.
+
+### Sidecar relations
+
+`SIDECAR_RELATIONS=none` keeps a table/equation/drawing sidecar entity but no longer
+links it to every entity extracted from its chunk with an "associated with, contained
+in" edge (upstream behaviour, `all`). On a paper corpus those edges were about a tenth
+of the graph, every one generic.
+
 ### PostgreSQL edge removal in plain SQL
 
 `PGGraphStorage.remove_edges` deletes edges with one plain-SQL statement per batch on

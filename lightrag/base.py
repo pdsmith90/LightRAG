@@ -188,6 +188,12 @@ class QueryParam:
     instructions. Set this to True to take full control of the final text.
     """
 
+    min_rerank_score: float | None = None
+    """Rerank-score floor for this request (fork). ``None`` keeps the server's
+    ``MIN_RERANK_SCORE``; a value replaces it for this query only, so an
+    evaluation can sweep the floor without restarting the server. Part of the
+    query-answer cache key when set."""
+
 
 @dataclass
 class StorageNameSpace(ABC):

@@ -47,7 +47,11 @@ from ..base import (
     SourceResolution,
     SourceUnique,
 )
-from ..constants import CUSTOM_CHUNK_PATCH_METADATA_KEY, DEFAULT_QUERY_PRIORITY
+from ..constants import (
+    CUSTOM_CHUNK_PATCH_METADATA_KEY,
+    DEFAULT_LEXICAL_DF_CAP_PCT,
+    DEFAULT_QUERY_PRIORITY,
+)
 from ..exceptions import (
     DataMigrationError,
     SourceConflictRepairCASError,
@@ -3569,12 +3573,38 @@ class PGKVStorage(BaseKVStorage):
                 )
         if not self._lexical_index_ok:
             return []
+        config = getattr(self, "global_config", None) or {}
+        cap_pct = float(config.get("lexical_df_cap_pct") or DEFAULT_LEXICAL_DF_CAP_PCT)
         rows = await self.db.query(
             SQL_TEMPLATES["lexical_search_text_chunks"],
-            [self.workspace, query, top_k],
+            [self.workspace, query, top_k, cap_pct],
             multirows=True,
         )
         return [dict(row, score=float(row["score"] or 0.0)) for row in rows or []]
+
+    async def get_chunks_for_works(
+        self, keys: list[str], query: str, per_work: int
+    ) -> list[dict[str, Any]]:
+        """Up to ``per_work`` chunks of each listed work, best first (fork).
+
+        A work is a processed document whose corpus file name starts with the
+        Zotero key (``<key>__<slug>.md``). Its first chunk (title, authors,
+        abstract) always comes first; the rest rank by ``ts_rank`` against the
+        query's terms, so a query that names a paper gets its header and the
+        passages that mention the query's other words. Rows carry ``id``,
+        ``full_doc_id``, ``file_path``, ``content``, ``chunk_order_index`` and
+        ``work`` (the key). Text-chunk namespace only.
+        """
+        if not keys or per_work <= 0:
+            return []
+        if not is_namespace(self.namespace, NameSpace.KV_STORE_TEXT_CHUNKS):
+            return []
+        rows = await self.db.query(
+            SQL_TEMPLATES["chunks_for_works_text_chunks"],
+            [self.workspace, list(keys), query or "", per_work],
+            multirows=True,
+        )
+        return [dict(row) for row in rows or []]
 
     async def filter_keys(self, keys: set[str]) -> set[str]:
         """Filter out duplicated content"""
@@ -5383,7 +5413,14 @@ class PGVectorStorage(BaseVectorStorage):
             try:
                 embeddings_list = await asyncio.gather(
                     *[
-                        self.embedding_func(batch, context="document")
+                        # Fork: the only caller is the query path (vector-similarity
+                        # chunk selection), so embed at query priority -- behind the
+                        # pipeline's embedding backlog a query otherwise waits FIFO
+                        # for every pending chunk ahead of it (stalls of 30-2,500 s
+                        # were measured during big-document ingest).
+                        self.embedding_func(
+                            batch, context="document", _priority=DEFAULT_QUERY_PRIORITY
+                        )
                         for batch in batches
                     ]
                 )
@@ -9939,10 +9976,10 @@ SQL_TEMPLATES = {
                                  FROM LIGHTRAG_DOC_FULL WHERE workspace=$1 AND id = ANY($2)
                             """,
     # Fork: the lexical leg of mix/naive retrieval (PGKVStorage.lexical_search).
-    # $1 workspace, $2 query text, $3 limit. Each query term (english stemming,
-    # stop words dropped) weighs ln(N / (df + 1)); df is counted only up to 2% of
-    # the chunks (at least 500) -- past that a term is common and gets the floor
-    # weight anyway. Candidates are the chunks holding one of the three rarest
+    # $1 workspace, $2 query text, $3 limit, $4 df cap in percent. Each query term
+    # (english stemming, stop words dropped) weighs ln(N / (df + 1)); df is counted
+    # only up to $4 % of the chunks (at least 500) -- past that a term is common
+    # and gets the floor weight anyway. Candidates are the chunks holding one of the three rarest
     # terms below that bar (at most 3000); each scores the summed weight of every
     # query term it contains. MATERIALIZED makes each candidate's text parse once,
     # not once per query term (measured: 18 s -> 1.4 s on a 15-term query).
@@ -9950,7 +9987,7 @@ SQL_TEMPLATES = {
                     SELECT DISTINCT lex FROM unnest(tsvector_to_array(to_tsvector('english', $2))) AS lex
                 ),
                 n AS (SELECT count(*)::float AS total FROM LIGHTRAG_DOC_CHUNKS WHERE workspace = $1),
-                cap AS (SELECT GREATEST(500, ((SELECT total FROM n) * 0.02)::int) AS v),
+                cap AS (SELECT GREATEST(500, ((SELECT total FROM n) * $4::float / 100.0)::int) AS v),
                 w AS (
                     SELECT q.lex,
                            (SELECT count(*) FROM (SELECT 1 FROM LIGHTRAG_DOC_CHUNKS c
@@ -9977,6 +10014,37 @@ SQL_TEMPLATES = {
                 FROM cand
                 ORDER BY score DESC, chunk_order_index ASC
                 LIMIT $3
+            """,
+    # Fork: the author-year / citation legs (PGKVStorage.get_chunks_for_works).
+    # $1 workspace, $2 Zotero keys, $3 query text, $4 chunks per work. A work's
+    # documents are the processed doc_status rows whose file name starts with the
+    # key; chunk 0 ranks first, the others by ts_rank over the query's lexemes
+    # (OR-ed, so a chunk holding any of them scores).
+    "chunks_for_works_text_chunks": """WITH w AS (SELECT DISTINCT unnest($2::text[]) AS key),
+                d AS (
+                    SELECT s.id AS doc_id, w.key
+                    FROM LIGHTRAG_DOC_STATUS s JOIN w ON split_part(s.file_path, '__', 1) = w.key
+                    WHERE s.workspace = $1 AND s.status = 'processed'
+                ),
+                q AS (
+                    SELECT string_agg(quote_literal(lex), ' | ')::tsquery AS tq
+                    FROM unnest(tsvector_to_array(to_tsvector('english', $3))) AS lex
+                ),
+                c AS (
+                    SELECT c.id, c.full_doc_id, c.file_path, COALESCE(c.content, '') AS content,
+                           c.chunk_order_index, d.key AS work,
+                           CASE WHEN c.chunk_order_index = 0 THEN 1e9
+                                WHEN (SELECT tq FROM q) IS NULL THEN 0.0
+                                ELSE ts_rank(to_tsvector('english', c.content), (SELECT tq FROM q)) END AS r
+                    FROM LIGHTRAG_DOC_CHUNKS c JOIN d ON c.full_doc_id = d.doc_id
+                    WHERE c.workspace = $1
+                ),
+                ranked AS (
+                    SELECT *, row_number() OVER (PARTITION BY work ORDER BY r DESC, chunk_order_index) AS rn
+                    FROM c
+                )
+                SELECT id, full_doc_id, file_path, content, chunk_order_index, work
+                FROM ranked WHERE rn <= $4 ORDER BY work, rn
             """,
     # The GIN index lexical_search_text_chunks needs; matched by definition, not name.
     "lexical_index_text_chunks": """SELECT 1 FROM pg_indexes

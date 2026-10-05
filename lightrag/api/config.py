@@ -33,6 +33,12 @@ from lightrag.constants import (
     DEFAULT_DROP_BIBLIOGRAPHY_CHUNKS,
     DEFAULT_MAX_CHUNKS_PER_DOC,
     DEFAULT_LEXICAL_CHUNK_TOP_K,
+    DEFAULT_LEXICAL_DF_CAP_PCT,
+    DEFAULT_METADATA_CHUNK_TOP_K,
+    DEFAULT_CITATION_HOP_TOP_K,
+    DEFAULT_LL_KEYWORDS_FALLBACK,
+    DEFAULT_SIDECAR_RELATIONS,
+    DEFAULT_ENTITY_TYPE_STRICT,
     DEFAULT_MIN_RERANK_SCORE,
     DEFAULT_FORCE_LLM_SUMMARY_ON_MERGE,
     DEFAULT_MAX_ASYNC,
@@ -950,6 +956,24 @@ def parse_args() -> argparse.Namespace:
     )
     args.lexical_chunk_top_k = get_env_value(
         "LEXICAL_CHUNK_TOP_K", DEFAULT_LEXICAL_CHUNK_TOP_K, int
+    )
+    args.lexical_df_cap_pct = get_env_value(
+        "LEXICAL_DF_CAP_PCT", DEFAULT_LEXICAL_DF_CAP_PCT, float
+    )
+    args.metadata_chunk_top_k = get_env_value(
+        "METADATA_CHUNK_TOP_K", DEFAULT_METADATA_CHUNK_TOP_K, int
+    )
+    args.citation_hop_top_k = get_env_value(
+        "CITATION_HOP_TOP_K", DEFAULT_CITATION_HOP_TOP_K, int
+    )
+    args.ll_keywords_fallback = get_env_value(
+        "LL_KEYWORDS_FALLBACK", DEFAULT_LL_KEYWORDS_FALLBACK, bool
+    )
+    args.sidecar_relations = get_env_value(
+        "SIDECAR_RELATIONS", DEFAULT_SIDECAR_RELATIONS, str
+    )
+    args.entity_type_strict = get_env_value(
+        "ENTITY_TYPE_STRICT", DEFAULT_ENTITY_TYPE_STRICT, bool
     )
 
     # Add missing environment variables for health endpoint
