@@ -158,6 +158,18 @@ guidance does not list (its `- Type: ...` lines) is stored as `other`
 `lightrag/operate.py`). The extraction LLM otherwise invents types freely. Ignored,
 with a warning, when the guidance lists no types. Off by default.
 
+### Symbol entity names
+
+With `DROP_SYMBOL_ENTITIES=true`, an extracted entity whose name is a lone symbol or
+variable -- one character (`x`, `θ`, `7`), or two that are not alphanumeric or are
+digits (`a,`, `12`) -- is dropped, and so is every extracted relation that names one
+(otherwise the merge would recreate the endpoint as an untyped node). Alphanumeric
+pairs such as `J2`, `Io` or `L1` are kept (`is_symbol_entity_name` in
+`lightrag/operate.py`). The extraction LLM turns formula variables into entities
+whatever the prompt says, and on a paper corpus the one-letter hubs collect
+thousands of unrelated edges. Applies to new extractions; existing symbol entities
+stay until deleted. Off by default.
+
 ### Sidecar relations
 
 `SIDECAR_RELATIONS=none` keeps a table/equation/drawing sidecar entity but no longer

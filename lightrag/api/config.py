@@ -39,6 +39,7 @@ from lightrag.constants import (
     DEFAULT_LL_KEYWORDS_FALLBACK,
     DEFAULT_SIDECAR_RELATIONS,
     DEFAULT_ENTITY_TYPE_STRICT,
+    DEFAULT_DROP_SYMBOL_ENTITIES,
     DEFAULT_MIN_RERANK_SCORE,
     DEFAULT_FORCE_LLM_SUMMARY_ON_MERGE,
     DEFAULT_MAX_ASYNC,
@@ -974,6 +975,9 @@ def parse_args() -> argparse.Namespace:
     )
     args.entity_type_strict = get_env_value(
         "ENTITY_TYPE_STRICT", DEFAULT_ENTITY_TYPE_STRICT, bool
+    )
+    args.drop_symbol_entities = get_env_value(
+        "DROP_SYMBOL_ENTITIES", DEFAULT_DROP_SYMBOL_ENTITIES, bool
     )
 
     # Add missing environment variables for health endpoint

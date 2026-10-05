@@ -762,6 +762,37 @@ def _normalize_and_validate_entity_type(entity_type: str, context: str) -> str |
     return entity_type
 
 
+# Fork (DROP_SYMBOL_ENTITIES): set by extract_entities for the process, like the
+# type allow-list. The extraction LLM turns formula variables into entities
+# ("x", "R", "θ") whatever the prompt says; on a paper corpus the one-letter hubs
+# collect thousands of unrelated edges.
+_DROP_SYMBOL_ENTITIES = False
+
+
+def _configure_symbol_entity_filter(global_config: dict) -> bool:
+    """Arm or disarm the symbol entity-name filter for this process."""
+    global _DROP_SYMBOL_ENTITIES
+    _DROP_SYMBOL_ENTITIES = bool(global_config.get("drop_symbol_entities"))
+    return _DROP_SYMBOL_ENTITIES
+
+
+def is_symbol_entity_name(name: str) -> bool:
+    """One character (``x``, ``θ``, ``7``), or two that are not alphanumeric or
+    are digits (``a,``, ``x̂``, ``12``). Alphanumeric pairs are real entities
+    often enough to keep: ``Io``, ``J2``, ``pH``, ``L1``."""
+    name = name.strip()
+    if len(name) == 1:
+        return True
+    if len(name) == 2:
+        return not name.isalnum() or name.isdigit()
+    return False
+
+
+def _dropped_as_symbol(*names: str) -> bool:
+    """True when the symbol filter is armed and any of ``names`` is a symbol."""
+    return _DROP_SYMBOL_ENTITIES and any(is_symbol_entity_name(n) for n in names)
+
+
 def _handle_single_entity_extraction(
     record_attributes: list[str],
     chunk_key: str,
@@ -784,6 +815,10 @@ def _handle_single_entity_extraction(
             logger.info(
                 f"Empty entity name found after sanitization. Original: '{record_attributes[1]}'"
             )
+            return None
+
+        if _dropped_as_symbol(entity_name):
+            logger.debug(f"{chunk_key}: symbol entity '{entity_name}' dropped")
             return None
 
         # Process entity type with same cleaning pipeline
@@ -862,6 +897,12 @@ def _handle_single_relationship_extraction(
         if source == target:
             logger.debug(
                 f"Relationship source and target are the same in: {record_attributes}"
+            )
+            return None
+
+        if _dropped_as_symbol(source, target):
+            logger.debug(
+                f"{chunk_key}: relation '{source}'~'{target}' dropped (symbol endpoint)"
             )
             return None
 
@@ -1034,6 +1075,10 @@ async def _process_json_extraction_result(
                 )
                 continue
 
+            if _dropped_as_symbol(entity_name):
+                logger.debug(f"{chunk_key}: symbol entity '{entity_name}' dropped")
+                continue
+
             entity_type = sanitize_and_normalize_extracted_text(
                 str(entity_data.get("type", "")), remove_inner_quotes=True
             )
@@ -1103,6 +1148,12 @@ async def _process_json_extraction_result(
                 continue
             if source == target:
                 logger.debug(f"{chunk_key}: Source and target are the same: '{source}'")
+                continue
+
+            if _dropped_as_symbol(source, target):
+                logger.debug(
+                    f"{chunk_key}: relation '{source}'~'{target}' dropped (symbol endpoint)"
+                )
                 continue
 
             edge_keywords = sanitize_and_normalize_extracted_text(
@@ -4073,6 +4124,7 @@ async def extract_entities(
         )
     entity_types_guidance = prompt_profile["entity_types_guidance"]
     _configure_entity_type_allowlist(global_config, entity_types_guidance)
+    _configure_symbol_entity_filter(global_config)
 
     max_total_records = global_config["entity_extract_max_records"]
     max_entity_records = global_config["entity_extract_max_entities"]

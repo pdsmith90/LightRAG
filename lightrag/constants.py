@@ -92,6 +92,8 @@ DEFAULT_LL_KEYWORDS_FALLBACK = False
 DEFAULT_SIDECAR_RELATIONS = "all"
 # Fork: store an entity type the extraction guidance does not list as "other".
 DEFAULT_ENTITY_TYPE_STRICT = False
+# Fork: drop extracted entities named by a lone symbol or variable, and their relations.
+DEFAULT_DROP_SYMBOL_ENTITIES = False
 
 # Rerank configuration defaults
 DEFAULT_MIN_RERANK_SCORE = 0.0

@@ -70,6 +70,7 @@ from lightrag.constants import (
     DEFAULT_LL_KEYWORDS_FALLBACK,
     DEFAULT_SIDECAR_RELATIONS,
     DEFAULT_ENTITY_TYPE_STRICT,
+    DEFAULT_DROP_SYMBOL_ENTITIES,
     DEFAULT_SUMMARY_MAX_TOKENS,
     DEFAULT_SUMMARY_CONTEXT_SIZE,
     DEFAULT_SUMMARY_LENGTH_RECOMMENDED,
@@ -1508,6 +1509,18 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
     not list (its ``- Type: ...`` lines) as ``other`` instead of as written.
     Ignored, with a warning, when the guidance lists no types. Env
     ``ENTITY_TYPE_STRICT``.
+    """
+
+    drop_symbol_entities: bool = field(
+        default_factory=lambda: get_env_value(
+            "DROP_SYMBOL_ENTITIES", DEFAULT_DROP_SYMBOL_ENTITIES, bool
+        )
+    )
+    """Drop an extracted entity whose name is a lone symbol or variable -- one
+    character (``x``, ``θ``, ``7``), or two that are not alphanumeric or are
+    digits (``a,``, ``12``) -- and every extracted relation that names one.
+    Alphanumeric pairs such as ``J2`` or ``Io`` are kept. Env
+    ``DROP_SYMBOL_ENTITIES``.
     """
 
     def _mark_addon_params_dirty(self) -> None:
