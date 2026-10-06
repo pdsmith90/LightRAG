@@ -884,6 +884,62 @@ def _ocr_layer_page(page) -> bool:
     return total > 0 and ocr >= OCR_LAYER_SHARE * total
 
 
+COLUMN_MIN_PAIRS = 8          # consecutive left-column line pairs needed before a page's order is judged
+COLUMN_MIN_SUCCESSION = 0.6   # below this share of pairs kept adjacent, the engine merged the two columns
+
+
+def _two_column_lines(page):
+    """The left column's lines (word lists of >= 5 words) when the page's text forms two columns, else
+    None. A block belongs to the left column when it starts in the first 40 % of the width and ends
+    before 60 %, to the right column when it starts beyond 45 %; each column needs >= 4 lines (a typeset
+    paragraph is one block, an OCR layer one block per line)."""
+    W = page.rect.width
+    left, right = [], 0
+    for b in page.get_text("blocks"):
+        if (len(b) > 6 and b[6] != 0) or not b[4].strip():
+            continue
+        lines = [ln.split() for ln in b[4].split("\n") if ln.strip()]
+        if b[0] < 0.4 * W and b[2] < 0.6 * W:
+            left += [words for words in lines if len(words) >= 5]
+        elif b[0] > 0.45 * W:
+            right += len(lines)
+    if len(left) < 4 or right < 4:
+        return None
+    return left
+
+
+def _norm_words(s: str) -> str:
+    return " " + re.sub(r"[^a-z0-9]+", " ", s.lower()).strip() + " "
+
+
+def _succession(engine_text: str, lines) -> tuple:
+    """(kept, pairs): of the consecutive left-column lines (a, b) the engine text contains, how many it
+    kept adjacent -- b's first three words within 12 characters after a's last three."""
+    e = _norm_words(engine_text)
+    kept = pairs = 0
+    for a, b in zip(lines, lines[1:]):
+        ta = _norm_words(" ".join(a[-3:])).rstrip()
+        tb = _norm_words(" ".join(b[:3]))
+        ia = e.find(ta)
+        ib = e.find(tb, ia + 1) if ia >= 0 else -1
+        if ia < 0 or ib < 0:
+            continue
+        pairs += 1
+        if 0 <= ib - (ia + len(ta)) <= 12:
+            kept += 1
+    return kept, pairs
+
+
+def _columns_merged(engine_text: str, page) -> bool:
+    """True when the page has two columns and the engine's text lost the left column's line order
+    (measured 2026-10-06: OCR-layer pages 0.00-0.46 of their pairs kept, typeset two-column pages 0.70-1.00)."""
+    lines = _two_column_lines(page)
+    if not lines:
+        return False
+    kept, pairs = _succession(engine_text, lines)
+    return pairs >= COLUMN_MIN_PAIRS and kept < COLUMN_MIN_SUCCESSION * pairs
+
+
 def _textlayer_page_md(page) -> str:
     """One page's text layer as paragraphs. OCR layers often make every LINE its own
     block, so a block is merged into the previous one unless that one ends a sentence
@@ -937,6 +993,7 @@ def pdf_to_md(path: str) -> str:
         out: list[str] = []
         repaired = regained = total = kept = 0
         ocr_pages = ocr_soup = 0
+        col_pages = 0
         garbled: list[int] = []
         why: dict[str, int] = {}
         _pdf_page_count = doc.page_count
@@ -967,6 +1024,15 @@ def pdf_to_md(path: str) -> str:
                 ocr_pages += 1
                 if garble_reason(text, GARBLED_PAGE_MIN_NONSPACE):
                     ocr_soup += 1
+                    text = ""
+                out.append(text)
+                continue
+            if _columns_merged(text, doc[pno]):
+                # 2026-10-06: the same merge from a typeset layer (other OCR engines' fonts, odd layouts):
+                # the engine lost the left column's line order, so the page is read from its blocks.
+                text = _textlayer_page_md(doc[pno])
+                col_pages += 1
+                if garble_reason(text, GARBLED_PAGE_MIN_NONSPACE):
                     text = ""
                 out.append(text)
                 continue
@@ -1001,6 +1067,14 @@ def pdf_to_md(path: str) -> str:
             print(
                 f"[build_corpus] OCR-LAYER {name}: {ocr_pages}/{len(chunks)} page(s) carry a Tesseract text "
                 f"layer -> read in its reading order ({ocr_soup} dropped as letter soup)",
+                flush=True,
+            )
+        if col_pages:
+            if not _pdf_method:
+                _pdf_method = "pdf+columns"
+            print(
+                f"[build_corpus] COLUMNS {name}: {col_pages}/{len(chunks)} two-column page(s) re-read from their "
+                f"blocks (pymupdf4llm merged the columns)",
                 flush=True,
             )
         if garbled:
@@ -1038,6 +1112,24 @@ OCR_TIMEOUT_PER_PAGE_S = (
 OCR_PARTIAL_MAX_SHARE = (
     0.5  # OCR only the garbled pages while they are fewer than this share
 )
+
+
+OCRMYPDF_ENCRYPTED = 8  # ocrmypdf's exit code for an encrypted input, even one that opens without a password
+
+
+def _decrypted_copy(path: str, tmpdir: str) -> str:
+    """A copy of `path` with its owner-password encryption removed (pikepdf), or "" when that fails."""
+    try:
+        import pikepdf
+
+        out = os.path.join(tmpdir, "decrypted.pdf")
+        with pikepdf.open(path) as pdf:
+            pdf.save(out)
+        return out
+    except Exception as e:
+        print(f"[build_corpus] WARN: could not decrypt {os.path.basename(path)} "
+              f"({type(e).__name__}: {str(e)[:80]})", flush=True)
+        return ""
 
 
 def _page_ranges(pages) -> str:
@@ -1078,7 +1170,18 @@ def ocr_pdf_to_md(path: str, pages=None) -> str:
     with tempfile.TemporaryDirectory() as td:
         out = os.path.join(td, "ocr.pdf")
         try:
-            subprocess.run(args + [path, out], check=True, timeout=timeout)
+            try:
+                subprocess.run(args + [path, out], check=True, timeout=timeout)
+            except subprocess.CalledProcessError as e:
+                if e.returncode != OCRMYPDF_ENCRYPTED:
+                    raise
+                # 2026-10-06: ocrmypdf refuses an encrypted PDF (exit 8) even when it opens without a
+                # password; pikepdf strips the owner-password encryption and the OCR runs on the copy.
+                plain = _decrypted_copy(path, td)
+                if not plain:
+                    raise
+                print(f"[build_corpus] DECRYPTED {os.path.basename(path)} for OCR", flush=True)
+                subprocess.run(args + [plain, out], check=True, timeout=timeout)
             return pdf_to_md(out)
         except Exception as e:
             print(
@@ -1227,6 +1330,19 @@ def _init(cfg):
     CFG.update(cfg)
 
 
+def _not_a_pdf(path: str) -> str:
+    """Why a .pdf-named file is not a PDF ("" when it is): "0 bytes", or "HTML/text content" when no
+    %PDF header sits in its first kilobyte (publisher landing pages saved under the article's name)."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(1024)
+    except OSError as e:
+        return f"unreadable ({type(e).__name__})"
+    if not head:
+        return "0 bytes"
+    return "" if b"%PDF" in head else "HTML/text content"
+
+
 def pick_primary(folder: str, want_name: str | None):
     """Choose the best attachment file inside a Zotero storage folder."""
     cands = []
@@ -1259,6 +1375,14 @@ def convert(key: str):
     src, kind = pick_primary(folder, want)
     if not src:
         return (key, "no_source", "", 0)
+    if kind == PDF:
+        why = _not_a_pdf(src)
+        if why:
+            # 2026-10-06: an HTML page or an empty file behind a .pdf name used to become a header-only
+            # document after a pointless OCR attempt; it now writes nothing and names itself in the log.
+            print(f"[build_corpus] NOT A PDF {key}: {os.path.basename(src)[:60]} ({why}) -> skipped; "
+                  f"fetch the real PDF", flush=True)
+            return (key, "not_a_pdf", "", 0)
 
     stem = os.path.splitext(os.path.basename(src))[0]
     out_base = f"{key}__{slug(stem)}.md"

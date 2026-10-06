@@ -15,3 +15,4 @@ python-pptx>=0.6.23,<2       # optional: .pptx
 #   djvulibre     -> `djvutxt` for .djvu
 #   tesseract-ocr -> OCR (ocrmypdf; recent PyMuPDF also uses it for image pages)
 #   ghostscript   -> required by ocrmypdf
+pikepdf>=6          # strips owner-password encryption before OCR (ocrmypdf refuses encrypted input)
