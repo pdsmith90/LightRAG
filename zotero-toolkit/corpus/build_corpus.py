@@ -885,7 +885,8 @@ def _ocr_layer_page(page) -> bool:
 
 
 COLUMN_MIN_PAIRS = 8          # consecutive left-column line pairs needed before a page's order is judged
-COLUMN_MIN_SUCCESSION = 0.6   # below this share of pairs kept adjacent, the engine merged the two columns
+COLUMN_MIN_SUCCESSION = 0.5   # below this share of pairs kept adjacent, the engine merged the two columns
+                              # (interleaved pages measure 0.00-0.46; title and table pages reach 0.56, typeset prose 0.70+)
 
 
 def _two_column_lines(page):
@@ -942,7 +943,8 @@ def _succession(engine_text: str, lines) -> tuple:
 
 def _columns_merged(engine_text: str, page) -> bool:
     """True when the page has two columns and the engine's text lost the left column's line order
-    (measured 2026-10-06: OCR-layer pages 0.00-0.46 of their pairs kept, typeset two-column pages 0.70-1.00)."""
+    (measured 2026-10-06: OCR-layer pages 0.00-0.46 of their pairs kept, typeset two-column prose 0.70-1.00,
+    chapter-title and table pages down to 0.56)."""
     lines = _two_column_lines(page)
     if not lines:
         return False
