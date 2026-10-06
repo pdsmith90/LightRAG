@@ -864,6 +864,26 @@ def _image_only_doc(doc) -> tuple[bool, int, int]:
     return (bool(idx) and hits / len(idx) >= 0.5), hits, len(idx)
 
 
+OCR_LAYER_FONTS = {"GlyphLessFont"}   # the invisible font of ocrmypdf / Tesseract text layers (hocr and sandwich renderers)
+OCR_LAYER_SHARE = 0.9
+
+
+def _ocr_layer_page(page) -> bool:
+    """True when (nearly) every character of the page's text layer is set in an OCR font, i.e. the
+    layer was written by Tesseract rather than by the typesetter."""
+    total = ocr = 0
+    for b in page.get_text("dict")["blocks"]:
+        if b.get("type", 0) != 0:
+            continue
+        for ln in b["lines"]:
+            for s in ln["spans"]:
+                n = len(s["text"].strip())
+                total += n
+                if s["font"] in OCR_LAYER_FONTS:
+                    ocr += n
+    return total > 0 and ocr >= OCR_LAYER_SHARE * total
+
+
 def _textlayer_page_md(page) -> str:
     """One page's text layer as paragraphs. OCR layers often make every LINE its own
     block, so a block is merged into the previous one unless that one ends a sentence
@@ -916,6 +936,7 @@ def pdf_to_md(path: str) -> str:
         )
         out: list[str] = []
         repaired = regained = total = kept = 0
+        ocr_pages = ocr_soup = 0
         garbled: list[int] = []
         why: dict[str, int] = {}
         _pdf_page_count = doc.page_count
@@ -936,6 +957,19 @@ def pdf_to_md(path: str) -> str:
             # (its layer is usually fine: three papers came out as 96-98 % U+FFFD that way), and a
             # layer that is garbage itself is never injected (a 611-page book came back as 830 KB of
             # control codes through this repair). Such pages are dropped here; convert() OCRs them.
+            if _ocr_layer_page(doc[pno]):
+                # 2026-10-06: pymupdf4llm merges the two columns of an OCR text layer line by line
+                # (left line + right line + left line: "pseudo|Thermal noise limits the|range"), while the layer's own
+                # blocks keep Tesseract's reading order -- so an OCR'd page is read from its blocks.
+                # A block page that is still letter soup (figure scribble) has nothing better to
+                # fall back to: dropped, and never sent to OCR again.
+                text = _textlayer_page_md(doc[pno])
+                ocr_pages += 1
+                if garble_reason(text, GARBLED_PAGE_MIN_NONSPACE):
+                    ocr_soup += 1
+                    text = ""
+                out.append(text)
+                continue
             bad = garble_reason(text, GARBLED_PAGE_MIN_NONSPACE)
             if bad or (
                 layer >= TEXTLAYER_PAGE_MIN and got < TEXTLAYER_PAGE_KEEP * layer
@@ -959,6 +993,14 @@ def pdf_to_md(path: str) -> str:
                 f"[build_corpus] TEXTLAYER {name}: pymupdf4llm kept {kept} of {total} text-layer "
                 f"chars ({kept / max(total, 1):.0%}); {repaired}/{len(chunks)} page(s) replaced by "
                 f"their text layer (+{regained} chars)",
+                flush=True,
+            )
+        if ocr_pages:
+            if not _pdf_method:
+                _pdf_method = "pdf+ocrlayer"
+            print(
+                f"[build_corpus] OCR-LAYER {name}: {ocr_pages}/{len(chunks)} page(s) carry a Tesseract text "
+                f"layer -> read in its reading order ({ocr_soup} dropped as letter soup)",
                 flush=True,
             )
         if garbled:
@@ -1290,19 +1332,21 @@ def convert(key: str):
                 )
             if looks_empty(body, CFG["min_chars"]) or garbled:
                 method = "pdf+ocr"
-                # 1) reuse pre-OCR'd text
+                # 1) OCR afresh; a pre-OCR'd cache of `pdftotext -layout` text lays the two columns
+                #    of a page side by side on every line, so the cache is only the fallback for
+                #    when ocrmypdf is unavailable or fails (and the whole of --ocr off)
+                ocr = ocr_pdf_to_md(src) if CFG["ocr"] in ("auto", "force") else ""
                 pre = (
                     os.path.join(CFG["ocr_cache"], stem + ".pdf.txt")
                     if CFG.get("ocr_cache")
                     else None
                 )
-                if pre and os.path.exists(pre):
+                if ocr:
+                    body = ocr
+                elif pre and os.path.exists(pre):
                     body, method = txt_to_md(pre), "pdf+ocr_cache"
                 elif CFG["ocr"] in ("auto", "force"):
-                    ocr = ocr_pdf_to_md(src)
-                    body = ocr or body
-                    if not ocr:
-                        method = "pdf_needs_ocr"
+                    method = "pdf_needs_ocr"
                 # 2) last resort: previously extracted text (e.g. old pdftotext output)
                 if looks_empty(body, CFG["min_chars"]) and CFG.get("fallback_md"):
                     old = os.path.join(CFG["fallback_md"], stem + ".md")
