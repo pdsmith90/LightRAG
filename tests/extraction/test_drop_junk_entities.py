@@ -263,3 +263,51 @@ async def test_extract_entities_arms_the_filter_from_global_config(monkeypatch):
 
     assert set(nodes) == {"Imaginary Basin"}
     assert not edges
+
+
+@pytest.mark.parametrize(
+    "name, raw_type, cls",
+    [
+        # a list of cited authors is the citation itself, whatever type it arrived under
+        ("C. C. Quux and K. C. Blorp", None, "citation"),
+        ("T. M. Doe, O. L. Roe, and J. R. Moe", "other", "citation"),
+        ("Doe, J., and Roe, K.", None, "citation"),
+        ("A. Quux & B. Blorp", "person", "citation"),
+        # an untyped endpoint shaped like a cited author is a person, library surname or not
+        ("S. Quux", None, "person"),
+        ("R. K. Blorp", None, "person"),
+        ("Blorp RK", None, "person"),
+        ("J. Zed", None, "person"),
+        # ...while an abbreviation before a place or body word stays
+        ("N. America", None, None),
+        ("U.S. Geological Survey", None, None),
+        ("E. Antarctica", None, None),
+        ("B. Corporation", None, None),
+        ("S. Hemisphere", None, None),
+        # typed, the surname still has to be a library author (unchanged)
+        ("J. Zed", "other", None),
+        ("S. Quux", "organization", None),
+    ],
+)
+def test_untyped_author_shapes(name, raw_type, cls):
+    assert junk_entity_class(name, raw_type) == cls
+
+
+def test_untyped_author_endpoint_drops_the_relation_instead_of_a_placeholder():
+    maybe_nodes = {
+        "Alpha Model": [
+            {"entity_name": "Alpha Model", "entity_type": "model", "_raw_type": "model"}
+        ]
+    }
+    maybe_edges = {
+        ("Alpha Model", "S. Quux"): [{}],
+        ("Alpha Model", "C. C. Quux and K. C. Blorp"): [{}],
+        ("Alpha Model", "N. America"): [{}],
+        ("Alpha Model", "Beta Method"): [{}],
+    }
+    operate._drop_junk_records(maybe_nodes, maybe_edges, "chunk-1")
+    assert set(maybe_edges) == {
+        ("Alpha Model", "N. America"),
+        ("Alpha Model", "Beta Method"),
+    }
+    assert set(maybe_nodes) == {"Alpha Model"}

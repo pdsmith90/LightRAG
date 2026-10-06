@@ -184,6 +184,219 @@ _TRAILING_CITATION = re.compile(
 _SURNAME_LIST = re.compile(
     rf"^{_SURNAME}(?:(?:,\s?|\s(?:and|&)\s){_SURNAME})*(?:\set\.?\sal\.?)?,?$"
 )
+# A list of two or more cited authors ("J. Doe and K. Roe", "Doe, J., and Roe, K.",
+# "A. Doe, B. Roe, and C. Moe") is the citation itself, whatever type it arrived under.
+_INIT_SURNAME_ITEM = rf"(?:{_UP}\.\s?-?){{1,3}}\s?{_SURNAME}"
+_SURNAME_INIT_ITEM = rf"{_SURNAME},?\s{_UP}\.(?:\s?-?{_UP}\.){{0,2}}"
+_AUTHOR_LIST = re.compile(
+    rf"^(?:{_INIT_SURNAME_ITEM}|{_SURNAME_INIT_ITEM})"
+    rf"(?:(?:,\s?|,?\s(?:and|&)\s)(?:{_INIT_SURNAME_ITEM}|{_SURNAME_INIT_ITEM}))+,?$"
+)
+# An untyped relation endpoint shaped like a cited author -- initials and a surname ("J. Doe",
+# "J. K. Doe", "Doe JK") -- is taken for a person even when the surname is not in the library:
+# relations name cited authors far more often than people a paper is about, and the merge
+# would otherwise create the endpoint as an untyped placeholder node (on one corpus 8.8 % of
+# all vertices were such placeholders, "R. K. Doe" among them). Two look-alikes stay: an
+# abbreviation spelled with periods before a place or body ("N. America", "U.S. Geological
+# Survey") and an initial before an organisation or object word ("B. Corporation", "P. Wave").
+_INITIALS_ABBREVIATIONS = frozenset(
+    {
+        "US",
+        "UK",
+        "UN",
+        "EU",
+        "DC",
+        "NY",
+        "LA",
+        "SA",
+        "NA",
+        "PR",
+        "USA",
+        "USSR",
+        "UAE",
+        "NZ",
+        "BC",
+        "NE",
+        "NW",
+        "SE",
+        "SW",
+        "ST",
+        "MT",
+        "FT",
+        "CA",
+        "CO",
+    }
+)
+_PLACE_OR_BODY_WORDS = frozenset(
+    fold(w)
+    for w in (
+        "America",
+        "Americas",
+        "American",
+        "Africa",
+        "African",
+        "Europe",
+        "European",
+        "Asia",
+        "Asian",
+        "Australia",
+        "Antarctica",
+        "Antarctic",
+        "Arctic",
+        "Atlantic",
+        "Pacific",
+        "Indian",
+        "Hemisphere",
+        "Pole",
+        "Polar",
+        "Equatorial",
+        "Tropical",
+        "Ocean",
+        "Sea",
+        "Coast",
+        "Island",
+        "Islands",
+        "Shetland",
+        "Georgia",
+        "Korea",
+        "Vietnam",
+        "Sudan",
+        "Ireland",
+        "Ossetia",
+        "Cyprus",
+        "Yorkshire",
+        "Wales",
+        "Zealand",
+        "Tibet",
+        "China",
+        "Siberia",
+        "Greenland",
+        "Alaska",
+        "California",
+        "Carolina",
+        "Dakota",
+        "Virginia",
+        "Jersey",
+        "Hampshire",
+        "Mexico",
+        "Texas",
+        "Cascadia",
+        "Andes",
+        "Alps",
+        "Himalaya",
+        "Himalayas",
+        "Anatolia",
+        "Sahara",
+        "Sahel",
+        "Plains",
+        "Plateau",
+        "Basin",
+        "Trench",
+        "Ridge",
+        "Rise",
+        "Rift",
+        "Fault",
+        "Shelf",
+        "Slope",
+        "Current",
+        "Gyre",
+        "Front",
+        "Monsoon",
+        "Jet",
+        "Navy",
+        "Army",
+        "Air",
+        "Force",
+        "Marines",
+        "Survey",
+        "Service",
+        "Department",
+        "Agency",
+        "Bureau",
+        "Institute",
+        "Office",
+        "Corps",
+        "Guard",
+        "Station",
+        "University",
+        "College",
+        "Center",
+        "Centre",
+        "Laboratory",
+        "Observatory",
+        "Society",
+        "Union",
+        "Committee",
+        "Commission",
+        "Council",
+        "Program",
+        "Programme",
+        "Project",
+        "Mission",
+        "Standard",
+        "Standards",
+        "Code",
+        "Rule",
+        "Law",
+        "Theorem",
+        "Model",
+        "Method",
+        "Function",
+        "Index",
+        "Number",
+        "Constant",
+        "Equation",
+        "Congress",
+        "Senate",
+        "Government",
+        "Fleet",
+        "Command",
+        "Administration",
+        "Authority",
+        "Board",
+        "Foundation",
+        "Academy",
+        "Patent",
+        "Treasury",
+        "Mint",
+        "Steel",
+        "Bank",
+        "Mail",
+        "Postal",
+        "Highway",
+        "Route",
+        "Interstate",
+        "Dollar",
+        "Dollars",
+        "Geological",
+        "Corporation",
+        "Company",
+        "Wave",
+        "Waves",
+        "Field",
+        "Band",
+        "Shell",
+        "Layer",
+        "Region",
+        "Zone",
+        "Belt",
+    )
+)
+
+
+def _abbreviated_place_or_body(name: str) -> bool:
+    """ "N. America", "U.S. Geological Survey", "B. Corporation": an abbreviation before a place
+    or a body word -- not a cited author."""
+    initials = "".join(re.findall(rf"({_UP})\.", name))
+    if len(initials) >= 2 and initials.upper() in _INITIALS_ABBREVIATIONS:
+        return True
+    return any(
+        fold(t) in _PLACE_OR_BODY_WORDS
+        for t in re.split(r"[\s\-\.]+", name)
+        if len(t) > 1
+    )
+
+
 _URL_ANYWHERE = re.compile(r"(\b10\.\d{4,9}/|^doi\b|https?://|\bwww\.)", re.IGNORECASE)
 _URL_LEADING = re.compile(r"^\W*(10\.\d{4,9}/|doi\b|https?://|www\.)", re.IGNORECASE)
 # "Geophys.", "Res." -- at least two letters, so a person's initials ("A. B.") never
@@ -268,6 +481,8 @@ def junk_entity_class(name: str, raw_type: str | None = None) -> str | None:
         return "label"
     if _ET_AL.search(plain):
         return "citation"
+    if _AUTHOR_LIST.match(plain):
+        return "citation"
     if typ not in AUTHOR_YEAR_PROTECTED_TYPES and (
         _AUTHOR_YEAR.match(plain) or _PAIR_BARE_YEAR.match(plain)
     ):
@@ -304,8 +519,9 @@ def junk_entity_class(name: str, raw_type: str | None = None) -> str | None:
     if typ not in PROTECTED_TYPES:
         if _SURNAME_INITIALS.match(plain):
             return "person"
-        if (
-            _INITIALS_SURNAME.match(plain) or _SURNAME_BARE_INITIALS.match(plain)
-        ) and _surname_known(plain, surnames):
-            return "person"
+        if _INITIALS_SURNAME.match(plain) or _SURNAME_BARE_INITIALS.match(plain):
+            if _surname_known(plain, surnames):
+                return "person"
+            if raw_type is None and not _abbreviated_place_or_body(plain):
+                return "person"
     return None
