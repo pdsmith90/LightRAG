@@ -660,6 +660,8 @@ def _strip_back_index(md: str) -> str:
 
 
 def clean_md(md: str) -> str:
+    md = _ctrl_re.sub("", md)  # C0 control codes: PostgreSQL refuses NUL in text, and a
+    # glyph mapped to a control code carries no text anyway (2026-10-06)
     md = _pic_re.sub("", md)  # drop OCR'd figure-scribble noise
     md = _datauri_re.sub("", md)  # embedded data: images
     md = _b64_re.sub(
@@ -689,16 +691,111 @@ def looks_empty(text: str, min_chars: int) -> bool:
 # gap. quarantine_junk.py applies the same bar to the corpus root as a second line.
 GARBLED_PUA_RATIO = 0.30
 _pua_re = re.compile(r"[\ue000-\uf8ff\U000f0000-\U0010ffff]")
+# 2026-10-06: three more shapes of glyph garbage, measured on the knowledge base's own chunks (5,677
+# documents) and on the text layers of the PDFs behind them (40 pages sampled per PDF):
+#  * REPLACEMENT -- pymupdf4llm turns glyphs it cannot decode into U+FFFD (96-98 % of a page) while
+#    page.get_text() reads the same layer as clean prose; three 1999-2001 papers were re-ingested as
+#    replacement characters that way.
+#  * CONTROL -- fonts that map glyphs to C0 control codes: a 1993 book scan had 9.8 % of its non-space
+#    characters as controls and 2,955 NULs, which PostgreSQL refuses ("\u0000 cannot be converted to
+#    text") -- the document failed. TeX symbol fonts also leave a few per cent of control codes on
+#    equation pages of REAL prose (16 % on one page of a 2010 mathematics book), so the rule also wants
+#    the page to have almost no words.
+#  * LETTER SOUP -- glyphs mapped to arbitrary printable ASCII ("c ? c o o c o c c c o"): most
+#    whitespace-separated tokens are single non-digit characters and almost nothing is a word. Pages of
+#    numeric tables look similar but are mostly digits (a 1973 table volume: digit share 0.55), so the
+#    digit share protects them.
+# The word share (characters inside runs of >= 4 letters, any script, over non-space characters) is
+# 0.5-0.7 for prose and under 0.1 for every garbage shape; equation-heavy pages sit at 0.02-0.26 but are
+# mostly digits and never 35 % single letters, so no rule fires on the word share alone.
+GARBLED_FFFD_SHARE = 0.05
+GARBLED_CTRL_SHARE = 0.05
+GARBLED_CTRL_MAX_WORDS = 0.25
+GARBLED_SOUP_SINGLES = 0.35
+GARBLED_SOUP_MAX_WORDS = 0.15
+GARBLED_SOUP_MAX_DIGITS = 0.30
+GARBLED_NOWORDS_ALPHA = 0.30
+GARBLED_NOWORDS_MAX_WORDS = 0.03
+GARBLED_MIN_NONSPACE = 500  # a whole document (convert): below this looks_empty decides
+GARBLED_PAGE_MIN_NONSPACE = 200  # one page (pdf_to_md)
+_ws_re = re.compile(r"\s+")
+_ctrl_re = re.compile(
+    r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]"
+)  # C0 controls except \t \n \r, plus DEL
+_word_re = re.compile(r"[^\W\d_]{4,}")  # runs of letters in any script
 
 
 def pua_share(text: str) -> float:
     """Private Use Area code points over non-whitespace characters (0.0 under 500 of them)."""
-    nonspace = len(re.sub(r"\s+", "", text))
-    return len(_pua_re.findall(text)) / nonspace if nonspace >= 500 else 0.0
+    nonspace = len(_ws_re.sub("", text))
+    return (
+        len(_pua_re.findall(text)) / nonspace
+        if nonspace >= GARBLED_MIN_NONSPACE
+        else 0.0
+    )
+
+
+def garble_metrics(text: str) -> dict:
+    """Shares over the non-space characters of `text`; `single` is over whitespace-separated tokens."""
+    ns = _ws_re.sub("", text)
+    n = len(ns)
+    if not n:
+        return {
+            "n": 0,
+            "pua": 0.0,
+            "fffd": 0.0,
+            "ctrl": 0.0,
+            "word": 0.0,
+            "alpha": 0.0,
+            "digit": 0.0,
+            "single": 0.0,
+        }
+    toks = text.split()
+    return {
+        "n": n,
+        "pua": len(_pua_re.findall(ns)) / n,
+        "fffd": ns.count("\ufffd") / n,
+        "ctrl": len(_ctrl_re.findall(ns)) / n,
+        "word": sum(len(w) for w in _word_re.findall(text)) / n,
+        "alpha": sum(ch.isalpha() for ch in ns) / n,
+        "digit": sum(ch.isdigit() for ch in ns) / n,
+        "single": sum(1 for t in toks if len(t) == 1 and not t.isdigit()) / len(toks),
+    }
+
+
+def garble_reason(text: str, min_nonspace: int = GARBLED_MIN_NONSPACE):
+    """Why `text` is glyph garbage -- 'pua', 'replacement', 'control', 'letter-soup' or 'no-words' --
+    or None when it reads as text. Under min_nonspace non-space characters nothing is ever garbled."""
+    m = garble_metrics(text)
+    if m["n"] < min_nonspace:
+        return None
+    if m["pua"] >= GARBLED_PUA_RATIO:
+        return "pua"
+    if m["fffd"] >= GARBLED_FFFD_SHARE:
+        return "replacement"
+    if m["ctrl"] >= GARBLED_CTRL_SHARE and m["word"] < GARBLED_CTRL_MAX_WORDS:
+        return "control"
+    if (
+        m["single"] >= GARBLED_SOUP_SINGLES
+        and m["word"] < GARBLED_SOUP_MAX_WORDS
+        and m["digit"] < GARBLED_SOUP_MAX_DIGITS
+    ):
+        return "letter-soup"
+    if m["alpha"] >= GARBLED_NOWORDS_ALPHA and m["word"] < GARBLED_NOWORDS_MAX_WORDS:
+        return "no-words"
+    return None
+
+
+def garble_detail(text: str) -> str:
+    m = garble_metrics(text)
+    return (
+        f"pua {m['pua']:.0%}, U+FFFD {m['fffd']:.0%}, control {m['ctrl']:.0%}, words {m['word']:.0%}, "
+        f"single-char tokens {m['single']:.0%}, digits {m['digit']:.0%}"
+    )
 
 
 def looks_garbled(text: str) -> bool:
-    return pua_share(text) >= GARBLED_PUA_RATIO
+    return garble_reason(text) is not None
 
 
 # ---------- pages pymupdf4llm drops: repair them from the PDF's own text layer ----------
@@ -730,6 +827,8 @@ TEXTLAYER_IMAGE_COVER = 0.7  # image area / page area for a page to count as a s
 _pdf_method = (
     ""  # "pdf+textlayer" when pages were repaired; convert() labels the method
 )
+_pdf_garbled_pages: list = []  # 0-based pages whose engine text AND text layer are glyph garbage
+_pdf_page_count = 0
 _sentence_end = re.compile(r"[.!?:;]['\")\]]?$")
 
 
@@ -796,8 +895,10 @@ def pdf_to_md(path: str) -> str:
     import pymupdf
     import pymupdf4llm
 
-    global _pdf_method
+    global _pdf_method, _pdf_garbled_pages, _pdf_page_count
     _pdf_method = ""
+    _pdf_garbled_pages = []
+    _pdf_page_count = 0
     name = os.path.basename(path)
     try:
         doc = pymupdf.open(path)
@@ -815,6 +916,9 @@ def pdf_to_md(path: str) -> str:
         )
         out: list[str] = []
         repaired = regained = total = kept = 0
+        garbled: list[int] = []
+        why: dict[str, int] = {}
+        _pdf_page_count = doc.page_count
         for i, ch in enumerate(chunks):
             text = ch.get("text", "") if isinstance(ch, dict) else str(ch)
             pno = (
@@ -828,10 +932,24 @@ def pdf_to_md(path: str) -> str:
             layer, got = _nonws_len(doc[pno].get_text("text")), _nonws_len(text)
             total += layer
             kept += got
-            if layer >= TEXTLAYER_PAGE_MIN and got < TEXTLAYER_PAGE_KEEP * layer:
-                text = _textlayer_page_md(doc[pno])
-                repaired += 1
-                regained += layer
+            # 2026-10-06: a page the engine turned into glyph garbage is repaired like a dropped one
+            # (its layer is usually fine: three papers came out as 96-98 % U+FFFD that way), and a
+            # layer that is garbage itself is never injected (a 611-page book came back as 830 KB of
+            # control codes through this repair). Such pages are dropped here; convert() OCRs them.
+            bad = garble_reason(text, GARBLED_PAGE_MIN_NONSPACE)
+            if bad or (
+                layer >= TEXTLAYER_PAGE_MIN and got < TEXTLAYER_PAGE_KEEP * layer
+            ):
+                fixed = _textlayer_page_md(doc[pno])
+                bad_layer = garble_reason(fixed, GARBLED_PAGE_MIN_NONSPACE)
+                if bad_layer:
+                    garbled.append(pno)
+                    why[bad_layer] = why.get(bad_layer, 0) + 1
+                    text = ""
+                else:
+                    text = fixed
+                    repaired += 1
+                    regained += layer
             out.append(text)
         doc.close()
         md = "".join(out)
@@ -841,6 +959,14 @@ def pdf_to_md(path: str) -> str:
                 f"[build_corpus] TEXTLAYER {name}: pymupdf4llm kept {kept} of {total} text-layer "
                 f"chars ({kept / max(total, 1):.0%}); {repaired}/{len(chunks)} page(s) replaced by "
                 f"their text layer (+{regained} chars)",
+                flush=True,
+            )
+        if garbled:
+            _pdf_garbled_pages = sorted(garbled)
+            print(
+                f"[build_corpus] GARBLED pages {name}: {len(garbled)}/{len(chunks)} page(s) are glyph "
+                f"garbage in pymupdf4llm's output and in the text layer "
+                f"({', '.join(f'{k} {v}' for k, v in sorted(why.items()))}) -> dropped here, OCR route",
                 flush=True,
             )
         return clean_md(md)
@@ -863,20 +989,61 @@ def pdf_to_md(path: str) -> str:
         return ""
 
 
-def ocr_pdf_to_md(path: str) -> str:
-    """OCR a scanned PDF with ocrmypdf (if available) then extract markdown."""
+OCR_TIMEOUT_MIN_S = 600
+OCR_TIMEOUT_PER_PAGE_S = (
+    5  # 2026-10-06: a flat 600 s could never finish a 611-page book
+)
+OCR_PARTIAL_MAX_SHARE = (
+    0.5  # OCR only the garbled pages while they are fewer than this share
+)
+
+
+def _page_ranges(pages) -> str:
+    """0-based page numbers -> ocrmypdf's 1-based --pages list ("1-3,7,9-11")."""
+    runs: list[list[int]] = []
+    for p in sorted(set(pages)):
+        if runs and p == runs[-1][-1] + 1:
+            runs[-1].append(p)
+        else:
+            runs.append([p])
+    return ",".join(
+        f"{r[0] + 1}-{r[-1] + 1}" if len(r) > 1 else f"{r[0] + 1}" for r in runs
+    )
+
+
+def ocr_pdf_to_md(path: str, pages=None) -> str:
+    """OCR a scanned PDF with ocrmypdf (if available) then extract markdown.
+
+    `pages` (0-based) limits the OCR to those pages when they are a minority of the document
+    (2026-10-06: a PDF whose glyph garbage sits on a few pages keeps its real text layer everywhere
+    else); the time limit scales with the number of pages OCR'd."""
     if not shutil.which("ocrmypdf"):
         return ""
+    n_pages = 0
+    try:
+        import pymupdf
+
+        with pymupdf.open(path) as d:
+            n_pages = d.page_count
+    except Exception:
+        pass
+    args = ["ocrmypdf", "--force-ocr", "--quiet"]
+    todo = n_pages
+    if pages and n_pages and len(set(pages)) < OCR_PARTIAL_MAX_SHARE * n_pages:
+        args += ["--pages", _page_ranges(pages)]
+        todo = len(set(pages))
+    timeout = max(OCR_TIMEOUT_MIN_S, OCR_TIMEOUT_PER_PAGE_S * max(todo, 1) + 60)
     with tempfile.TemporaryDirectory() as td:
         out = os.path.join(td, "ocr.pdf")
         try:
-            subprocess.run(
-                ["ocrmypdf", "--force-ocr", "--quiet", path, out],
-                check=True,
-                timeout=600,
-            )
+            subprocess.run(args + [path, out], check=True, timeout=timeout)
             return pdf_to_md(out)
-        except Exception:
+        except Exception as e:
+            print(
+                f"[build_corpus] WARN: ocrmypdf failed on {os.path.basename(path)} "
+                f"({type(e).__name__}: {str(e)[:120]})",
+                flush=True,
+            )
             return ""
 
 
@@ -1039,6 +1206,7 @@ def pick_primary(folder: str, want_name: str | None):
 
 
 def convert(key: str):
+    global _pdf_garbled_pages, _pdf_page_count
     meta = CFG["meta"]
     zdir = CFG["zotero"]
     outdir = CFG["out"]
@@ -1108,15 +1276,16 @@ def convert(key: str):
     method = kind
     try:
         if kind == PDF:
+            _pdf_garbled_pages = []  # pdf_to_md sets it; a replaced pdf_to_md (tests) leaves it empty
             body = pdf_to_md(src)
             if _pdf_method:
                 method = _pdf_method
-            garbled = looks_garbled(body)
+            bad_pages = list(_pdf_garbled_pages)
+            garbled = garble_reason(body)
             if garbled:
                 print(
-                    f"[build_corpus] GARBLED text layer {os.path.basename(src)}: "
-                    f"{pua_share(body):.0%} of the text is Private Use Area glyph codes "
-                    "-> OCR route",
+                    f"[build_corpus] GARBLED text layer {os.path.basename(src)}: {garbled} "
+                    f"({garble_detail(body)}) -> OCR route",
                     flush=True,
                 )
             if looks_empty(body, CFG["min_chars"]) or garbled:
@@ -1139,6 +1308,20 @@ def convert(key: str):
                     old = os.path.join(CFG["fallback_md"], stem + ".md")
                     if os.path.exists(old):
                         body, method = txt_to_md(old), "pdf_legacy_md"
+            elif bad_pages:
+                # Real text on most pages, glyph garbage on some: OCR those pages (all of them once
+                # they are the majority). pdf_to_md already dropped the garbage, so a failed or
+                # disabled OCR still writes the readable pages, never the garbage.
+                method = "pdf_garbled_pages_dropped"
+                if CFG["ocr"] in ("auto", "force"):
+                    ocr = ocr_pdf_to_md(src, bad_pages)
+                    if ocr and not garble_reason(ocr):
+                        body = ocr
+                        method = (
+                            "pdf+ocr"
+                            if len(bad_pages) >= OCR_PARTIAL_MAX_SHARE * _pdf_page_count
+                            else "pdf+ocr_pages"
+                        )
             if garbled and looks_garbled(body):
                 # OCR unavailable or failed, and every fallback is the same glyph codes:
                 # write the header only, never the garbage.

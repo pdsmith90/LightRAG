@@ -169,3 +169,36 @@ def test_min_pua_raises_the_bar(tmp_path):
     r = run_script("quarantine_junk.py", "--corpus", corpus, "--min-pua", "0.999")
     assert r.returncode == 0 and "0 junk files" in r.stdout
     assert os.listdir(corpus) == ["TEST0010__garbled_scan.md"]
+
+
+SOUP = "\n".join(
+    "c ? c o o c o c c c o c o o c o c o" for _ in range(40)
+)  # OCR letter soup
+TABLE = "\n".join(" ".join(f"{(i * j) % 977:5d}" for j in range(12)) for i in range(60))
+
+
+def test_glyph_garbage_shapes_are_quarantined_and_tables_are_kept(tmp_path):
+    corpus = tmp_path / "rag_corpus"
+    corpus.mkdir()
+    (corpus / "TEST0013__soup_scan.md").write_text(SOUP, encoding="utf-8")
+    (corpus / "TEST0014__replacement_scan.md").write_text(
+        ("�" * 9 + " ") * 160, encoding="utf-8"
+    )
+    (corpus / "TEST0015__table_volume.md").write_text(TABLE, encoding="utf-8")
+    (corpus / "TEST0016__prose_paper.md").write_text(PROSE, encoding="utf-8")
+    r = run_script("quarantine_junk.py", "--corpus", corpus)
+    assert r.returncode == 0, r.stderr
+    assert "[garbled ]" in r.stdout and "glyph garbage (letter-soup)" in r.stdout
+    assert "glyph garbage (replacement)" in r.stdout
+    assert sorted(os.listdir(corpus)) == [
+        "TEST0015__table_volume.md",
+        "TEST0016__prose_paper.md",
+    ]
+    q = tmp_path / "rag_corpus_junk_quarantine"
+    log = {
+        json.loads(line)["file"]: json.loads(line)
+        for line in (q / "quarantined.jsonl").read_text().splitlines()
+    }
+    assert log["TEST0013__soup_scan.md"]["reason"] == "garbled"
+    assert log["TEST0013__soup_scan.md"]["garble"] == "letter-soup"
+    assert log["TEST0014__replacement_scan.md"]["garble"] == "replacement"

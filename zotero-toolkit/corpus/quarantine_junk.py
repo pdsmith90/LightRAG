@@ -53,6 +53,11 @@ keeps it out of the KB. Files already in __parsed__/ have been ingested; moving
 them does not retract them (that needs a doc delete) and would strand them from
 build_corpus's up-to-date check.
 
+4. GLYPH GARBAGE (automatic, like 3). Three more shapes a broken text layer takes --
+   U+FFFD replacement characters, C0 control codes, letter soup of single characters --
+   with the bars build_corpus.garble_reason uses (the same code, duplicated here because
+   build_corpus imports load_denylist from this file). Reason `garbled` in the log.
+
 Never deletes: moves to <corpus>_junk_quarantine/ and appends to quarantined.jsonl.
 Always exits 0 so a bad heuristic can never abort a scheduled corpus update.
 
@@ -88,6 +93,37 @@ def pua_ratio(text: str) -> float:
     if nonspace < PUA_MIN_NONSPACE:
         return 0.0
     return len(_pua_re.findall(text)) / nonspace
+
+
+# The other garbage shapes build_corpus.garble_reason knows -- U+FFFD replacement characters,
+# C0 control codes, letter soup -- duplicated here because build_corpus imports load_denylist
+# from this file. Same bars; see build_corpus for how they were measured.
+_ctrl_re = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_word_re = re.compile(r"[^\W\d_]{4,}")
+
+
+def garble_reason(text: str):
+    """'replacement', 'control', 'letter-soup' or 'no-words' when the text is glyph garbage of
+    a shape other than Private Use Area codes (those are pua_ratio's), else None. Texts under
+    PUA_MIN_NONSPACE non-space characters are never garbled."""
+    ns = _ws_re.sub("", text)
+    n = len(ns)
+    if n < PUA_MIN_NONSPACE:
+        return None
+    toks = text.split()
+    word = sum(len(w) for w in _word_re.findall(text)) / n
+    if ns.count("\ufffd") / n >= 0.05:
+        return "replacement"
+    if len(_ctrl_re.findall(ns)) / n >= 0.05 and word < 0.25:
+        return "control"
+    single = sum(1 for t in toks if len(t) == 1 and not t.isdigit()) / len(toks)
+    digit = sum(ch.isdigit() for ch in ns) / n
+    if single >= 0.35 and word < 0.15 and digit < 0.30:
+        return "letter-soup"
+    alpha = sum(ch.isalpha() for ch in ns) / n
+    if alpha >= 0.30 and word < 0.03:
+        return "no-words"
+    return None
 
 
 def junk_ratio(text: str) -> float:
@@ -188,16 +224,20 @@ def main() -> int:
             continue
         jr, pr = junk_ratio(text), pua_ratio(text)
         if key in deny or name in deny:
-            hits.append(("denylist", jr, len(text), name, pr))
+            hits.append(("denylist", jr, len(text), name, pr, ""))
         elif len(text) >= a.min_chars and jr >= a.min_junk:
-            hits.append(("ratio", jr, len(text), name, pr))
+            hits.append(("ratio", jr, len(text), name, pr, ""))
         elif pr >= a.min_pua:
-            hits.append(("glyphs", pr, len(text), name, pr))
+            hits.append(("glyphs", pr, len(text), name, pr, ""))
+        else:
+            why = garble_reason(text)
+            if why:
+                hits.append(("garbled", 1.0, len(text), name, pr, why))
 
     if not hits:
         print(
             f"quarantine_junk: 0 junk files "
-            f"(ratio>={a.min_junk:.0%}, glyphs>={a.min_pua:.0%} or on "
+            f"(ratio>={a.min_junk:.0%}, glyphs>={a.min_pua:.0%}, glyph garbage, or on "
             f"denylist[{len(deny)}]) in {corpus}"
         )
         return 0
@@ -207,8 +247,14 @@ def main() -> int:
         os.makedirs(qdir, exist_ok=True)
     moved, failed, records = 0, 0, []
     stamp = time.strftime("%F %T")
-    for reason, r, size, name, pr in hits:
-        what = "PUA glyph codes" if reason == "glyphs" else "junk"
+    for reason, r, size, name, pr, why in hits:
+        what = (
+            "PUA glyph codes"
+            if reason == "glyphs"
+            else f"glyph garbage ({why})"
+            if reason == "garbled"
+            else "junk"
+        )
         print(
             f"quarantine_junk: {'DRY ' if a.dry_run else ''}[{reason:8s}] "
             f"{r:6.1%} {what}, {size:9d} chars — {name}"
@@ -221,6 +267,7 @@ def main() -> int:
                 "junk_ratio": round(r, 4),
                 "pua_ratio": round(pr, 4),
                 "chars": size,
+                "garble": why,
             }
         )
         if a.dry_run:

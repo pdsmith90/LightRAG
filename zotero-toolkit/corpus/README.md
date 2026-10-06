@@ -14,7 +14,7 @@ storage/<KEY>/<attachment> ─────────────────�
 |---|---|
 | `build_metadata.py` | Reads `zotero.sqlite` and writes `zotero_metadata.json`, which maps every attachment's storage key to its bibliographic metadata. A rebuild never forgets a key: entries for attachments that Zotero no longer has are carried forward and flagged `"orphan": true`. |
 | `build_corpus.py` | Converts each `storage/<KEY>/` attachment into cleaned Markdown with a metadata header. It is resumable (only missing or outdated outputs are rebuilt), runs in parallel, and records what it did in `.manifest.jsonl`. |
-| `quarantine_junk.py` | Moves webpage-snapshot junk (a high markup/base64 ratio, or a denylist entry) and glyph-code files (a text layer that is mostly Private Use Area code points) out of the corpus root into `<corpus>_junk_quarantine/`. It never deletes anything and always exits 0. |
+| `quarantine_junk.py` | Moves webpage-snapshot junk (a high markup/base64 ratio, or a denylist entry) and glyph-garbage files (a text layer that is mostly Private Use Area code points, U+FFFD replacement characters, control codes or letter soup — `build_corpus.garble_reason`'s rules) out of the corpus root into `<corpus>_junk_quarantine/`. It never deletes anything and always exits 0. |
 
 ## Install
 
@@ -156,24 +156,35 @@ Lines whose fields are empty are left out.
 ### Converting each format
 
 - **PDF.** The file goes through pymupdf4llm, one page at a time with the engine's
-  own OCR off. A page the engine emptied — it kept less than 40 % of a text layer of
-  at least 400 characters, which happens to scans whose OCR text is drawn under the
-  page image (the page comes back as its download watermark only) and to figure pages
-  of born-digital papers — is replaced by that page's text layer as paragraphs; the
-  other pages keep their markdown. Such files are labelled `pdf+textlayer` in the
-  summary and the log says `TEXTLAYER <file>: pymupdf4llm kept N of M text-layer
-  chars; k/n page(s) replaced`. A PDF whose pages are full-page images with no text
-  layer at all (`IMAGE-ONLY` in the log) goes straight to the OCR fallbacks below. If
-  the text is shorter than
-  `--min-chars`, or **garbled** — at least 30 % of its non-whitespace characters are
-  Unicode Private Use Area code points, which is what a scanned PDF whose fonts carry
-  no Unicode mapping yields (the log says `GARBLED text layer`) — the fallbacks are
-  tried in order: `--ocr-cache-dir`, then `ocrmypdf` (unless `--ocr off`), then
-  `--fallback-md-dir`. A garbled layer whose fallbacks are glyph codes too is written
-  as `pdf_needs_ocr` with the header only, never the glyph codes. The 30 % bar
-  (`GARBLED_PUA_RATIO`) sits in a measured gap: on a corpus of several thousand
-  academic PDFs, garbled files scored above 0.75 and every genuine file below 0.05,
-  a mathematics handbook with symbol-font Greek being the highest.
+  own OCR off, and every page is then judged. A page the engine emptied — it kept less
+  than 40 % of a text layer of at least 400 characters, which happens to scans whose
+  OCR text is drawn under the page image (the page comes back as its download watermark
+  only) and to figure pages of born-digital papers — or turned into **glyph garbage** is
+  replaced by that page's text layer as paragraphs, provided the layer itself reads as
+  text; the other pages keep their markdown. Glyph garbage is what `garble_reason`
+  recognises: Private Use Area code points (at least 30 % of the non-space characters),
+  U+FFFD replacement characters (5 %, what the engine emits for a font it cannot decode
+  while the layer itself is fine), C0 control codes (5 % on a page with under 25 % of
+  its characters inside words — TeX symbol fonts leave a few per cent on equation pages
+  of real prose), letter soup (35 % of the tokens are single non-digit characters, under
+  15 % of the characters are in words and under 30 % are digits — numeric tables are
+  mostly digits) or letters that form no words at all. A page whose layer is garbage too
+  is dropped, and convert() sends those pages to `ocrmypdf --pages` (all pages once they
+  are the majority): such files are labelled `pdf+ocr_pages` (or `pdf+ocr`), or
+  `pdf_garbled_pages_dropped` when OCR is off or fails, and the log says `GARBLED pages
+  <file>: k/n page(s) ...`. Repaired files are labelled `pdf+textlayer` and the log says
+  `TEXTLAYER <file>: pymupdf4llm kept N of M text-layer chars; k/n page(s) replaced`. A
+  PDF whose pages are full-page images with no text layer at all (`IMAGE-ONLY` in the
+  log) goes straight to the OCR fallbacks below. If the whole text is shorter than
+  `--min-chars`, or garbled by the same rules (the log says `GARBLED text layer`), the
+  fallbacks are tried in order: `--ocr-cache-dir`, then `ocrmypdf` (unless `--ocr off`;
+  its time limit is 600 s or 5 s per page OCR'd, whichever is longer), then
+  `--fallback-md-dir`. A garbled layer whose fallbacks are glyph codes too is written as
+  `pdf_needs_ocr` with the header only, never the garbage. Control codes are stripped
+  from every conversion in any case (PostgreSQL refuses NUL in text). The bars were
+  measured on a corpus of several thousand academic PDFs: prose has 50-70 % of its
+  characters inside words of four or more letters and every garbage shape under 10 %;
+  equation-heavy pages sit at 2-26 % but are mostly digits.
 - **HTML snapshot.** Zotero's own `.zotero-ft-cache` in the same folder is used when
   it is non-empty. Otherwise the page is converted with pandoc, or with
   BeautifulSoup if pandoc is missing.
