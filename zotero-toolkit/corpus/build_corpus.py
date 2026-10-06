@@ -912,12 +912,22 @@ def _norm_words(s: str) -> str:
     return " " + re.sub(r"[^a-z0-9]+", " ", s.lower()).strip() + " "
 
 
+def _wordy(tokens) -> bool:
+    """A three-token line end or start is usable for the succession test when it carries real words:
+    >= 8 alphanumerics and a token of >= 4 letters (equations and variable names match anywhere)."""
+    joined = "".join(tokens)
+    return sum(c.isalnum() for c in joined) >= 8 and any(len(re.sub(r"[^a-zA-Z]", "", t)) >= 4 for t in tokens)
+
+
 def _succession(engine_text: str, lines) -> tuple:
     """(kept, pairs): of the consecutive left-column lines (a, b) the engine text contains, how many it
-    kept adjacent -- b's first three words within 12 characters after a's last three."""
+    kept adjacent -- b's first three words within 12 characters after a's last three. Pairs whose
+    boundary tokens are not real words are not counted (a math-heavy page scored 0.46 before, 0.75 after)."""
     e = _norm_words(engine_text)
     kept = pairs = 0
     for a, b in zip(lines, lines[1:]):
+        if not (_wordy(a[-3:]) and _wordy(b[:3])):
+            continue
         ta = _norm_words(" ".join(a[-3:])).rstrip()
         tb = _norm_words(" ".join(b[:3]))
         ia = e.find(ta)
