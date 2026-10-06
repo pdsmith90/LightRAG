@@ -5410,6 +5410,7 @@ class PGVectorStorage(BaseVectorStorage):
                 contents[i : i + self._max_batch_size]
                 for i in range(0, len(contents), self._max_batch_size)
             ]
+            t_embed = time.perf_counter()
             try:
                 embeddings_list = await asyncio.gather(
                     *[
@@ -5436,6 +5437,11 @@ class PGVectorStorage(BaseVectorStorage):
                     f"[{self.workspace}] Embedding count mismatch: "
                     f"expected {len(docs_to_embed)}, got {len(embeddings)}"
                 )
+            logger.info(
+                f"[{self.workspace}] get_vectors_by_ids: {len(docs_to_embed)} pending chunk "
+                f"vectors embedded at query priority in {time.perf_counter() - t_embed:.1f}s "
+                f"({len(batches)} batch(es))"
+            )
 
             # Re-acquire the lock just long enough to cache results on
             # the same record. The identity check gates BOTH the cache
@@ -5461,10 +5467,17 @@ class PGVectorStorage(BaseVectorStorage):
             f"SELECT id, content_vector FROM {self.table_name} "
             f"WHERE workspace=$1 AND id = ANY($2)"
         )
+        t_sql = time.perf_counter()
         try:
             results = await self.db.query(
                 query, [self.workspace, remaining], multirows=True
             )
+            sql_s = time.perf_counter() - t_sql
+            if sql_s >= 1.0:
+                logger.info(
+                    f"[{self.workspace}] get_vectors_by_ids: {len(remaining)} stored vectors "
+                    f"fetched by id in {sql_s:.1f}s"
+                )
             for row in results or []:
                 if not row or "content_vector" not in row or "id" not in row:
                     continue

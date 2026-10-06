@@ -6793,10 +6793,20 @@ async def pick_by_vector_similarity(
             )
 
         # Get chunk embeddings from vector database
+        t_fetch = time.perf_counter()
         chunk_vectors = await chunks_vdb.get_vectors_by_ids(all_chunk_ids)
+        fetch_s = time.perf_counter() - t_fetch
         logger.debug(
             f"Vector similarity chunk selection: {len(chunk_vectors)} chunk vectors Retrieved"
         )
+        # Fork: this is the one step of a query that can wait on the ingest pipeline
+        # (pending chunk vectors are embedded here); waits of 30-570 s were measured
+        # during big-document ingest, so a slow fetch is logged where it happens.
+        if fetch_s >= 1.0:
+            logger.info(
+                f"Vector similarity chunk selection: {len(chunk_vectors)} of "
+                f"{len(all_chunk_ids)} chunk vectors fetched in {fetch_s:.1f}s"
+            )
 
         if not chunk_vectors:
             logger.warning(

@@ -6802,6 +6802,7 @@ async def _find_related_text_unit_from_entities(
     if not node_datas:
         return []
 
+    t_start = time.perf_counter()
     # Step 1: Collect all text chunks for each entity
     entities_with_chunks = []
     for entity in node_datas:
@@ -6911,6 +6912,7 @@ async def _find_related_text_unit_from_entities(
                 else:
                     logger.info(
                         f"Selecting {len(selected_chunk_ids)} from {total_entity_chunks} entity-related chunks by vector similarity"
+                        f" in {time.perf_counter() - t_start:.1f}s"
                     )
 
             except Exception as e:
