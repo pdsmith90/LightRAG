@@ -5374,9 +5374,8 @@ class PGVectorStorage(BaseVectorStorage):
 
         Embedding I/O runs *outside* ``_flush_lock`` so a slow embedding
         provider cannot block concurrent ``upsert`` / ``delete`` / read
-        calls on this storage. The lock is re-acquired briefly to cache
-        the result, and the pending record's identity is re-checked
-        first: if a concurrent ``upsert`` / ``delete`` / ``drop`` replaced
+        calls on this storage. Before the result is cached, the pending
+        record's identity is re-checked: if a concurrent ``upsert`` / ``delete`` / ``drop`` replaced
         or removed the record during the embedding window, that ID is
         dropped from the response entirely — we neither cache the stale
         vector on the new/missing record nor return it to the caller, so
@@ -5384,6 +5383,16 @@ class PGVectorStorage(BaseVectorStorage):
         current buffer state. Affected callers should treat the missing
         key the same as the existing "id was deleted before the call"
         case and retry if needed.
+
+        Fork: neither buffer access takes ``_flush_lock``. A flush holds that
+        lock through its whole embedding phase -- 39 min for one large book's
+        chunks, measured 2026-10-06 -- and this query-path read waited behind
+        it (a 246 s vector fetch). Both accesses are synchronous
+        (no await inside), so on the event loop they cannot interleave with
+        an upsert / delete / drop / flush mutating the process-local buffers,
+        and the identity check still guards the cache write. A vector cached
+        while a flush is mid-embedding is overwritten by the flush's own
+        embedding of the same content.
         """
         if not ids:
             return {}
@@ -5391,7 +5400,7 @@ class PGVectorStorage(BaseVectorStorage):
         result: dict[str, list[float]] = {}
         remaining: list[str] = []
         docs_to_embed: list[tuple[str, _PendingPGVectorDoc]] = []
-        async with self._flush_lock:
+        if True:  # Fork: was `async with self._flush_lock:` (see docstring)
             for doc_id in ids:
                 if doc_id in self._pending_vector_deletes:
                     continue
@@ -5443,14 +5452,14 @@ class PGVectorStorage(BaseVectorStorage):
                 f"({len(batches)} batch(es))"
             )
 
-            # Re-acquire the lock just long enough to cache results on
-            # the same record. The identity check gates BOTH the cache
-            # write and the response entry: if the pending record was
-            # swapped or removed during the embedding window (concurrent
-            # upsert / delete / drop), the just-computed vector no longer
-            # matches the current buffer state for this id, so we drop it
-            # from the response rather than return a stale embedding.
-            async with self._flush_lock:
+            # Cache results on the same record. The identity check gates
+            # BOTH the cache write and the response entry: if the pending
+            # record was swapped or removed during the embedding window
+            # (concurrent upsert / delete / drop), the just-computed vector
+            # no longer matches the current buffer state for this id, so we
+            # drop it from the response rather than return a stale embedding.
+            # Fork: no lock here either -- each check-and-set is synchronous.
+            if True:
                 for i, ((doc_id, original_pending), embedding) in enumerate(
                     zip(docs_to_embed, embeddings), start=1
                 ):

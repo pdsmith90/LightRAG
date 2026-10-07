@@ -906,6 +906,47 @@ async def test_get_vectors_by_ids_drops_when_pending_record_removed():
     assert result == {}
 
 
+class _FlushGatedEmbed(_GatedEmbed):
+    """Blocks only the flush's embedding; the query path's calls carry _priority."""
+
+    async def __call__(self, texts, **kwargs):
+        if "_priority" in kwargs:
+            self.call_count += 1
+            return np.array([[0.0, 1.0, 0.0] for _ in texts], dtype=np.float32)
+        return await super().__call__(texts, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_get_vectors_by_ids_does_not_wait_for_in_flight_flush():
+    """Fork: a flush holds _flush_lock through its embedding phase (39 min for
+    one book's chunks on 2026-10-06), and the query path's vector fetch waited
+    behind it. Stored ids come from SQL and pending ids are embedded by the
+    query itself, both while the flush is still embedding; the flush then
+    persists its own vector."""
+    embed = _FlushGatedEmbed()
+    storage = _make_storage(embed=embed)
+    await storage.upsert({"c1": _chunk_data(content="being flushed")})
+
+    flush_task = asyncio.create_task(storage.index_done_callback())
+    await asyncio.wait_for(embed.entered.wait(), timeout=1.0)
+    assert storage._flush_lock.locked()
+
+    storage.db.query = AsyncMock(
+        return_value=[{"id": "c9", "content_vector": [0.1, 0.2, 0.3]}]
+    )
+    vecs = await asyncio.wait_for(
+        storage.get_vectors_by_ids(["c1", "c9"]), timeout=1.0
+    )
+    assert vecs["c9"] == [0.1, 0.2, 0.3]
+    assert vecs["c1"] == [0.0, 1.0, 0.0]
+    assert not flush_task.done()
+
+    embed.gate.set()
+    await asyncio.wait_for(flush_task, timeout=1.0)
+    assert len(storage._captured_executemany) == 1
+    assert storage._pending_vector_docs == {}
+
+
 # ---------------------------------------------------------------------------
 # Flush batching: upsert split by record cap, delete split by id cap
 # ---------------------------------------------------------------------------
