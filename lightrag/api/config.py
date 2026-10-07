@@ -37,6 +37,8 @@ from lightrag.constants import (
     DEFAULT_METADATA_CHUNK_TOP_K,
     DEFAULT_CITATION_HOP_TOP_K,
     DEFAULT_LL_KEYWORDS_FALLBACK,
+    DEFAULT_NAMED_WORK_NOTICE,
+    DEFAULT_NAMED_WORK_PIN,
     DEFAULT_SIDECAR_RELATIONS,
     DEFAULT_ENTITY_TYPE_STRICT,
     DEFAULT_DROP_SYMBOL_ENTITIES,
@@ -971,6 +973,10 @@ def parse_args() -> argparse.Namespace:
     )
     args.ll_keywords_fallback = get_env_value(
         "LL_KEYWORDS_FALLBACK", DEFAULT_LL_KEYWORDS_FALLBACK, bool
+    )
+    args.named_work_pin = get_env_value("NAMED_WORK_PIN", DEFAULT_NAMED_WORK_PIN, bool)
+    args.named_work_notice = get_env_value(
+        "NAMED_WORK_NOTICE", DEFAULT_NAMED_WORK_NOTICE, bool
     )
     args.sidecar_relations = get_env_value(
         "SIDECAR_RELATIONS", DEFAULT_SIDECAR_RELATIONS, str

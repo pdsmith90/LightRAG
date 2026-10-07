@@ -87,6 +87,12 @@ DEFAULT_CITATION_HOP_TOP_K = 0
 # Fork: reuse the high-level keywords for the entity leg when the extractor
 # returned no low-level keywords.
 DEFAULT_LL_KEYWORDS_FALLBACK = False
+# Fork: keep the chunks of the works a query names by author and year at the
+# front of the context, through the rerank floor, chunk_top_k and the token budget.
+DEFAULT_NAMED_WORK_PIN = False
+# Fork (API): say when a work the query names by author and year is not among
+# the answer's sources.
+DEFAULT_NAMED_WORK_NOTICE = False
 # Fork: "all" links a table/equation/drawing sidecar entity to every entity of its
 # chunk (upstream behaviour); "none" creates the sidecar entity only.
 DEFAULT_SIDECAR_RELATIONS = "all"

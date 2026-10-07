@@ -27,7 +27,9 @@ from lightrag.query_validation import validate_query_not_empty, validate_rag_que
 from lightrag.utils import logger
 from lightrag.zotero_citations import (
     ReferenceStripper,
+    find_works,
     format_reference_block,
+    named_work_notices,
     strip_llm_references,
 )
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -353,6 +355,14 @@ class QueryResponse(BaseModel):
         default=None,
         description="Total server-side processing time in seconds (retrieval + LLM generation)",
     )
+    notices: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Works the question names by author and year that are not among the "
+            "sources, and why (fork, NAMED_WORK_NOTICE); the same sentences open "
+            "the response text."
+        ),
+    )
     llm_generated: bool = Field(
         default=True,
         description=(
@@ -453,6 +463,7 @@ def _journal_entry(
     llm_generated: Optional[bool] = None,
     error: Optional[str] = None,
     complete: bool = True,
+    notices: Optional[List[str]] = None,
 ) -> dict[str, Any]:
     """One QUERY_JOURNAL_FILE line: who asked what, with which settings, and
     what came back (the answer as delivered, sources included)."""
@@ -487,6 +498,7 @@ def _journal_entry(
         "response_time": response_time,
         "complete": complete,
         "error": error,
+        "notices": notices or None,
     }
 
 
@@ -505,6 +517,7 @@ def create_query_routes(
     top_k: int = 60,
     enable_query_budget_ceiling: bool = False,
     query_journal_file: Optional[str] = None,
+    named_work_notice: bool = False,
 ):
     # Fresh router per call. A module-level instance would accumulate
     # duplicate routes when the factory is invoked more than once in the
@@ -513,6 +526,30 @@ def create_query_routes(
     router = APIRouter(tags=["query"])
 
     combined_auth = get_combined_auth_dependency(api_key)
+
+    async def _notices_for(query: str, references: list) -> list[str]:
+        """Fork (NAMED_WORK_NOTICE): the sentences that open an answer when a
+        work the question names by author and year is not among its sources.
+        A failure here never fails the query."""
+        if not named_work_notice:
+            return []
+        try:
+            named = find_works(query)
+            if not named:
+                return []
+            paths = [(ref or {}).get("file_path") or "" for ref in references or []]
+            indexed: set[str] = set()
+            fetch = getattr(
+                getattr(rag, "text_chunks", None), "get_chunks_for_works", None
+            )
+            if fetch is not None:
+                for key, _ in named[:3]:
+                    if await fetch([key], query, 1):
+                        indexed.add(key)
+            return named_work_notices(query, paths, named, indexed)
+        except Exception as e:
+            logger.warning(f"Named-work notice: skipped ({e})")
+            return []
 
     @router.post(
         "/query",
@@ -801,6 +838,14 @@ def create_query_routes(
                 if references:
                     response_content += format_reference_block(references)
 
+            # Fork: a work the question names by author and year that is not
+            # among the sources is said so, ahead of the answer.
+            notices: list[str] = []
+            if not request.only_need_context and not request.only_need_prompt:
+                notices = await _notices_for(request.query, references)
+                if notices:
+                    response_content = "\n\n".join(notices) + "\n\n" + response_content
+
             if query_journal_file:
                 _append_journal(
                     query_journal_file,
@@ -814,6 +859,7 @@ def create_query_routes(
                         response_time=response_time,
                         references=references,
                         llm_generated=llm_generated,
+                        notices=notices,
                     ),
                 )
 
@@ -824,6 +870,7 @@ def create_query_routes(
                     references=references,
                     response_time=response_time,
                     llm_generated=llm_generated,
+                    notices=notices or None,
                 )
             else:
                 return QueryResponse(
@@ -831,6 +878,7 @@ def create_query_routes(
                     references=None,
                     response_time=response_time,
                     llm_generated=llm_generated,
+                    notices=notices or None,
                 )
         except Exception as e:
             logger.error(f"Error processing query: {str(e)}", exc_info=True)
@@ -859,8 +907,13 @@ def create_query_routes(
         include_chunk_content: bool,
         include_response_time: bool,
         start_time: float,
+        notice_fn=None,
     ):
         """Shared async generator that yields NDJSON lines for streaming responses.
+
+        ``notice_fn`` (fork, NAMED_WORK_NOTICE) is awaited with the references and
+        returns the sentences that open the response: one ``response`` line right
+        after the references when streaming, a prefix otherwise.
 
         Used by ``/query/stream`` to format NDJSON output with consistent
         error-handling behaviour. When ``include_response_time`` is enabled,
@@ -896,11 +949,15 @@ def create_query_routes(
             # something real to append. Zero-chunk retrievals still produce an
             # invented references section that has to go.
             rewrite = bool(include_references and allow_reference_block)
+            notices = (await notice_fn(references)) if notice_fn else []
+            notice_text = ("\n\n".join(notices) + "\n\n") if notices else ""
 
             if llm_response.get("is_streaming"):
                 # Streaming: references first, then response chunks
                 if include_references:
                     yield f"{json.dumps({'references': references})}\n"
+                if notice_text:
+                    yield f"{json.dumps({'response': notice_text})}\n"
 
                 response_stream = llm_response.get("response_iterator")
                 if response_stream:
@@ -939,6 +996,8 @@ def create_query_routes(
                     response_content = strip_llm_references(response_content)
                     if references:
                         response_content += format_reference_block(references)
+                if notice_text:
+                    response_content = notice_text + response_content
 
                 # The flag rides this line rather than a separate one: it
                 # describes THIS content, and a client that ignores the key
@@ -1269,6 +1328,11 @@ def create_query_routes(
             # is False (default), use the original blocking path that preserves
             # the exact protocol order: references → response chunks → time.
             include_progress = request.include_progress or False
+            notice_fn = (
+                None
+                if request.only_need_context or request.only_need_prompt
+                else (lambda refs: _notices_for(request.query, refs))
+            )
 
             if include_progress:
                 progress_queue: asyncio.Queue = asyncio.Queue()
@@ -1338,6 +1402,7 @@ def create_query_routes(
                             include_chunk_content=include_chunk_content,
                             include_response_time=True,
                             start_time=start_time,
+                            notice_fn=notice_fn,
                         )
                         async for line in stream_gen():
                             yield line
@@ -1386,6 +1451,7 @@ def create_query_routes(
                     include_chunk_content=request.include_chunk_content,
                     include_response_time=False,
                     start_time=start_time,
+                    notice_fn=notice_fn,
                 )
 
                 return StreamingResponse(

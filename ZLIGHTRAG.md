@@ -21,6 +21,7 @@ starting with [README.md](./README.md), applies as written.
 | [Per-work chunk cap](#per-work-chunk-cap) | `MAX_CHUNKS_PER_DOC` | `0` (off) |
 | [Lexical retrieval leg](#lexical-retrieval-leg) | `LEXICAL_CHUNK_TOP_K` | `0` (off) |
 | [PostgreSQL edge removal in plain SQL](#postgresql-edge-removal-in-plain-sql) | none | always active |
+| [Named-work pin and notice](#named-work-pin-and-notice) | `NAMED_WORK_PIN`, `NAMED_WORK_NOTICE` | `false`, `false` |
 
 ### Reference lists compiled from Zotero metadata
 
@@ -129,6 +130,29 @@ only by citation, such as the origin of an acronym the paper itself never spells
 out. Both need a text-chunk storage with `get_chunks_for_works` (PostgreSQL). Code:
 `_get_metadata_context` in `lightrag/operate.py`. Part of the query-answer cache key;
 reported in `/health`. Off by default.
+
+`find_works` returns every work tied at the best score, past its cap if need be, a tie
+broken by the title words a work shares with the query and only then by key: two
+authors who published several papers in one year would otherwise lose the right one
+to an alphabetical cut. When no work matches the query's year, the adjacent years
+stand in without the year point (a journal's online-first and print years differ by
+one). A surname is the first token of a creator string, continued only through
+particles (`van der Lind Tamás`), never the given names that follow it.
+
+### Named-work pin and notice
+
+The author-year leg brings a named work's chunks into the candidates, but the
+reranker, the score floor, `chunk_top_k` and the token budget can still drop them
+when the papers citing the work match the question better than the work itself.
+With `NAMED_WORK_PIN=true`, whenever the query carries a year, up to two named works
+keep up to `MAX_CHUNKS_PER_DOC` (else two) chunks each at the front of the context,
+through the rerank floor and both cuts (`pin_named_work_chunks` in
+`lightrag/utils.py`; the chunks carry `pinned` into `/query/data`). With
+`NAMED_WORK_NOTICE=true`, `/query` and `/query/stream` open the answer with one
+sentence per named work that is not among the sources, saying whether it is in the
+knowledge base at all (`named_work_notices` in `lightrag/zotero_citations.py`), and
+return them as `notices`; nothing is said when the query names no year or when any
+named work is a source. Both off by default; the pin needs `METADATA_CHUNK_TOP_K`.
 
 ### Low-level keyword fallback
 

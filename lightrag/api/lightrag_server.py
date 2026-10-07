@@ -2608,6 +2608,7 @@ def create_app(args):
             args.top_k,
             enable_query_budget_ceiling=query_budget_ceiling_enabled,
             query_journal_file=query_journal_file,
+            named_work_notice=args.named_work_notice,
         )
     )
     app.include_router(create_graph_routes(rag, api_key))
@@ -3059,6 +3060,8 @@ def create_app(args):
                         "metadata_chunk_top_k": args.metadata_chunk_top_k,
                         "citation_hop_top_k": args.citation_hop_top_k,
                         "ll_keywords_fallback": args.ll_keywords_fallback,
+                        "named_work_pin": args.named_work_pin,
+                        "named_work_notice": args.named_work_notice,
                         "sidecar_relations": args.sidecar_relations,
                         "entity_type_strict": args.entity_type_strict,
                         "drop_symbol_entities": args.drop_symbol_entities,

@@ -16,7 +16,12 @@ from lightrag.exceptions import (
     IndexFlushError,
     PipelineCancelledException,
 )
-from lightrag.zotero_citations import cited_works_in, citation_short, find_works
+from lightrag.zotero_citations import (
+    cited_works_in,
+    citation_short,
+    find_works,
+    query_has_year,
+)
 from lightrag.entity_name_guard import junk_entity_class
 from lightrag.entity_name_fold import alias_chunk_result, fold_chunk_result
 from lightrag.utils import (
@@ -5586,13 +5591,16 @@ _CITATION_HOP_CHUNKS_PER_WORK = 2
 _metadata_unsupported_warned = False
 
 
-def _work_rows_to_chunks(rows: list[dict], source_type: str) -> list[dict]:
+def _work_rows_to_chunks(
+    rows: list[dict], source_type: str, pinned: bool = False
+) -> list[dict]:
     return [
         {
             "content": row.get("content") or "",
             "file_path": row.get("file_path") or "unknown_source",
             "source_type": source_type,
             "chunk_id": row["id"],
+            **({"pinned": True} if pinned else {}),
         }
         for row in rows
         if row.get("id")
@@ -5655,7 +5663,11 @@ async def _get_metadata_context(
     if named:
         per_work = max(1, -(-top_k // len(named)))
         rows = await fetch(named, query, per_work)
-        chunks.extend(_work_rows_to_chunks(rows[:top_k], "metadata"))
+        # NAMED_WORK_PIN: a work named with its year keeps its chunks through the
+        # rerank floor, chunk_top_k and the token budget (utils.pin_named_work_chunks);
+        # a bare surname names too weakly to pin.
+        pin = bool(config.get("named_work_pin")) and query_has_year(query)
+        chunks.extend(_work_rows_to_chunks(rows[:top_k], "metadata", pinned=pin))
     if cited:
         rows = await fetch(cited, query, _CITATION_HOP_CHUNKS_PER_WORK)
         chunks.extend(_work_rows_to_chunks(rows, "citation"))
@@ -6251,6 +6263,8 @@ async def _merge_all_chunks(
                         "content": chunk["content"],
                         "file_path": chunk.get("file_path", "unknown_source"),
                         "chunk_id": chunk_id,
+                        # the author-year leg's pin survives the merge
+                        **({"pinned": True} if chunk.get("pinned") else {}),
                     }
                 )
 

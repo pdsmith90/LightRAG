@@ -7153,6 +7153,52 @@ def filter_bibliography_chunks(chunks: list[dict]) -> list[dict]:
     return kept
 
 
+_PIN_MAX_WORKS = 2
+_PIN_MAX_PER_WORK = 2
+
+
+def pin_named_work_chunks(
+    chunks: list[dict], max_per_work: int, max_works: int = _PIN_MAX_WORKS
+) -> list[dict]:
+    """Move the chunks of the works a query named to the front (fork;
+    NAMED_WORK_PIN), so neither the chunk_top_k cut nor the token budget can
+    drop them: at most ``max_works`` works, chosen by their best rerank score
+    (else the author-year leg's order), at most ``max_per_work`` chunks each.
+    The other pinned chunks lose their pin and keep their place.
+
+    ``chunks`` arrive in rerank order; the pinned ones carry ``pinned`` from
+    :func:`lightrag.operate._get_metadata_context`.
+    """
+    pinned = [c for c in chunks if c.get("pinned")]
+    if not pinned:
+        return chunks
+    best: dict[str, float] = {}
+    order: list[str] = []
+    for chunk in pinned:
+        key = work_key(chunk.get("file_path") or "")
+        score = float(chunk.get("rerank_score") or 0.0)
+        if key not in best:
+            order.append(key)
+            best[key] = score
+        else:
+            best[key] = max(best[key], score)
+    chosen = set(sorted(order, key=lambda k: (-best[k], order.index(k)))[:max_works])
+    per_work = max(1, max_per_work)
+    front, rest, count = [], [], {}
+    for chunk in chunks:
+        key = work_key(chunk.get("file_path") or "")
+        if chunk.get("pinned") and key in chosen and count.get(key, 0) < per_work:
+            count[key] = count.get(key, 0) + 1
+            front.append(chunk)
+        else:
+            rest.append(chunk)
+    if front:
+        logger.info(
+            f"Named-work pin: {len(front)} chunks of {len(count)} named works kept first"
+        )
+    return front + rest
+
+
 def cap_chunks_per_work(chunks: list[dict], max_per_work: int) -> list[dict]:
     """Keep at most ``max_per_work`` chunks of each work, preserving order.
 
@@ -7214,6 +7260,11 @@ async def process_chunks_unified(
             return []
 
     max_per_work = global_config.get("max_chunks_per_doc") or 0
+    # Fork: chunks of the works the query named (NAMED_WORK_PIN) ride through
+    # the rerank cut, the score floor, chunk_top_k and the token budget.
+    pinned_any = bool(global_config.get("named_work_pin")) and any(
+        c.get("pinned") for c in unique_chunks
+    )
 
     # 1. Apply reranking if enabled and query is provided
     if query_param.enable_rerank and query and unique_chunks:
@@ -7223,7 +7274,7 @@ async def process_chunks_unified(
         # needs the ones ranked below chunk_top_k to refill the slots it frees.
         rerank_top_k = (
             len(unique_chunks)
-            if max_per_work
+            if max_per_work or pinned_any
             else query_param.chunk_top_k or len(unique_chunks)
         )
         unique_chunks = await apply_rerank_if_enabled(
@@ -7252,7 +7303,9 @@ async def process_chunks_unified(
                 rerank_score = chunk.get(
                     "rerank_score", 1.0
                 )  # Default to 1.0 if no score
-                if rerank_score >= min_rerank_score:
+                if rerank_score >= min_rerank_score or (
+                    pinned_any and chunk.get("pinned")
+                ):
                     filtered_chunks.append(chunk)
 
             unique_chunks = filtered_chunks
@@ -7268,6 +7321,13 @@ async def process_chunks_unified(
     # 2b. At most MAX_CHUNKS_PER_DOC chunks of one work (opt-in)
     if max_per_work:
         unique_chunks = cap_chunks_per_work(unique_chunks, max_per_work)
+
+    # 2c. The named works' chunks first (opt-in, NAMED_WORK_PIN), ahead of the
+    #     chunk_top_k cut and the token truncation below
+    if pinned_any:
+        unique_chunks = pin_named_work_chunks(
+            unique_chunks, max_per_work or _PIN_MAX_PER_WORK
+        )
 
     # 3. Apply chunk_top_k limiting if specified
     if query_param.chunk_top_k is not None and query_param.chunk_top_k > 0:

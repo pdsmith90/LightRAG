@@ -199,6 +199,71 @@ def citation_for(file_path: str) -> str:
         return ""
 
 
+def citation_for_key(key: str) -> str:
+    """Full bibliographic citation of the library item with storage ``key``;
+    "" when the metadata does not know it."""
+    try:
+        entry = _load().get(key)
+        if not isinstance(entry, dict):
+            return ""
+        title = (entry.get("title") or "").strip().rstrip(".")
+        parts = [
+            p
+            for p in (
+                _authors(entry),
+                f"({entry['year']})" if (entry.get("year") or "").strip() else "",
+                title,
+                (entry.get("publication") or "").strip(),
+                f"https://doi.org/{entry['doi'].strip()}"
+                if (entry.get("doi") or "").strip()
+                else "",
+            )
+            if p
+        ]
+        return _join(parts)
+    except Exception as e:  # never break a query over a citation
+        logger.warning(f"zotero_citations: citation_for_key({key!r}) failed: {e}")
+        return ""
+
+
+def named_work_notices(
+    query: str,
+    reference_file_paths,
+    named: list[tuple[str, int]],
+    indexed,
+) -> list[str]:
+    """Fork (NAMED_WORK_NOTICE): one sentence per work the query names by author
+    and year that is not among the answer's sources, saying why -- not in the
+    knowledge base at all, or indexed but not retrieved -- so a reader never
+    mistakes an answer built from a paper's citers for one built from the paper.
+
+    ``named`` is :func:`find_works`'s result for the query, ``indexed`` the keys
+    among them that hold chunks. Empty when the query names no year (a bare
+    surname is too weak a naming to warn about), when any named work is among
+    the references (the paper asked about was found), or when nothing was
+    named. At most three notices.
+    """
+    if not named or not query_has_year(query):
+        return []
+    cited = {zotero_key(path or "") for path in reference_file_paths}
+    if any(key in cited for key, _ in named):
+        return []
+    notices = []
+    for key, _ in named[:3]:
+        cite = citation_for_key(key) or key
+        if key in indexed:
+            notices.append(
+                f"{cite} is in the knowledge base but was not among the sources "
+                "retrieved for this question."
+            )
+        else:
+            notices.append(
+                f"{cite} is in the Zotero library but not in this knowledge base; "
+                "the answer relies on other sources."
+            )
+    return notices
+
+
 _WORK_TITLE_MIN = (
     20  # shorter normalised titles ("Preface", "Introduction") name no single work
 )
@@ -365,7 +430,29 @@ class ReferenceStripper:
 # ---------------------------------------------------------------------------
 
 _AY_YEAR_RE = re.compile(r"(?<!\d)((?:19|20)\d{2})(?!\d)")
-_AY_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z'\u2019\-]{2,}")
+_AY_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z'\u2019\-\u2010\u2011]{2,}")
+_AY_TITLE_WORD_RE = re.compile(r"[A-Za-z][A-Za-z\-]{3,}")
+# Lower-case words that continue a surname ("van der Lind Tamás", "Ferreira Da
+# Costa Inês"); any other token after the first ends it.
+_NAME_PARTICLES = frozenset(
+    "van der den de del della di da do dos das du le la von zu zur ter ten af av al el bin ibn".split()
+)
+# A creator string that is an institution, a programme or a mailbox rather than a
+# person contributes no surname: its first token is an ordinary word ("Data",
+# "University", "Satellites") that would otherwise name the work in every
+# question that uses it.
+_ORG_WORDS = frozenset(
+    "university corporation institute institution center centre centres laboratory "
+    "laboratories agency administration program programme project group team "
+    "consortium committee commission council office department division service "
+    "support data mission observatory satellites association society foundation "
+    "survey bureau network".split()
+)
+# Function words a malformed creator string can put in the surname position
+# ("For Mei"); never a surname form.
+_NOT_SURNAMES = frozenset(
+    "and the for with from that this which what when where who how not but nor".split()
+)
 # "Okafor (2019)", "Okafor and Lindqvist 2019", "Okafor et al., 2019a", "(Okafor, 2019)".
 _CITE_RE = re.compile(
     r"(?<![A-Za-z])([A-Z][A-Za-z'\u2019\-]{2,})"
@@ -378,7 +465,7 @@ _AY_MAX_TIES = 9
 _CITE_MAX_WORKS_PER_MENTION = 3
 
 _ay_index: tuple | None = (
-    None  # (mtime, surname -> keys, year -> keys, key -> (surnames, year))
+    None  # (mtime, surname -> keys, year -> keys, key -> (surnames, year, title words))
 )
 
 
@@ -389,17 +476,30 @@ def _surname_forms(author: str) -> set[str]:
     four letters, so "Ghobadi-Far Khosro" answers to "ghobadi-far" and "ghobadi".
     """
     author = (author or "").strip()
-    if not author:
+    if not author or "@" in author:
+        return set()
+    words = {w.lower() for w in re.findall(r"[A-Za-z]+", author)}
+    # A person carries a given name or an initial; a lone token is an organisation.
+    if words & _ORG_WORDS or ("," not in author and len(author.split()) < 2):
         return set()
     if "," in author:
         last = author.split(",", 1)[0]
     else:
+        # "Last First [Middle]": the surname is the first token, continued only
+        # through particles ("van der Lind Tamás"), so the given names that
+        # follow it ("Varga Grace E.") never become surname forms.
         parts = author.split()
-        last = " ".join(parts[:-1]) if len(parts) > 1 else parts[0]
+        keep = parts[:1]
+        for prev, tok in zip(parts, parts[1:]):
+            if tok.lower() in _NAME_PARTICLES or prev.lower() in _NAME_PARTICLES:
+                keep.append(tok)
+            else:
+                break
+        last = " ".join(keep)
     last = last.lower().strip()
     forms = {last} if len(last) >= 3 else set()
-    forms.update(p for p in re.split(r"[\s\-]+", last) if len(p) >= 4)
-    return forms
+    forms.update(p for p in re.split(r"[\s\-\u2010\u2011]+", last) if len(p) >= 4)
+    return forms - _NOT_SURNAMES
 
 
 def _author_year_index() -> tuple:
@@ -410,7 +510,7 @@ def _author_year_index() -> tuple:
         return _ay_index
     by_surname: dict[str, set[str]] = {}
     by_year: dict[str, set[str]] = {}
-    works: dict[str, tuple[frozenset[str], str]] = {}
+    works: dict[str, tuple[frozenset[str], str, frozenset[str]]] = {}
     for key, entry in meta.items():
         if not isinstance(entry, dict):
             continue
@@ -423,7 +523,10 @@ def _author_year_index() -> tuple:
             by_surname.setdefault(name, set()).add(key)
         if year:
             by_year.setdefault(year, set()).add(key)
-        works[key] = (frozenset(names), year)
+        title_words = frozenset(
+            w.lower() for w in _AY_TITLE_WORD_RE.findall(str(entry.get("title") or ""))
+        )
+        works[key] = (frozenset(names), year, title_words)
     _ay_index = (_mtime, by_surname, by_year, works)
     return _ay_index
 
@@ -432,10 +535,17 @@ def find_works(query: str, max_works: int = 3) -> list[tuple[str, int]]:
     """Zotero keys of the works a query names by author surname(s) and year,
     best first, each with its match score (surnames matched, +1 for the year).
 
-    A year in the query must match. Without a year, a single surname counts only
-    when it names at most two works (a rare name), two or more surnames always.
-    When the best score is shared by more than ``_AY_MAX_TIES`` works the query
-    is too ambiguous and nothing is returned. Empty when the metadata is absent.
+    A year in the query must match; a work of an adjacent year stands in
+    without the year point when no work matches the year exactly, or when it
+    matches more of the surnames than any exact-year work does (a journal's
+    online-first and print years differ by one). Without a year, a single surname counts
+    only when it names at most two works (a rare name), two or more surnames
+    always. Works tied at the best score are all returned, past ``max_works``
+    if need be: a tie is broken by how many of the query's other content words
+    a title shares, then by key, and an alphabetical cut would drop the right
+    paper when a pair of authors published several times in one year. When more
+    than ``_AY_MAX_TIES`` works tie the query is too ambiguous and nothing is
+    returned. Empty when the metadata is absent.
     """
     _, by_surname, _by_year, works = _author_year_index()
     if not works or not query:
@@ -450,25 +560,37 @@ def find_works(query: str, max_works: int = 3) -> list[tuple[str, int]]:
         for key in by_surname[name]:
             matched[key] = matched.get(key, 0) + 1
     scored: list[tuple[str, int]] = []
-    for key, hits in matched.items():
-        names, year = works[key]
-        if years:
-            if year not in years:
-                continue
-            scored.append((key, hits + 1))
-        else:
+    if years:
+        adjacent = {str(int(y) + d) for y in years for d in (-1, 1)} - years
+        scored = [(k, h + 1) for k, h in matched.items() if works[k][1] in years]
+        floor = max((h for _, h in scored), default=0)
+        scored += [
+            (k, h)
+            for k, h in matched.items()
+            if works[k][1] in adjacent and h + 1 > floor
+        ]
+    else:
+        for key, hits in matched.items():
             if hits == 1:
-                name = next(n for n in surnames if n in names)
+                name = next(n for n in surnames if n in works[key][0])
                 if len(by_surname[name]) > 2:
                     continue
             scored.append((key, hits))
     if not scored:
         return []
-    scored.sort(key=lambda item: (-item[1], item[0]))
+    content = tokens - surnames
+    scored.sort(key=lambda item: (-item[1], -len(works[item[0]][2] & content), item[0]))
     best = scored[0][1]
-    if sum(1 for _, score in scored if score == best) > _AY_MAX_TIES:
+    ties = sum(1 for _, score in scored if score == best)
+    if ties > _AY_MAX_TIES:
         return []
-    return scored[:max_works]
+    return scored[: max(max_works, ties)]
+
+
+def query_has_year(query: str) -> bool:
+    """Whether the query carries a four-digit year, i.e. names a work firmly
+    enough for :func:`find_works`'s result to be pinned or missed."""
+    return bool(_AY_YEAR_RE.search(query or ""))
 
 
 def cited_works_in(

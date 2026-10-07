@@ -14,7 +14,12 @@ import pytest
 
 import lightrag.zotero_citations as zc
 from lightrag.operate import _get_metadata_context, _merge_all_chunks, _prepend_chunks
-from lightrag.zotero_citations import cited_works_in, find_works
+from lightrag.zotero_citations import (
+    _surname_forms,
+    cited_works_in,
+    find_works,
+    named_work_notices,
+)
 
 pytestmark = pytest.mark.offline
 
@@ -84,7 +89,79 @@ def test_surnames_and_year_name_the_works(metadata):
         ("AAAA0003", 3),
     ]
     assert find_works("okafor 2021 residuals") == [("AAAA0002", 2)]
-    assert find_works("Okafor Lindqvist 2019", max_works=1) == [("AAAA0001", 3)]
+
+
+def test_ties_at_the_best_score_all_return_and_titles_break_them(metadata):
+    # both Okafor-Lindqvist 2019 works tie: the cap never cuts a tie
+    assert find_works("Okafor Lindqvist 2019", max_works=1) == [
+        ("AAAA0001", 3),
+        ("AAAA0003", 3),
+    ]
+    # the title sharing the query's other words goes first
+    assert find_works("Lindqvist Okafor 2019 third")[0] == ("AAAA0003", 3)
+
+
+def test_adjacent_years_stand_in_when_the_year_matches_nothing(metadata):
+    assert find_works("Okafor 2020 residuals") == [
+        ("AAAA0001", 1),
+        ("AAAA0002", 1),
+        ("AAAA0003", 1),
+    ]
+    assert find_works("Okafor 2005 residuals") == []  # two years off never
+
+
+def test_an_adjacent_year_work_joins_when_it_matches_more_surnames(tmp_path):
+    # the pair's paper is filed a year off; the exact-year match names one author
+    meta = {
+        "BBBB0001": {
+            "title": "Pair",
+            "authors": ["Okafor Chidi", "Lindqvist Maja"],
+            "year": "2022",
+        },
+        "BBBB0002": {"title": "Solo", "authors": ["Okafor Chidi"], "year": "2021"},
+        "BBBB0003": {
+            "title": "Pair too",
+            "authors": ["Okafor Chidi", "Lindqvist Maja"],
+            "year": "2019",
+        },
+    }
+    path = tmp_path / "zotero_metadata.json"
+    path.write_text(json.dumps(meta), encoding="utf-8")
+    saved = zc.METADATA_PATH
+    _reset(str(path))
+    try:
+        assert find_works("Okafor Lindqvist 2021 residuals") == [
+            ("BBBB0001", 2),
+            ("BBBB0002", 2),
+        ]
+    finally:
+        _reset(saved)
+
+
+def test_surname_forms_stop_at_the_given_names():
+    assert _surname_forms("Varga Grace E.") == {"varga"}
+    assert _surname_forms("van der Lind Tamás") == {"van der lind", "lind"}
+    assert _surname_forms("Ferreira Da Costa Inês") == {
+        "ferreira da costa",
+        "ferreira",
+        "costa",
+    }
+    assert _surname_forms("Nakamura\u2010Lindqvist Ren") == {
+        "nakamura\u2010lindqvist",
+        "nakamura",
+        "lindqvist",
+    }
+    assert _surname_forms("Okafor, Chidi") == {"okafor"}
+
+
+def test_institutions_and_mailboxes_contribute_no_surname():
+    assert _surname_forms("Data Support, mailbox@example.invalid") == set()
+    assert _surname_forms("University Consortium For Imaginary Research") == set()
+    assert _surname_forms("Satellites Programme Of An Example Observatory") == set()
+    assert _surname_forms("Programme Office") == set()
+    assert _surname_forms("Varga Eric F.") == {"varga"}
+    assert _surname_forms("Acme") == set()  # a lone token is no person
+    assert _surname_forms("For Mei") == set()  # a function word is no surname
 
 
 def test_hyphenated_surnames_answer_to_their_parts(metadata):
@@ -113,6 +190,26 @@ def test_no_surname_or_no_metadata_finds_nothing(metadata, tmp_path):
     assert find_works("gravity field smoothing 2019") == []
     _reset(str(tmp_path / "missing.json"))
     assert find_works("Okafor 2019") == []
+
+
+# ---------------------------------------------------------------------------
+# named_work_notices
+# ---------------------------------------------------------------------------
+
+
+def test_notices_name_the_missing_works_and_say_why(metadata):
+    named = [("AAAA0001", 3), ("AAAA0003", 3)]
+    query = "Okafor Lindqvist 2019 residuals"
+    # a named work is among the references: nothing to say
+    assert named_work_notices(query, ["AAAA0001__x.md"], named, {"AAAA0001"}) == []
+    out = named_work_notices(query, ["AAAA0009__citer.md"], named, {"AAAA0001"})
+    assert len(out) == 2
+    assert "Okafor" in out[0] and "(2019)" in out[0]
+    assert out[0].endswith("not among the sources retrieved for this question.")
+    assert "Third" in out[1] and "not in this knowledge base" in out[1]
+    # no year: too weak a naming to warn about; nothing named: nothing
+    assert named_work_notices("Okafor Lindqvist residuals", [], named, set()) == []
+    assert named_work_notices(query, [], [], set()) == []
 
 
 # ---------------------------------------------------------------------------

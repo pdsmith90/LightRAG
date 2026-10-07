@@ -68,6 +68,7 @@ from lightrag.constants import (
     DEFAULT_METADATA_CHUNK_TOP_K,
     DEFAULT_CITATION_HOP_TOP_K,
     DEFAULT_LL_KEYWORDS_FALLBACK,
+    DEFAULT_NAMED_WORK_PIN,
     DEFAULT_SIDECAR_RELATIONS,
     DEFAULT_ENTITY_TYPE_STRICT,
     DEFAULT_DROP_SYMBOL_ENTITIES,
@@ -1491,6 +1492,23 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
     Without it a ``local``, ``hybrid`` or ``mix`` query whose extraction put every
     term in the high-level list skips the entity search entirely. Env
     ``LL_KEYWORDS_FALLBACK``.
+    """
+
+    named_work_pin: bool = field(
+        default_factory=lambda: get_env_value(
+            "NAMED_WORK_PIN", DEFAULT_NAMED_WORK_PIN, bool
+        )
+    )
+    """Keep the chunks of the works a query names by author and year at the
+    front of the context.
+
+    The author-year leg (``metadata_chunk_top_k``) brings a named work's chunks
+    into the candidates, but the reranker, the score floor, ``chunk_top_k`` and
+    the token budget can still drop them when the papers citing the work match
+    the question better than the work itself. With the pin, up to two named
+    works keep up to ``max_chunks_per_doc`` (else two) chunks each, first in the
+    context, whenever the query carries a year
+    (:func:`lightrag.utils.pin_named_work_chunks`). Env ``NAMED_WORK_PIN``.
     """
 
     sidecar_relations: str = field(
