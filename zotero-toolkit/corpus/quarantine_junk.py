@@ -96,14 +96,15 @@ def pua_ratio(text: str) -> float:
 
 
 # The other garbage shapes build_corpus.garble_reason knows -- U+FFFD replacement characters,
-# C0 control codes, letter soup -- duplicated here because build_corpus imports load_denylist
-# from this file. Same bars; see build_corpus for how they were measured.
+# C0 control codes, Latin-1 codes, letter soup -- duplicated here because build_corpus imports
+# load_denylist from this file. Same bars; see build_corpus for how they were measured.
 _ctrl_re = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _word_re = re.compile(r"[^\W\d_]{4,}")
+_latin1_re = re.compile(r"[\u0080-\u00af\u00b4\u00b6\u00b8\u00ba\u00bb\u00bf-\u00d6\u00d8-\u00f6\u00f8-\u00ff]")
 
 
 def garble_reason(text: str):
-    """'replacement', 'control', 'letter-soup' or 'no-words' when the text is glyph garbage of
+    """'replacement', 'control', 'latin1', 'letter-soup' or 'no-words' when the text is glyph garbage of
     a shape other than Private Use Area codes (those are pua_ratio's), else None. Texts under
     PUA_MIN_NONSPACE non-space characters are never garbled."""
     ns = _ws_re.sub("", text)
@@ -116,6 +117,8 @@ def garble_reason(text: str):
         return "replacement"
     if len(_ctrl_re.findall(ns)) / n >= 0.05 and word < 0.25:
         return "control"
+    if len(_latin1_re.findall(ns)) / n >= 0.12:
+        return "latin1"
     single = sum(1 for t in toks if len(t) == 1 and not t.isdigit()) / len(toks)
     digit = sum(ch.isdigit() for ch in ns) / n
     if single >= 0.35 and word < 0.15 and digit < 0.30:

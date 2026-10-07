@@ -5,7 +5,7 @@ A two-column page whose engine text lost the left column's line order, or glued 
 is re-read from its blocks, whatever font the layer uses; a page the engine read correctly, or one with too
 few lines or words to judge, is left alone.
 Synthetic PDFs via pymupdf; pymupdf4llm replaced by a fake; all text is invented."""
-import contextlib, io, os, sys, tempfile
+import contextlib, io, itertools, os, sys, tempfile
 
 try:
     import corpus_testlib  # noqa: F401  -- fork layout
@@ -131,6 +131,18 @@ def test_word_recall_spares_correct_and_order_merged_text():
         glued = "\n\n".join(" ".join(x + y for x, y in zip(a.split(), b.split())) for a, b in zip(LEFT[:1], RIGHT[:1]))
         with pymupdf.open(s) as doc:
             assert not bc._words_glued(glued, doc[0])
+
+
+def test_glued_page_with_a_garbage_layer_goes_to_ocr():
+    # a font mapped to Latin-1 codes: the layer's ASCII fragments count as words, the rest is garbage
+    words = ["".join(c) for c in itertools.product("bcdfg", "aeiou", "hjklm", "nprst")][::10][:60]   # 60 distinct
+    soup = [" ".join(f"{w}ÄóÓÒÌ" for w in words[i:i + 6]) for i in range(0, 60, 6)]
+    with tempfile.TemporaryDirectory() as td:
+        p = os.path.join(td, "paper.pdf")
+        two_column_pdf(p, soup[:5], soup[5:])
+        md, log = run(p, [CORRECT])                                        # engine text shares no word
+        assert md.strip() == "" and bc._pdf_garbled_pages == [0], (md[:200], bc._pdf_garbled_pages)
+        assert "1 glued word into word" in log and "latin1 1" in log, log
 
 
 def test_too_few_pairs_are_not_judged():

@@ -716,6 +716,13 @@ GARBLED_SOUP_MAX_WORDS = 0.15
 GARBLED_SOUP_MAX_DIGITS = 0.30
 GARBLED_NOWORDS_ALPHA = 0.30
 GARBLED_NOWORDS_MAX_WORDS = 0.03
+# 2026-10-06: LATIN-1 -- fonts that map glyphs to C1 controls and Latin-1 letters ("ÄóÓÒeÌôbÑÃØÏ"; a 1999 survey
+# paper had 64 % of its characters there) passed every rule above: the word share counts runs of Latin-1 letters
+# as words, and the control rule sees C0 only (pymupdf4llm drops the C0 codes such fonts also produce). Measured
+# 2026-10-06: six such documents 0.15-0.50 of their non-space characters in _latin1_re (whole text); 20,641
+# sampled pages of the knowledge base's PDFs at most 0.084 over the whole U+0080-U+00FF range (accented prose,
+# degree signs) -- leaving the scientific symbols out only lowers that; a dense French paragraph 0.095.
+GARBLED_LATIN1_SHARE = 0.12
 GARBLED_MIN_NONSPACE = 500  # a whole document (convert): below this looks_empty decides
 GARBLED_PAGE_MIN_NONSPACE = 200  # one page (pdf_to_md)
 _ws_re = re.compile(r"\s+")
@@ -723,6 +730,8 @@ _ctrl_re = re.compile(
     r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]"
 )  # C0 controls except \t \n \r, plus DEL
 _word_re = re.compile(r"[^\W\d_]{4,}")  # runs of letters in any script
+# C1 controls + Latin-1 letters and symbols, except the ones science uses (° ± µ · × ÷ ² ³ ¹ ¼ ½ ¾)
+_latin1_re = re.compile(r"[\u0080-\u00af\u00b4\u00b6\u00b8\u00ba\u00bb\u00bf-\u00d6\u00d8-\u00f6\u00f8-\u00ff]")
 
 
 def pua_share(text: str) -> float:
@@ -749,6 +758,7 @@ def garble_metrics(text: str) -> dict:
             "alpha": 0.0,
             "digit": 0.0,
             "single": 0.0,
+            "latin1": 0.0,
         }
     toks = text.split()
     return {
@@ -760,11 +770,12 @@ def garble_metrics(text: str) -> dict:
         "alpha": sum(ch.isalpha() for ch in ns) / n,
         "digit": sum(ch.isdigit() for ch in ns) / n,
         "single": sum(1 for t in toks if len(t) == 1 and not t.isdigit()) / len(toks),
+        "latin1": len(_latin1_re.findall(ns)) / n,
     }
 
 
 def garble_reason(text: str, min_nonspace: int = GARBLED_MIN_NONSPACE):
-    """Why `text` is glyph garbage -- 'pua', 'replacement', 'control', 'letter-soup' or 'no-words' --
+    """Why `text` is glyph garbage -- 'pua', 'replacement', 'control', 'latin1', 'letter-soup' or 'no-words' --
     or None when it reads as text. Under min_nonspace non-space characters nothing is ever garbled."""
     m = garble_metrics(text)
     if m["n"] < min_nonspace:
@@ -775,6 +786,8 @@ def garble_reason(text: str, min_nonspace: int = GARBLED_MIN_NONSPACE):
         return "replacement"
     if m["ctrl"] >= GARBLED_CTRL_SHARE and m["word"] < GARBLED_CTRL_MAX_WORDS:
         return "control"
+    if m["latin1"] >= GARBLED_LATIN1_SHARE:
+        return "latin1"
     if (
         m["single"] >= GARBLED_SOUP_SINGLES
         and m["word"] < GARBLED_SOUP_MAX_WORDS
@@ -790,7 +803,7 @@ def garble_detail(text: str) -> str:
     m = garble_metrics(text)
     return (
         f"pua {m['pua']:.0%}, U+FFFD {m['fffd']:.0%}, control {m['ctrl']:.0%}, words {m['word']:.0%}, "
-        f"single-char tokens {m['single']:.0%}, digits {m['digit']:.0%}"
+        f"single-char tokens {m['single']:.0%}, digits {m['digit']:.0%}, Latin-1 {m['latin1']:.0%}"
     )
 
 
@@ -1066,7 +1079,10 @@ def pdf_to_md(path: str) -> str:
                 text = _textlayer_page_md(doc[pno])
                 col_pages += 1
                 glued_pages += glued
-                if garble_reason(text, GARBLED_PAGE_MIN_NONSPACE):
+                bad_layer = garble_reason(text, GARBLED_PAGE_MIN_NONSPACE)
+                if bad_layer:   # the layer itself is garbage: dropped, and OCR'd like the repair below
+                    garbled.append(pno)
+                    why[bad_layer] = why.get(bad_layer, 0) + 1
                     text = ""
                 out.append(text)
                 continue

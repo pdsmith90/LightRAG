@@ -64,6 +64,23 @@ def test_garble_reason_shapes():
     assert "single-char tokens 100%" in bc.garble_detail(SOUP)
 
 
+MOJIBAKE = " ".join("ÄóÓÒeÌôbÑÃØÏ¨¯¬¥" for _ in range(80))  # a font mapped to Latin-1 codes
+FRENCH = "\n".join(
+    "Les mesures gravimétriques révèlent une déformation élastique de la croûte."
+    for _ in range(16)
+)  # accented prose stays
+DEGREES = "\n".join(
+    f"{i}° ± {i / 10:.1f} µm  {i * 3}° ± 0.{i % 9} µm" for i in range(80)
+)  # scientific symbols are not counted
+
+
+def test_latin1_shape():
+    assert bc.garble_reason(MOJIBAKE) == "latin1"
+    assert bc.garble_reason(FRENCH) is None
+    assert bc.garble_reason(DEGREES) is None
+    assert "Latin-1 88%" in bc.garble_detail(MOJIBAKE)
+
+
 def test_clean_md_strips_control_codes():
     out = bc.clean_md(
         "Intro\x00duction\x01 to the\x1f method.\n\nSecond paragraph of the text."

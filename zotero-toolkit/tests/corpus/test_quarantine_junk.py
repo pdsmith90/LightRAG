@@ -202,3 +202,22 @@ def test_glyph_garbage_shapes_are_quarantined_and_tables_are_kept(tmp_path):
     assert log["TEST0013__soup_scan.md"]["reason"] == "garbled"
     assert log["TEST0013__soup_scan.md"]["garble"] == "letter-soup"
     assert log["TEST0014__replacement_scan.md"]["garble"] == "replacement"
+
+
+def test_latin1_garbage_is_quarantined_and_accented_prose_is_kept(tmp_path):
+    corpus = tmp_path / "rag_corpus"
+    corpus.mkdir()
+    (corpus / "TEST0017__latin1_font.md").write_text(
+        " ".join("ÄóÓÒeÌôbÑÃØÏ¨¯¬¥" for _ in range(80)), encoding="utf-8"
+    )
+    (corpus / "TEST0018__french_paper.md").write_text(
+        "\n".join(
+            "Les mesures gravimétriques révèlent une déformation élastique de la croûte."
+            for _ in range(16)
+        ),
+        encoding="utf-8",
+    )
+    r = run_script("quarantine_junk.py", "--corpus", corpus)
+    assert r.returncode == 0, r.stderr
+    assert "glyph garbage (latin1)" in r.stdout
+    assert sorted(os.listdir(corpus)) == ["TEST0018__french_paper.md"]
