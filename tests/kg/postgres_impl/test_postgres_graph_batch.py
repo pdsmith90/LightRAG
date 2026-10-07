@@ -193,10 +193,11 @@ async def test_upsert_edges_batch_empty_noop():
 
 
 # ---------------------------------------------------------------------------
-# remove_nodes — all chunks in ONE transaction (all-or-nothing)
+# remove_nodes — all chunks in ONE transaction (all-or-nothing), plain SQL
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.offline
 @pytest.mark.asyncio
 async def test_remove_nodes_chunks_share_one_transaction():
     storage, cap = make_graph_storage(max_delete_records=2)
@@ -205,10 +206,67 @@ async def test_remove_nodes_chunks_share_one_transaction():
     # One transaction wraps all chunks (preserves single-statement atomicity).
     assert cap.run_count == 1
     assert cap.tx_count == 1
-    # 5 ids / cap 2 => 3 bounded IN [...] DETACH DELETE statements.
-    assert _sql_count(cap, "DETACH DELETE n") == 3
+    # 5 ids / cap 2 => 3 chunks, each an edge DELETE then a vertex DELETE,
+    # never a Cypher DETACH DELETE.
+    assert _sql_count(cap, "DETACH DELETE") == 0
+    assert [c["sql"].split()[2] for c in cap.calls] == [
+        '"test_graph"._ag_label_edge',
+        '"test_graph".base',
+    ] * 3
+    assert [c["args"] for c in cap.calls] == [
+        (["n0", "n1"],),
+        (["n0", "n1"],),
+        (["n2", "n3"],),
+        (["n2", "n3"],),
+        (["n4"],),
+        (["n4"],),
+    ]
 
 
+@pytest.mark.offline
+@pytest.mark.asyncio
+async def test_remove_nodes_binds_ids_never_interpolates():
+    """Entity ids (injection-shaped, escape-shaped or unicode) reach the server only as params."""
+    storage, cap = make_graph_storage()
+    ids = ['x"}) MATCH (m) DETACH DELETE m; //', "back\\slash", "北京"]
+
+    await storage.remove_nodes(ids)
+
+    edges_call, vertices_call = cap.calls
+    for call in (edges_call, vertices_call):
+        # Bound verbatim: no Cypher escaping of quotes or backslashes.
+        assert call["args"] == (ids,)
+        for nid in ids:
+            assert nid not in call["sql"]
+    # Edges of every label (parent table) touching a matched vertex, either end.
+    assert "e.start_id = v.id OR e.end_id = v.id" in edges_call["sql"]
+
+
+@pytest.mark.offline
+@pytest.mark.asyncio
+async def test_remove_nodes_strips_nul_bytes():
+    """NUL bytes are stripped like remove_edges does (text cannot hold one)."""
+    storage, cap = make_graph_storage()
+
+    await storage.remove_nodes(["A\x00B"])
+
+    assert [c["args"] for c in cap.calls] == [(["AB"],), (["AB"],)]
+
+
+@pytest.mark.offline
+@pytest.mark.asyncio
+async def test_delete_node_runs_the_remove_nodes_sql():
+    storage, cap = make_graph_storage()
+
+    await storage.delete_node('say "hi"')
+
+    assert cap.run_count == 1
+    assert cap.tx_count == 1
+    assert _sql_count(cap, "DETACH DELETE") == 0
+    assert [c["args"] for c in cap.calls] == [(['say "hi"'],), (['say "hi"'],)]
+
+
+@pytest.mark.offline
 @pytest.mark.asyncio
 async def test_remove_nodes_empty_noop():
     storage, cap = make_graph_storage()

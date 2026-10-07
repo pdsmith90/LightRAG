@@ -1,9 +1,9 @@
-"""PGGraphStorage.remove_edges against a live PostgreSQL + Apache AGE server.
+"""PGGraphStorage.remove_edges / remove_nodes against a live PostgreSQL + Apache AGE server.
 
-The offline tests in ``test_postgres_graph_batch.py`` pin the statement shape
-with a fake connection; this module proves the plain-SQL DELETE removes exactly
-the requested edges on a real AGE graph: both stored directions, every edge
-label, several chunks, and vertices left alone.
+The offline tests in ``test_postgres_graph_batch.py`` pin the statement shapes
+with a fake connection; this module proves the plain-SQL DELETEs remove exactly
+the requested edges, or vertices with their edges, on a real AGE graph: both
+stored directions, every edge label, several chunks, and the rest left alone.
 
 Opt in with ``--run-integration`` and the ``POSTGRES_*`` variables pointing at a
 server that has AGE preloaded, e.g. the ``apache/age`` image. The module skips
@@ -163,3 +163,56 @@ async def test_remove_edges_deletes_exactly_the_requested_pairs(graph):
         ]
     )
     assert await _vertex_count(graph) == vertices_before == len(names)
+
+
+@pytest.mark.asyncio
+async def test_remove_nodes_deletes_the_vertices_and_every_edge_touching_them(graph):
+    names = ["A", "B", "C", "D", "E", 'say "hi"', "back\\slash", "北京"]
+    for name in names:
+        await graph.upsert_node(name, _node(name))
+    stored = [
+        ("A", "B"),
+        ("C", "A"),
+        ("A", "D"),
+        ("B", "C"),
+        ("D", "B"),
+        ("E", "A"),
+        ('say "hi"', "back\\slash"),
+        ("back\\slash", "E"),
+        ("北京", "A"),
+    ]
+    await graph.upsert_edges_batch([(src, tgt, _edge()) for src, tgt in stored])
+    # A second edge label pointing INTO a removed vertex: DETACH DELETE removed
+    # edges of every label at either end, so the SQL must reach it too.
+    await graph._query(
+        f"SELECT * FROM cypher('{graph.graph_name}', $$"
+        'MATCH (b:base {entity_id: "B"}), (a:base {entity_id: "A"}) '
+        "CREATE (b)-[:OTHER]->(a)"
+        "$$) AS (r agtype)",
+        readonly=False,
+    )
+    assert len(await _edges(graph)) == len(stored) + 1
+
+    # Two ids per chunk, so the request spans two chunks of one transaction.
+    graph._max_delete_records_per_batch = 2
+    await graph.remove_nodes(["A", 'say "hi"', "北京", "missing"])
+
+    assert await _edges(graph) == sorted(
+        [
+            ("B", "C", "DIRECTED"),
+            ("D", "B", "DIRECTED"),
+            ("back\\slash", "E", "DIRECTED"),
+        ]
+    )
+    assert await _vertex_count(graph) == len(names) - 3
+    # Cypher reads see the SQL removal. (get_node_edges is the Cypher read
+    # here; has_node and the batch reads interpolate the graph name unquoted
+    # and cannot reach this mixed-case graph.)
+    assert sorted(await graph.get_node_edges("B")) == [("B", "C"), ("B", "D")]
+    assert await graph.get_node_edges("E") == [("E", "back\\slash")]
+
+    await graph.delete_node("back\\slash")
+
+    assert await _edges(graph) == [("B", "C", "DIRECTED"), ("D", "B", "DIRECTED")]
+    assert await _vertex_count(graph) == len(names) - 4
+    assert await graph.get_node_edges("E") == []

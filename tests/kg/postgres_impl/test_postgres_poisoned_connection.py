@@ -1,11 +1,11 @@
 """A pooled connection whose server messages asyncpg cannot decode is discarded and
 the operation retried on a fresh one.
 
-Apache AGE with a corrupted per-backend label cache answers ``DETACH DELETE`` with
-``relation "<graph>.<garbage>" does not exist`` whose garbage is not UTF-8; asyncpg
-then raises ``UnicodeDecodeError`` from its protocol decoder and the PostgresError is
-lost. The fault follows the backend, so ``_run_with_retry`` terminates that one
-connection and retries, without resetting the whole pool."""
+Apache AGE below 1.8.0 can answer a Cypher ``DELETE`` with ``relation
+"<graph>.<garbage>" does not exist`` whose garbage is not UTF-8; asyncpg then raises
+``UnicodeDecodeError`` from its protocol decoder and the PostgresError is lost.
+``_run_with_retry`` terminates that one connection and retries, without resetting
+the whole pool."""
 
 import asyncio
 from unittest.mock import AsyncMock
