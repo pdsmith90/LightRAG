@@ -731,7 +731,9 @@ _ctrl_re = re.compile(
 )  # C0 controls except \t \n \r, plus DEL
 _word_re = re.compile(r"[^\W\d_]{4,}")  # runs of letters in any script
 # C1 controls + Latin-1 letters and symbols, except the ones science uses (° ± µ · × ÷ ² ³ ¹ ¼ ½ ¾)
-_latin1_re = re.compile(r"[\u0080-\u00af\u00b4\u00b6\u00b8\u00ba\u00bb\u00bf-\u00d6\u00d8-\u00f6\u00f8-\u00ff]")
+_latin1_re = re.compile(
+    r"[\u0080-\u00af\u00b4\u00b6\u00b8\u00ba\u00bb\u00bf-\u00d6\u00d8-\u00f6\u00f8-\u00ff]"
+)
 
 
 def pua_share(text: str) -> float:
@@ -877,7 +879,9 @@ def _image_only_doc(doc) -> tuple[bool, int, int]:
     return (bool(idx) and hits / len(idx) >= 0.5), hits, len(idx)
 
 
-OCR_LAYER_FONTS = {"GlyphLessFont"}   # the invisible font of ocrmypdf / Tesseract text layers (hocr and sandwich renderers)
+OCR_LAYER_FONTS = {
+    "GlyphLessFont"
+}  # the invisible font of ocrmypdf / Tesseract text layers (hocr and sandwich renderers)
 OCR_LAYER_SHARE = 0.9
 
 
@@ -897,9 +901,13 @@ def _ocr_layer_page(page) -> bool:
     return total > 0 and ocr >= OCR_LAYER_SHARE * total
 
 
-COLUMN_MIN_PAIRS = 8          # consecutive left-column line pairs needed before a page's order is judged
-COLUMN_MIN_SUCCESSION = 0.5   # below this share of pairs kept adjacent, the engine merged the two columns
-                              # (interleaved pages measure 0.00-0.46; title and table pages reach 0.56, typeset prose 0.70+)
+COLUMN_MIN_PAIRS = (
+    8  # consecutive left-column line pairs needed before a page's order is judged
+)
+COLUMN_MIN_SUCCESSION = (
+    0.5  # below this share of pairs kept adjacent, the engine merged the two columns
+)
+# (interleaved pages measure 0.00-0.46; title and table pages reach 0.56, typeset prose 0.70+)
 
 
 def _two_column_lines(page):
@@ -930,7 +938,9 @@ def _wordy(tokens) -> bool:
     """A three-token line end or start is usable for the succession test when it carries real words:
     >= 8 alphanumerics and a token of >= 4 letters (equations and variable names match anywhere)."""
     joined = "".join(tokens)
-    return sum(c.isalnum() for c in joined) >= 8 and any(len(re.sub(r"[^a-zA-Z]", "", t)) >= 4 for t in tokens)
+    return sum(c.isalnum() for c in joined) >= 8 and any(
+        len(re.sub(r"[^a-zA-Z]", "", t)) >= 4 for t in tokens
+    )
 
 
 def _succession(engine_text: str, lines) -> tuple:
@@ -954,7 +964,7 @@ def _succession(engine_text: str, lines) -> tuple:
     return kept, pairs
 
 
-WORDS_MIN_LAYER = 30     # distinct text-layer words (>= 4 letters) a page needs before its word recall is judged
+WORDS_MIN_LAYER = 30  # distinct text-layer words (>= 4 letters) a page needs before its word recall is judged
 WORDS_MIN_RECALL = 0.45  # below this share of them surviving as whole words, the engine glued the words together
 
 
@@ -966,10 +976,16 @@ def _words_glued(engine_text: str, page) -> bool:
     the line ORDER keeps every word. Measured 2026-10-06 on 5,286 typeset pages the garble and text-layer
     repairs leave alone: such pages 0.18-0.41; below 0.45 otherwise only garbage layers, a code listing and an
     OCR'd table (a re-read changes little); figure pages with a publisher banner 0.45-0.48; tables, reference lists, math 0.5-0.8; prose 0.8+."""
-    layer = {w for w in (re.sub(r"[^a-z]", "", x[4].lower()) for x in page.get_text("words")) if len(w) >= 4}
+    layer = {
+        w
+        for w in (re.sub(r"[^a-z]", "", x[4].lower()) for x in page.get_text("words"))
+        if len(w) >= 4
+    }
     if len(layer) < WORDS_MIN_LAYER:
         return False
-    return len(layer & set(re.findall(r"[a-z]+", engine_text.lower()))) < WORDS_MIN_RECALL * len(layer)
+    return len(
+        layer & set(re.findall(r"[a-z]+", engine_text.lower()))
+    ) < WORDS_MIN_RECALL * len(layer)
 
 
 def _columns_merged(engine_text: str, page) -> bool:
@@ -1071,7 +1087,9 @@ def pdf_to_md(path: str) -> str:
                 out.append(text)
                 continue
             bad = garble_reason(text, GARBLED_PAGE_MIN_NONSPACE)
-            glued = not bad and _words_glued(text, doc[pno])   # glyph garbage keeps its own repair + OCR route below
+            glued = not bad and _words_glued(
+                text, doc[pno]
+            )  # glyph garbage keeps its own repair + OCR route below
             if glued or _columns_merged(text, doc[pno]):
                 # 2026-10-06: the same merge from a typeset layer (other OCR engines' fonts, odd layouts):
                 # the engine lost the left column's line order, or glued the columns word into word, so the
@@ -1080,7 +1098,7 @@ def pdf_to_md(path: str) -> str:
                 col_pages += 1
                 glued_pages += glued
                 bad_layer = garble_reason(text, GARBLED_PAGE_MIN_NONSPACE)
-                if bad_layer:   # the layer itself is garbage: dropped, and OCR'd like the repair below
+                if bad_layer:  # the layer itself is garbage: dropped, and OCR'd like the repair below
                     garbled.append(pno)
                     why[bad_layer] = why.get(bad_layer, 0) + 1
                     text = ""
@@ -1102,6 +1120,22 @@ def pdf_to_md(path: str) -> str:
             out.append(text)
         doc.close()
         md = "".join(out)
+        if (
+            ocr_pages
+            and ocr_pages >= OCR_PARTIAL_MAX_SHARE * max(len(chunks), 1)
+            and CFG.get("ocr_vlm") == "auto"
+            and CFG.get("ocr", "auto") in ("auto", "force")
+        ):
+            # 2026-10-07: a Tesseract layer is the floor, not the ceiling -- the VLM reads the scan itself.
+            vlm = vlm_ocr_pdf_to_md(path)
+            if vlm and not garble_reason(vlm):
+                _pdf_method = "pdf+vlmocr"
+                print(
+                    f"[build_corpus] OCR-LAYER {name}: {ocr_pages}/{len(chunks)} Tesseract-layer page(s) "
+                    f"re-OCR'd by {OCR_VLM_MODEL} ({_ocr_backend})",
+                    flush=True,
+                )
+                return clean_md(vlm)
         if repaired:
             _pdf_method = "pdf+textlayer"
             print(
@@ -1123,7 +1157,8 @@ def pdf_to_md(path: str) -> str:
                 _pdf_method = "pdf+columns"
             print(
                 f"[build_corpus] COLUMNS {name}: {col_pages}/{len(chunks)} two-column page(s) re-read from their "
-                f"blocks (pymupdf4llm merged the columns" + (f"; {glued_pages} glued word into word)" if glued_pages else ")"),
+                f"blocks (pymupdf4llm merged the columns"
+                + (f"; {glued_pages} glued word into word)" if glued_pages else ")"),
                 flush=True,
             )
         if garbled:
@@ -1163,6 +1198,195 @@ OCR_PARTIAL_MAX_SHARE = (
 )
 
 
+# ---------- VLM OCR (2026-10-07): PepperOCR-VL turns a page image into Markdown with LaTeX math ----------
+# Screened 2026-10-06 on six Tesseract-OCR'd pages: correct two-column reading order (the Tesseract layer
+# interleaves the columns), display and inline LaTeX, word precision 0.84-0.98 against the Tesseract text.
+# Whole-document OCR only: image-only PDFs, majority-garbled PDFs and majority-OCR-layer scans; the partial
+# `--pages` route stays on ocrmypdf. A page failure abandons the VLM for that document (never a mixed-engine
+# document) and the ocrmypdf path runs exactly as before. `--ocr-vlm off` disables all of it, and the route is
+# active only when CFG carries ocr_vlm == "auto" (main() sets it): a test that builds CFG by hand never reaches a
+# server -- on 2026-10-07 the old tests transcribed their synthetic PDFs through the live alias on :18000.
+OCR_VLM_LOCAL_URL = os.environ.get("OCR_VLM_LOCAL_URL", "http://127.0.0.1:19530")
+OCR_VLM_REMOTE_URL = os.environ.get("OCR_VLM_REMOTE_URL", "http://127.0.0.1:18000")
+OCR_VLM_MODEL = os.environ.get("OCR_VLM_MODEL", "pepperocr-vl")
+OCR_VLM_REMOTE_QUIET = os.environ.get(
+    "OCR_VLM_REMOTE_QUIET", "01:30-08:45"
+)  # the remote GPU's cron night (llm_failover.py's window)
+OCR_VLM_LOCAL_START = os.environ.get(
+    "OCR_VLM_LOCAL_START",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "ocr_server.sh"),
+)
+OCR_VLM_DPI = int(os.environ.get("OCR_VLM_DPI", "130"))
+OCR_VLM_MAX_SIDE = 1800  # px; the screened pages were 780-1105 x 1170-1521 at 130 dpi
+OCR_VLM_MAX_TOKENS = 6000
+OCR_VLM_PAGE_TIMEOUT_S = 300
+OCR_VLM_PROMPT = (  # the model card's instruction, verbatim; the model was tuned on it
+    "You are an advanced hybrid OCR engine capable of processing multilingual text mixed with mathematical "
+    "notation. Your goal is to transcribe the content with high fidelity.Strict Rules: 1. Multilingual Precision: "
+    "Transcribe text exactly as it appears in the original language. Do not translate, summarize, or correct "
+    "original spelling errors. 2. Math Formatting: Identify all mathematical expressions and convert them into "
+    "LaTeX. 3. Use single dollar signs ($x$) for inline math (formulas within a sentence). 4. Use double dollar "
+    "signs ($$x$$) for display math (standalone formulas on their own lines). 5. Layout & Structure: Use Markdown "
+    "to preserve the visual structure (headers, paragraphs, lists). 6. Output Only: Output the transcribed text "
+    "directly without any conversational filler."
+)
+_ocr_backend = ""  # "vlm:local" / "vlm:remote" / "ocrmypdf": what the last OCR used (convert() names the method)
+_vlm_endpoint_cache = None  # per worker process
+
+
+def _vlm_quiet(now=None) -> bool:
+    """True inside OCR_VLM_REMOTE_QUIET ("HH:MM-HH:MM", may wrap midnight)."""
+    spec = OCR_VLM_REMOTE_QUIET
+    if not spec or "-" not in spec:
+        return False
+    try:
+        a, b = spec.split("-")
+        h1, m1 = map(int, a.split(":"))
+        h2, m2 = map(int, b.split(":"))
+    except ValueError:
+        return False
+    lt = time.localtime(now) if now is not None else time.localtime()
+    t, lo, hi = lt.tm_hour * 60 + lt.tm_min, h1 * 60 + m1, h2 * 60 + m2
+    return lo <= t < hi if lo <= hi else (t >= lo or t < hi)
+
+
+def _vlm_alive(base: str, timeout: float = 3.0) -> bool:
+    """The server at `base` lists OCR_VLM_MODEL (llama-swap or a llama-server started with -a)."""
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(
+            base.rstrip("/") + "/v1/models", timeout=timeout
+        ) as r:
+            ids = {m.get("id") for m in (json.load(r).get("data") or [])}
+        return OCR_VLM_MODEL in ids
+    except Exception:
+        return False
+
+
+def _vlm_endpoint():
+    """(kind, base_url) of a usable OCR server, cached per process: the local one, the remote one outside its
+    quiet window, or the local one after starting it (ocr_server.sh start --for-build, which supplants the RAG
+    model). ("", "") when none."""
+    global _vlm_endpoint_cache
+    if _vlm_endpoint_cache is not None:
+        return _vlm_endpoint_cache
+    found = ("", "")
+    if _vlm_alive(OCR_VLM_LOCAL_URL):
+        found = ("local", OCR_VLM_LOCAL_URL)
+    elif OCR_VLM_REMOTE_URL and not _vlm_quiet() and _vlm_alive(OCR_VLM_REMOTE_URL):
+        found = ("remote", OCR_VLM_REMOTE_URL)
+    elif OCR_VLM_LOCAL_START and os.access(OCR_VLM_LOCAL_START, os.X_OK):
+        try:
+            subprocess.run(
+                [OCR_VLM_LOCAL_START, "start", "--for-build"],
+                check=True,
+                timeout=900,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            if _vlm_alive(OCR_VLM_LOCAL_URL, 10.0):
+                found = ("local", OCR_VLM_LOCAL_URL)
+        except Exception as e:
+            print(
+                f"[build_corpus] WARN: could not start the local OCR server ({type(e).__name__}: {str(e)[:80]})",
+                flush=True,
+            )
+    _vlm_endpoint_cache = found
+    return found
+
+
+def _vlm_ocr_page(base: str, png: bytes) -> str:
+    """One page image -> Markdown. Raises on any non-success (the caller abandons the VLM for the document)."""
+    import base64, urllib.request
+
+    body = {
+        "model": OCR_VLM_MODEL,
+        "temperature": 0,
+        "repeat_penalty": 1.05,
+        "max_tokens": OCR_VLM_MAX_TOKENS,
+        "chat_template_kwargs": {"enable_thinking": False},
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "data:image/png;base64,"
+                            + base64.b64encode(png).decode()
+                        },
+                    },
+                    {"type": "text", "text": OCR_VLM_PROMPT},
+                ],
+            }
+        ],
+    }
+    req = urllib.request.Request(
+        base.rstrip("/") + "/v1/chat/completions",
+        json.dumps(body).encode(),
+        {"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=OCR_VLM_PAGE_TIMEOUT_S) as r:
+        d = json.load(r)
+    ch = (d.get("choices") or [{}])[0]
+    text = ((ch.get("message") or {}).get("content") or "").strip()
+    if ch.get("finish_reason") != "stop" or not text:
+        raise RuntimeError(f"finish_reason={ch.get('finish_reason')} chars={len(text)}")
+    return text
+
+
+def vlm_ocr_pdf_to_md(path: str) -> str:
+    """Whole-document OCR through the VLM: every page rendered at OCR_VLM_DPI and transcribed in order.
+    "" when no server is usable or any page fails (the caller falls back to ocrmypdf)."""
+    global _ocr_backend
+    kind, base = _vlm_endpoint()
+    if not base:
+        return ""
+    import pymupdf
+
+    name = os.path.basename(path)
+    parts: list[str] = []
+    t0 = time.time()
+    try:
+        with pymupdf.open(path) as doc:
+            n = doc.page_count
+            for i in range(n):
+                page = doc[i]
+                dpi = OCR_VLM_DPI
+                side = max(page.rect.width, page.rect.height) * dpi / 72.0
+                if side > OCR_VLM_MAX_SIDE:
+                    dpi = max(60, int(dpi * OCR_VLM_MAX_SIDE / side))
+                parts.append(
+                    _vlm_ocr_page(base, page.get_pixmap(dpi=dpi).tobytes("png"))
+                )
+    except Exception as e:
+        print(
+            f"[build_corpus] WARN: VLM OCR abandoned on {name} after {len(parts)} page(s) "
+            f"({type(e).__name__}: {str(e)[:120]}) -> ocrmypdf",
+            flush=True,
+        )
+        return ""
+    _ocr_backend = "vlm:" + kind
+    print(
+        f"[build_corpus] VLM-OCR {name}: {n} page(s) via {OCR_VLM_MODEL} ({kind}) in {time.time() - t0:.0f} s",
+        flush=True,
+    )
+    return "\n\n".join(parts)
+
+
+def _vlm_local_stop() -> None:
+    """End of a build: stop the local OCR server if this build started it (ocr_server.sh keeps the marker)."""
+    if OCR_VLM_LOCAL_START and os.access(OCR_VLM_LOCAL_START, os.X_OK):
+        subprocess.run(
+            [OCR_VLM_LOCAL_START, "stop", "--if-build"],
+            timeout=120,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+
+
 OCRMYPDF_ENCRYPTED = 8  # ocrmypdf's exit code for an encrypted input, even one that opens without a password
 
 
@@ -1176,8 +1400,11 @@ def _decrypted_copy(path: str, tmpdir: str) -> str:
             pdf.save(out)
         return out
     except Exception as e:
-        print(f"[build_corpus] WARN: could not decrypt {os.path.basename(path)} "
-              f"({type(e).__name__}: {str(e)[:80]})", flush=True)
+        print(
+            f"[build_corpus] WARN: could not decrypt {os.path.basename(path)} "
+            f"({type(e).__name__}: {str(e)[:80]})",
+            flush=True,
+        )
         return ""
 
 
@@ -1200,6 +1427,22 @@ def ocr_pdf_to_md(path: str, pages=None) -> str:
     `pages` (0-based) limits the OCR to those pages when they are a minority of the document
     (2026-10-06: a PDF whose glyph garbage sits on a few pages keeps its real text layer everywhere
     else); the time limit scales with the number of pages OCR'd."""
+    global _ocr_backend
+    _ocr_backend = ""
+    if CFG.get("ocr_vlm") == "auto":
+        n_vlm = 0
+        try:
+            import pymupdf
+
+            with pymupdf.open(path) as d:
+                n_vlm = d.page_count
+        except Exception:
+            pass
+        if not pages or (n_vlm and len(set(pages)) >= OCR_PARTIAL_MAX_SHARE * n_vlm):
+            md = vlm_ocr_pdf_to_md(path)
+            if md and not garble_reason(md):
+                return md
+    _ocr_backend = "ocrmypdf"
     if not shutil.which("ocrmypdf"):
         return ""
     n_pages = 0
@@ -1229,7 +1472,10 @@ def ocr_pdf_to_md(path: str, pages=None) -> str:
                 plain = _decrypted_copy(path, td)
                 if not plain:
                     raise
-                print(f"[build_corpus] DECRYPTED {os.path.basename(path)} for OCR", flush=True)
+                print(
+                    f"[build_corpus] DECRYPTED {os.path.basename(path)} for OCR",
+                    flush=True,
+                )
                 subprocess.run(args + [plain, out], check=True, timeout=timeout)
             return pdf_to_md(out)
         except Exception as e:
@@ -1429,8 +1675,11 @@ def convert(key: str):
         if why:
             # 2026-10-06: an HTML page or an empty file behind a .pdf name used to become a header-only
             # document after a pointless OCR attempt; it now writes nothing and names itself in the log.
-            print(f"[build_corpus] NOT A PDF {key}: {os.path.basename(src)[:60]} ({why}) -> skipped; "
-                  f"fetch the real PDF", flush=True)
+            print(
+                f"[build_corpus] NOT A PDF {key}: {os.path.basename(src)[:60]} ({why}) -> skipped; "
+                f"fetch the real PDF",
+                flush=True,
+            )
             return (key, "not_a_pdf", "", 0)
 
     stem = os.path.splitext(os.path.basename(src))[0]
@@ -1516,6 +1765,8 @@ def convert(key: str):
                 )
                 if ocr:
                     body = ocr
+                    if _ocr_backend.startswith("vlm"):
+                        method = "pdf+vlmocr"
                 elif pre and os.path.exists(pre):
                     body, method = txt_to_md(pre), "pdf+ocr_cache"
                 elif CFG["ocr"] in ("auto", "force"):
@@ -1535,7 +1786,11 @@ def convert(key: str):
                     if ocr and not garble_reason(ocr):
                         body = ocr
                         method = (
-                            "pdf+ocr"
+                            (
+                                "pdf+vlmocr"
+                                if _ocr_backend.startswith("vlm")
+                                else "pdf+ocr"
+                            )
                             if len(bad_pages) >= OCR_PARTIAL_MAX_SHARE * _pdf_page_count
                             else "pdf+ocr_pages"
                         )
@@ -1621,6 +1876,13 @@ def main():
         help="auto/force = run ocrmypdf on image-only PDFs; off = only reuse --ocr-cache-dir.",
     )
     ap.add_argument(
+        "--ocr-vlm",
+        choices=["auto", "off"],
+        default="auto",
+        help="auto = whole-document OCR through the VLM (PepperOCR-VL) when a server is usable, "
+        "ocrmypdf otherwise; off = ocrmypdf only.",
+    )
+    ap.add_argument(
         "--min-chars",
         type=int,
         default=200,
@@ -1684,6 +1946,7 @@ def main():
         "out": a.out,
         "force": a.force,
         "ocr": a.ocr,
+        "ocr_vlm": a.ocr_vlm,
         "min_chars": a.min_chars,
         "deny": deny,
         "held": a.held_dir,
@@ -1692,7 +1955,7 @@ def main():
     }
     print(
         f"[build_corpus] {len(keys)} storage folders -> {a.out}  "
-        f"(jobs={a.jobs}, ocr={a.ocr}, denylist={len(deny)})",
+        f"(jobs={a.jobs}, ocr={a.ocr}, ocr_vlm={a.ocr_vlm}, denylist={len(deny)})",
         flush=True,
     )
 
@@ -1726,6 +1989,7 @@ def main():
                     flush=True,
                 )
     manifest.close()
+    _vlm_local_stop()
     print("\n[done] methods:", json.dumps(counts, indent=2))
     need = counts.get("pdf_needs_ocr", 0)
     if need:

@@ -206,6 +206,39 @@ def _reserved(now=None):
 # YIELD_HOLD_S (a queued load swaps in during that gap), then re-reads /running uncached. A
 # waiting load then waits at most ~YIELD_EVERY_S + one call; the fallback keeps working
 # throughout. Applies to guarded SHARED_MODELS. YIELD_EVERY_S=0 (default) disables.
+# ---- local lane pause (2026-10-07) ----------------------------------------------------------------
+# ocr_server.sh writes an epoch second ("paused until") into PAUSE_FILE while the OCR model (PepperOCR-VL)
+# holds the VM's GPU in place of the ollama 7b -- the two do not fit the card together (operator decision 2026-10-07: "the
+# ocr model can supplant the rag model if ocr is needed"). While the file is set the local lane takes NO new
+# calls: shared-model calls use the primary when it is allowed, and anything else bound for ollama gets a 503 so
+# LightRAG retries later instead of waking the 7b under the OCR model. Deleting the file resumes the lane.
+PAUSE_FILE = os.environ.get(
+    "LLM_FO_LOCAL_PAUSE_FILE",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), ".local_llm_paused"),
+)
+_pause_cache = (0.0, 0)  # (checked_at, until_epoch)
+
+
+def _local_paused_until():
+    """Epoch second the local lane is paused until (0 = not paused), re-read at most once a second."""
+    global _pause_cache
+    now = time.time()
+    if now - _pause_cache[0] < 1.0:
+        return _pause_cache[1]
+    until = 0
+    try:
+        with open(PAUSE_FILE) as f:
+            until = int(float(f.read().strip() or 0))
+    except (OSError, ValueError):
+        until = 0
+    _pause_cache = (now, until)
+    return until
+
+
+def _local_paused(now=None):
+    return (time.time() if now is None else now) < _local_paused_until()
+
+
 YIELD_EVERY_S = float(os.environ.get("LLM_FO_YIELD_EVERY_S", "0"))
 YIELD_HOLD_S = float(os.environ.get("LLM_FO_YIELD_HOLD_S", "3"))
 YIELD_MAX_S = float(
@@ -754,6 +787,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 )
 
         # ---- fallback: ollama's native /api/chat translated to the OpenAI schema, or OpenAI as-is ----
+        if _local_paused():
+            _log(
+                f"local {tag} PAUSED until {time.strftime('%H:%M', time.localtime(_local_paused_until()))} "
+                f"(the OCR model holds the GPU) -> 503"
+            )
+            self._send(
+                503,
+                json.dumps(
+                    {
+                        "error": "local LLM lane paused: the OCR model holds the GPU; retry later"
+                    }
+                ).encode(),
+            )
+            return
         with _slot("fallback"):
             t1 = time.time()
             note = f" ({why_fallback})" if why_fallback else ""
