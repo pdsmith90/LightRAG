@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Behavioural tests for build_corpus's column-sanity gate (2026-10-06).
 Run:  .venv/bin/python test_build_corpus_columns.py     (plain asserts; pytest also collects it)
-A two-column page whose engine text lost the left column's line order is re-read from its blocks, whatever
-font the layer uses; a page the engine read correctly, or one with too few lines to judge, is left alone.
+A two-column page whose engine text lost the left column's line order, or glued the columns word into word,
+is re-read from its blocks, whatever font the layer uses; a page the engine read correctly, or one with too
+few lines or words to judge, is left alone.
 Synthetic PDFs via pymupdf; pymupdf4llm replaced by a fake; all text is invented."""
 import contextlib, io, os, sys, tempfile
 
@@ -44,6 +45,8 @@ RIGHT = [
 ]
 INTERLEAVED = "\n\n".join(f"{a} {b}" for a, b in zip(LEFT, RIGHT))
 CORRECT = "\n\n".join(LEFT + RIGHT)
+# the columns glued word into word (Mascons 1968: "tainedinsufficient74 setsdata)(of ofthenormalized80")
+GLUED = "\n\n".join(" ".join(x + y for x, y in zip(a.split(), b.split())) for a, b in zip(LEFT, RIGHT))
 
 
 def two_column_pdf(path, left, right, single=False):
@@ -100,6 +103,34 @@ def test_correct_engine_order_is_kept():
         two_column_pdf(p, LEFT, RIGHT)
         md, log = run(p, [CORRECT])
         assert md == bc.clean_md(CORRECT) and "COLUMNS" not in log and bc._pdf_method == ""
+
+
+def test_glued_columns_are_re_read_from_blocks():
+    with tempfile.TemporaryDirectory() as td:
+        p = os.path.join(td, "paper.pdf")
+        two_column_pdf(p, LEFT, RIGHT)
+        with pymupdf.open(p) as doc:
+            assert bc._words_glued(GLUED, doc[0])
+            assert not bc._columns_merged(GLUED, doc[0])                   # the succession test finds no pairs
+        md, log = run(p, [GLUED])
+        pos = [md.index(line) for line in LEFT + RIGHT]
+        assert max(pos[:12]) < min(pos[12:]), md
+        assert "COLUMNS paper.pdf: 1/1 two-column page(s)" in log and "1 glued word into word" in log, log
+        assert bc._pdf_method == "pdf+columns"
+
+
+def test_word_recall_spares_correct_and_order_merged_text():
+    with tempfile.TemporaryDirectory() as td:
+        p = os.path.join(td, "paper.pdf")
+        two_column_pdf(p, LEFT, RIGHT)
+        with pymupdf.open(p) as doc:
+            assert not bc._words_glued(CORRECT, doc[0])
+            assert not bc._words_glued(INTERLEAVED, doc[0])                 # order lost, every word kept
+        s = os.path.join(td, "short.pdf")
+        two_column_pdf(s, LEFT[:1], RIGHT[:1])                               # 15 distinct words < WORDS_MIN_LAYER
+        glued = "\n\n".join(" ".join(x + y for x, y in zip(a.split(), b.split())) for a, b in zip(LEFT[:1], RIGHT[:1]))
+        with pymupdf.open(s) as doc:
+            assert not bc._words_glued(glued, doc[0])
 
 
 def test_too_few_pairs_are_not_judged():

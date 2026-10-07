@@ -941,6 +941,24 @@ def _succession(engine_text: str, lines) -> tuple:
     return kept, pairs
 
 
+WORDS_MIN_LAYER = 30     # distinct text-layer words (>= 4 letters) a page needs before its word recall is judged
+WORDS_MIN_RECALL = 0.45  # below this share of them surviving as whole words, the engine glued the words together
+
+
+def _words_glued(engine_text: str, page) -> bool:
+    """True when the engine's page text lost most of the text layer's words as whole tokens: pymupdf4llm glued
+    the columns of a page word into word ("tainedinsufficient74 setsdata)(of ofthenormalized80", Mascons 1968
+    p.4, three columns) or dropped every space ("terminedoneaftertheother", some scanned journals). The
+    succession test cannot see this -- it never finds the line ends it compares -- and a merge that only loses
+    the line ORDER keeps every word. Measured 2026-10-06 on 5,286 typeset pages the garble and text-layer
+    repairs leave alone: such pages 0.18-0.41; below 0.45 otherwise only garbage layers, a code listing and an
+    OCR'd table (a re-read changes little); figure pages with a publisher banner 0.45-0.48; tables, reference lists, math 0.5-0.8; prose 0.8+."""
+    layer = {w for w in (re.sub(r"[^a-z]", "", x[4].lower()) for x in page.get_text("words")) if len(w) >= 4}
+    if len(layer) < WORDS_MIN_LAYER:
+        return False
+    return len(layer & set(re.findall(r"[a-z]+", engine_text.lower()))) < WORDS_MIN_RECALL * len(layer)
+
+
 def _columns_merged(engine_text: str, page) -> bool:
     """True when the page has two columns and the engine's text lost the left column's line order
     (measured 2026-10-06: OCR-layer pages 0.00-0.46 of their pairs kept, typeset two-column prose 0.70-1.00,
@@ -1005,7 +1023,7 @@ def pdf_to_md(path: str) -> str:
         out: list[str] = []
         repaired = regained = total = kept = 0
         ocr_pages = ocr_soup = 0
-        col_pages = 0
+        col_pages = glued_pages = 0
         garbled: list[int] = []
         why: dict[str, int] = {}
         _pdf_page_count = doc.page_count
@@ -1039,16 +1057,19 @@ def pdf_to_md(path: str) -> str:
                     text = ""
                 out.append(text)
                 continue
-            if _columns_merged(text, doc[pno]):
+            bad = garble_reason(text, GARBLED_PAGE_MIN_NONSPACE)
+            glued = not bad and _words_glued(text, doc[pno])   # glyph garbage keeps its own repair + OCR route below
+            if glued or _columns_merged(text, doc[pno]):
                 # 2026-10-06: the same merge from a typeset layer (other OCR engines' fonts, odd layouts):
-                # the engine lost the left column's line order, so the page is read from its blocks.
+                # the engine lost the left column's line order, or glued the columns word into word, so the
+                # page is read from its blocks.
                 text = _textlayer_page_md(doc[pno])
                 col_pages += 1
+                glued_pages += glued
                 if garble_reason(text, GARBLED_PAGE_MIN_NONSPACE):
                     text = ""
                 out.append(text)
                 continue
-            bad = garble_reason(text, GARBLED_PAGE_MIN_NONSPACE)
             if bad or (
                 layer >= TEXTLAYER_PAGE_MIN and got < TEXTLAYER_PAGE_KEEP * layer
             ):
@@ -1086,7 +1107,7 @@ def pdf_to_md(path: str) -> str:
                 _pdf_method = "pdf+columns"
             print(
                 f"[build_corpus] COLUMNS {name}: {col_pages}/{len(chunks)} two-column page(s) re-read from their "
-                f"blocks (pymupdf4llm merged the columns)",
+                f"blocks (pymupdf4llm merged the columns" + (f"; {glued_pages} glued word into word)" if glued_pages else ")"),
                 flush=True,
             )
         if garbled:
