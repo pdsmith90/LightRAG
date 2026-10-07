@@ -5,7 +5,13 @@ A two-column page whose engine text lost the left column's line order, or glued 
 is re-read from its blocks, whatever font the layer uses; a page the engine read correctly, or one with too
 few lines or words to judge, is left alone.
 Synthetic PDFs via pymupdf; pymupdf4llm replaced by a fake; all text is invented."""
-import contextlib, io, itertools, os, sys, tempfile
+
+import contextlib
+import io
+import itertools
+import os
+import sys
+import tempfile
 
 try:
     import corpus_testlib  # noqa: F401  -- fork layout
@@ -46,7 +52,9 @@ RIGHT = [
 INTERLEAVED = "\n\n".join(f"{a} {b}" for a, b in zip(LEFT, RIGHT))
 CORRECT = "\n\n".join(LEFT + RIGHT)
 # the columns glued word into word (Mascons 1968: "tainedinsufficient74 setsdata)(of ofthenormalized80")
-GLUED = "\n\n".join(" ".join(x + y for x, y in zip(a.split(), b.split())) for a, b in zip(LEFT, RIGHT))
+GLUED = "\n\n".join(
+    " ".join(x + y for x, y in zip(a.split(), b.split())) for a, b in zip(LEFT, RIGHT)
+)
 
 
 def two_column_pdf(path, left, right, single=False):
@@ -78,11 +86,13 @@ def test_two_column_lines_and_succession():
         assert bc._succession(CORRECT, lines) == (11, 11)
         kept, pairs = bc._succession(INTERLEAVED, lines)
         assert pairs == 11 and kept == 0, (kept, pairs)
-        assert bc._columns_merged(INTERLEAVED, pymupdf.open(p)[0]) and not bc._columns_merged(CORRECT, pymupdf.open(p)[0])
+        assert bc._columns_merged(
+            INTERLEAVED, pymupdf.open(p)[0]
+        ) and not bc._columns_merged(CORRECT, pymupdf.open(p)[0])
         s = os.path.join(td, "single.pdf")
         two_column_pdf(s, LEFT, RIGHT, single=True)
         with pymupdf.open(s) as doc:
-            assert bc._two_column_lines(doc[0]) is None                  # one column: never judged
+            assert bc._two_column_lines(doc[0]) is None  # one column: never judged
 
 
 def test_merged_columns_are_re_read_from_blocks():
@@ -91,7 +101,7 @@ def test_merged_columns_are_re_read_from_blocks():
         two_column_pdf(p, LEFT, RIGHT)
         md, log = run(p, [INTERLEAVED])
         pos = [md.index(line) for line in LEFT + RIGHT]
-        assert max(pos[:12]) < min(pos[12:]), md                           # the whole left column first
+        assert max(pos[:12]) < min(pos[12:]), md  # the whole left column first
         assert not any(f"{a} {b}" in md for a, b in zip(LEFT, RIGHT))
         assert "COLUMNS paper.pdf: 1/1 two-column page(s)" in log, log
         assert bc._pdf_method == "pdf+columns" and bc._pdf_garbled_pages == []
@@ -102,7 +112,9 @@ def test_correct_engine_order_is_kept():
         p = os.path.join(td, "paper.pdf")
         two_column_pdf(p, LEFT, RIGHT)
         md, log = run(p, [CORRECT])
-        assert md == bc.clean_md(CORRECT) and "COLUMNS" not in log and bc._pdf_method == ""
+        assert (
+            md == bc.clean_md(CORRECT) and "COLUMNS" not in log and bc._pdf_method == ""
+        )
 
 
 def test_glued_columns_are_re_read_from_blocks():
@@ -111,11 +123,16 @@ def test_glued_columns_are_re_read_from_blocks():
         two_column_pdf(p, LEFT, RIGHT)
         with pymupdf.open(p) as doc:
             assert bc._words_glued(GLUED, doc[0])
-            assert not bc._columns_merged(GLUED, doc[0])                   # the succession test finds no pairs
+            assert not bc._columns_merged(
+                GLUED, doc[0]
+            )  # the succession test finds no pairs
         md, log = run(p, [GLUED])
         pos = [md.index(line) for line in LEFT + RIGHT]
         assert max(pos[:12]) < min(pos[12:]), md
-        assert "COLUMNS paper.pdf: 1/1 two-column page(s)" in log and "1 glued word into word" in log, log
+        assert (
+            "COLUMNS paper.pdf: 1/1 two-column page(s)" in log
+            and "1 glued word into word" in log
+        ), log
         assert bc._pdf_method == "pdf+columns"
 
 
@@ -125,37 +142,50 @@ def test_word_recall_spares_correct_and_order_merged_text():
         two_column_pdf(p, LEFT, RIGHT)
         with pymupdf.open(p) as doc:
             assert not bc._words_glued(CORRECT, doc[0])
-            assert not bc._words_glued(INTERLEAVED, doc[0])                 # order lost, every word kept
+            assert not bc._words_glued(
+                INTERLEAVED, doc[0]
+            )  # order lost, every word kept
         s = os.path.join(td, "short.pdf")
-        two_column_pdf(s, LEFT[:1], RIGHT[:1])                               # 15 distinct words < WORDS_MIN_LAYER
-        glued = "\n\n".join(" ".join(x + y for x, y in zip(a.split(), b.split())) for a, b in zip(LEFT[:1], RIGHT[:1]))
+        two_column_pdf(s, LEFT[:1], RIGHT[:1])  # 15 distinct words < WORDS_MIN_LAYER
+        glued = "\n\n".join(
+            " ".join(x + y for x, y in zip(a.split(), b.split()))
+            for a, b in zip(LEFT[:1], RIGHT[:1])
+        )
         with pymupdf.open(s) as doc:
             assert not bc._words_glued(glued, doc[0])
 
 
 def test_glued_page_with_a_garbage_layer_goes_to_ocr():
     # a font mapped to Latin-1 codes: the layer's ASCII fragments count as words, the rest is garbage
-    words = ["".join(c) for c in itertools.product("bcdfg", "aeiou", "hjklm", "nprst")][::10][:60]   # 60 distinct
-    soup = [" ".join(f"{w}ÄóÓÒÌ" for w in words[i:i + 6]) for i in range(0, 60, 6)]
+    words = ["".join(c) for c in itertools.product("bcdfg", "aeiou", "hjklm", "nprst")][
+        ::10
+    ][:60]  # 60 distinct
+    soup = [" ".join(f"{w}ÄóÓÒÌ" for w in words[i : i + 6]) for i in range(0, 60, 6)]
     with tempfile.TemporaryDirectory() as td:
         p = os.path.join(td, "paper.pdf")
         two_column_pdf(p, soup[:5], soup[5:])
-        md, log = run(p, [CORRECT])                                        # engine text shares no word
-        assert md.strip() == "" and bc._pdf_garbled_pages == [0], (md[:200], bc._pdf_garbled_pages)
+        md, log = run(p, [CORRECT])  # engine text shares no word
+        assert md.strip() == "" and bc._pdf_garbled_pages == [0], (
+            md[:200],
+            bc._pdf_garbled_pages,
+        )
         assert "1 glued word into word" in log and "latin1 1" in log, log
 
 
 def test_too_few_pairs_are_not_judged():
     with tempfile.TemporaryDirectory() as td:
         p = os.path.join(td, "short.pdf")
-        two_column_pdf(p, LEFT[:5], RIGHT[:5])                               # 4 pairs < COLUMN_MIN_PAIRS
+        two_column_pdf(p, LEFT[:5], RIGHT[:5])  # 4 pairs < COLUMN_MIN_PAIRS
         merged = "\n\n".join(f"{a} {b}" for a, b in zip(LEFT[:5], RIGHT[:5]))
         md, log = run(p, [merged])
         assert md == bc.clean_md(merged) and "COLUMNS" not in log
 
 
 if __name__ == "__main__":
-    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
+    tests = [
+        v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)
+    ]
     for t in tests:
-        t(); print("ok", t.__name__)
+        t()
+        print("ok", t.__name__)
     print(f"{len(tests)} tests passed")

@@ -100,7 +100,9 @@ def pua_ratio(text: str) -> float:
 # load_denylist from this file. Same bars; see build_corpus for how they were measured.
 _ctrl_re = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _word_re = re.compile(r"[^\W\d_]{4,}")
-_latin1_re = re.compile(r"[\u0080-\u00af\u00b4\u00b6\u00b8\u00ba\u00bb\u00bf-\u00d6\u00d8-\u00f6\u00f8-\u00ff]")
+_latin1_re = re.compile(
+    r"[\u0080-\u00af\u00b4\u00b6\u00b8\u00ba\u00bb\u00bf-\u00d6\u00d8-\u00f6\u00f8-\u00ff]"
+)
 
 
 def garble_reason(text: str):

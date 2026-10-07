@@ -1298,7 +1298,8 @@ def _vlm_endpoint():
 
 def _vlm_ocr_page(base: str, png: bytes) -> str:
     """One page image -> Markdown. Raises on any non-success (the caller abandons the VLM for the document)."""
-    import base64, urllib.request
+    import base64
+    import urllib.request
 
     body = {
         "model": OCR_VLM_MODEL,

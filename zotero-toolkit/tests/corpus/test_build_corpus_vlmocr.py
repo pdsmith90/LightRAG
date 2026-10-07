@@ -6,7 +6,13 @@ to ocrmypdf when no server is usable or any page fails; the partial --pages rout
 the remote server is skipped inside its quiet window; --ocr-vlm off restores the old behaviour.
 Synthetic PDFs via pymupdf; pymupdf4llm, the HTTP calls and ocrmypdf replaced by fakes; all text is invented."""
 
-import contextlib, io, os, subprocess, sys, tempfile, time, types
+import contextlib
+import io
+import os
+import sys
+import tempfile
+import time
+import types
 
 try:
     import corpus_testlib  # noqa: F401  -- fork layout: tests/corpus/, puts corpus/ on sys.path
@@ -258,9 +264,10 @@ def test_quiet_window_skips_the_remote_server():
         assert bc._vlm_quiet(time.mktime((2026, 10, 7, 23, 30, 0, 0, 0, -1)))
         assert bc._vlm_quiet(time.mktime((2026, 10, 7, 5, 59, 0, 0, 0, -1)))
         assert not bc._vlm_quiet(time.mktime((2026, 10, 7, 6, 0, 0, 0, 0, -1)))
-    alive = lambda base, timeout=3.0: (
-        base == bc.OCR_VLM_REMOTE_URL
-    )  # only the remote server answers
+
+    def alive(base, timeout=3.0):  # only the remote server answers
+        return base == bc.OCR_VLM_REMOTE_URL
+
     with patched(bc, "_vlm_alive", alive), patched(bc, "OCR_VLM_LOCAL_START", ""):
         with (
             patched(bc, "_vlm_endpoint_cache", None),
@@ -282,7 +289,10 @@ def test_local_server_is_started_on_demand_for_a_build():
         alive_now.append(True)
 
     alive_now = []
-    alive = lambda base, timeout=3.0: base == bc.OCR_VLM_LOCAL_URL and bool(alive_now)
+
+    def alive(base, timeout=3.0):
+        return base == bc.OCR_VLM_LOCAL_URL and bool(alive_now)
+
     with tempfile.TemporaryDirectory() as td:
         script = os.path.join(td, "ocr_server.sh")
         open(script, "w").write("#!/bin/sh\n")

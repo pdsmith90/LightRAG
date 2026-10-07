@@ -64,7 +64,9 @@ def test_garble_reason_shapes():
     assert "single-char tokens 100%" in bc.garble_detail(SOUP)
 
 
-MOJIBAKE = " ".join("ÄóÓÒeÌôbÑÃØÏ¨¯¬¥" for _ in range(80))  # a font mapped to Latin-1 codes
+MOJIBAKE = " ".join(
+    "ÄóÓÒeÌôbÑÃØÏ¨¯¬¥" for _ in range(80)
+)  # a font mapped to Latin-1 codes
 FRENCH = "\n".join(
     "Les mesures gravimétriques révèlent une déformation élastique de la croûte."
     for _ in range(16)

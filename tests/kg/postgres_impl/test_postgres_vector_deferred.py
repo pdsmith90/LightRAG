@@ -934,9 +934,7 @@ async def test_get_vectors_by_ids_does_not_wait_for_in_flight_flush():
     storage.db.query = AsyncMock(
         return_value=[{"id": "c9", "content_vector": [0.1, 0.2, 0.3]}]
     )
-    vecs = await asyncio.wait_for(
-        storage.get_vectors_by_ids(["c1", "c9"]), timeout=1.0
-    )
+    vecs = await asyncio.wait_for(storage.get_vectors_by_ids(["c1", "c9"]), timeout=1.0)
     assert vecs["c9"] == [0.1, 0.2, 0.3]
     assert vecs["c1"] == [0.0, 1.0, 0.0]
     assert not flush_task.done()
