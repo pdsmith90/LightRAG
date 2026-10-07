@@ -239,17 +239,25 @@ def named_work_notices(
 
     ``named`` is :func:`find_works`'s result for the query, ``indexed`` the keys
     among them that hold chunks. Empty when the query names no year (a bare
-    surname is too weak a naming to warn about), when any named work is among
-    the references (the paper asked about was found), or when nothing was
-    named. At most three notices.
+    surname is too weak a naming to warn about), when the work the query names
+    specifically (:func:`specific_named_work`) is among the references, or,
+    for an ambiguous naming, when any of the tied works is; and when nothing
+    was named. At most three notices.
     """
     if not named or not query_has_year(query):
         return []
     cited = {zotero_key(path or "") for path in reference_file_paths}
-    if any(key in cited for key, _ in named):
-        return []
+    specific = specific_named_work(query, named)
+    if specific is not None:
+        if specific in cited:
+            return []
+        candidates = [(specific, 0)]
+    else:
+        if any(key in cited for key, _ in named):
+            return []
+        candidates = named[:3]
     notices = []
-    for key, _ in named[:3]:
+    for key, _ in candidates:
         cite = citation_for_key(key) or key
         if key in indexed:
             notices.append(
@@ -591,6 +599,36 @@ def query_has_year(query: str) -> bool:
     """Whether the query carries a four-digit year, i.e. names a work firmly
     enough for :func:`find_works`'s result to be pinned or missed."""
     return bool(_AY_YEAR_RE.search(query or ""))
+
+
+def specific_named_work(query: str, named: list[tuple[str, int]]) -> str | None:
+    """The one work ``query`` names beyond doubt, else None.
+
+    ``named`` is :func:`find_works`'s result. The first work is specific when
+    it is alone, when it beats the runner-up on the match score, or when, at
+    equal score, its title shares at least two more of the query's words than
+    the runner-up's -- "Scanlon 2016 global evaluation of mascon products"
+    means one of the three Scanlon 2016 papers, while one shared word such as
+    the mission's name decides nothing. Otherwise the query is ambiguous
+    between them.
+    """
+    if not named:
+        return None
+    if len(named) == 1:
+        return named[0][0]
+    _, _, _, works = _author_year_index()
+    tokens = {t.lower() for t in _AY_TOKEN_RE.findall(query or "")}
+
+    def rank(item):
+        key, score = item
+        return (score, len(works.get(key, ((), "", frozenset()))[2] & tokens))
+
+    (score, overlap), (runner_score, runner_overlap) = rank(named[0]), rank(named[1])
+    if score > runner_score or (
+        score == runner_score and overlap >= runner_overlap + 2
+    ):
+        return named[0][0]
+    return None
 
 
 def cited_works_in(

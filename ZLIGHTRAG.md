@@ -147,12 +147,14 @@ when the papers citing the work match the question better than the work itself.
 With `NAMED_WORK_PIN=true`, whenever the query carries a year, up to two named works
 keep up to `MAX_CHUNKS_PER_DOC` (else two) chunks each at the front of the context,
 through the rerank floor and both cuts (`pin_named_work_chunks` in
-`lightrag/utils.py`; the chunks carry `pinned` into `/query/data`). With
+`lightrag/utils.py`). When the query names one work beyond doubt -- a clear winner
+on score or on title words shared with the query (`specific_named_work`) -- only that
+work is pinned; otherwise every tied work is and the reranker picks among them. With
 `NAMED_WORK_NOTICE=true`, `/query` and `/query/stream` open the answer with one
 sentence per named work that is not among the sources, saying whether it is in the
 knowledge base at all (`named_work_notices` in `lightrag/zotero_citations.py`), and
-return them as `notices`; nothing is said when the query names no year or when any
-named work is a source. Both off by default; the pin needs `METADATA_CHUNK_TOP_K`.
+return them as `notices`; nothing is said when the query names no year, when the
+specifically named work is a source, or, for an ambiguous naming, when any tied work is. Both off by default; the pin needs `METADATA_CHUNK_TOP_K`.
 
 ### Low-level keyword fallback
 

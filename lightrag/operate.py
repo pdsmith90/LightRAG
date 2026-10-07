@@ -21,6 +21,7 @@ from lightrag.zotero_citations import (
     citation_short,
     find_works,
     query_has_year,
+    specific_named_work,
 )
 from lightrag.entity_name_guard import junk_entity_class
 from lightrag.entity_name_fold import alias_chunk_result, fold_chunk_result
@@ -5645,11 +5646,8 @@ async def _get_metadata_context(
             )
             _metadata_unsupported_warned = True
         return []
-    named = (
-        [key for key, _ in find_works(query, max_works=_METADATA_MAX_WORKS)]
-        if top_k > 0
-        else []
-    )
+    found = find_works(query, max_works=_METADATA_MAX_WORKS) if top_k > 0 else []
+    named = [key for key, _ in found]
     cited: list[str] = []
     if hop_k > 0 and hop_sources:
         text = "\n".join(
@@ -5665,9 +5663,16 @@ async def _get_metadata_context(
         rows = await fetch(named, query, per_work)
         # NAMED_WORK_PIN: a work named with its year keeps its chunks through the
         # rerank floor, chunk_top_k and the token budget (utils.pin_named_work_chunks);
-        # a bare surname names too weakly to pin.
+        # a bare surname names too weakly to pin. When the query names one work
+        # beyond doubt, only that work is pinned, else every tied work is and
+        # the reranker picks among them.
         pin = bool(config.get("named_work_pin")) and query_has_year(query)
-        chunks.extend(_work_rows_to_chunks(rows[:top_k], "metadata", pinned=pin))
+        specific = specific_named_work(query, found) if pin else None
+        for chunk in _work_rows_to_chunks(rows[:top_k], "metadata", pinned=pin):
+            if pin and specific is not None and chunk.get("pinned"):
+                if not (chunk.get("file_path") or "").startswith(specific + "__"):
+                    chunk.pop("pinned", None)
+            chunks.append(chunk)
     if cited:
         rows = await fetch(cited, query, _CITATION_HOP_CHUNKS_PER_WORK)
         chunks.extend(_work_rows_to_chunks(rows, "citation"))

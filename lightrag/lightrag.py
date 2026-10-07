@@ -1507,8 +1507,9 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
     the token budget can still drop them when the papers citing the work match
     the question better than the work itself. With the pin, up to two named
     works keep up to ``max_chunks_per_doc`` (else two) chunks each, first in the
-    context, whenever the query carries a year
-    (:func:`lightrag.utils.pin_named_work_chunks`). Env ``NAMED_WORK_PIN``.
+    context, whenever the query carries a year; a work the query names beyond
+    doubt is pinned alone (:func:`lightrag.utils.pin_named_work_chunks`,
+    :func:`lightrag.zotero_citations.specific_named_work`). Env ``NAMED_WORK_PIN``.
     """
 
     sidecar_relations: str = field(

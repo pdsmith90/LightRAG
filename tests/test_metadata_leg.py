@@ -19,6 +19,7 @@ from lightrag.zotero_citations import (
     cited_works_in,
     find_works,
     named_work_notices,
+    specific_named_work,
 )
 
 pytestmark = pytest.mark.offline
@@ -197,18 +198,46 @@ def test_no_surname_or_no_metadata_finds_nothing(metadata, tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def test_specific_named_work_needs_a_clear_winner(metadata):
+    # two of the query's words are in the first title only: it means that paper
+    named = find_works("Okafor Lindqvist 2019 simulated residuals")
+    assert (
+        specific_named_work("Okafor Lindqvist 2019 simulated residuals", named)
+        == "AAAA0001"
+    )
+    # one shared word decides nothing; nor does nothing at all
+    for query in ("Okafor Lindqvist 2019 residuals", "Okafor Lindqvist 2019 method"):
+        assert specific_named_work(query, find_works(query)) is None
+    assert specific_named_work("okafor 2021", find_works("okafor 2021")) == "AAAA0002"
+    assert specific_named_work("x", []) is None
+
+
 def test_notices_name_the_missing_works_and_say_why(metadata):
-    named = [("AAAA0001", 3), ("AAAA0003", 3)]
-    query = "Okafor Lindqvist 2019 residuals"
-    # a named work is among the references: nothing to say
-    assert named_work_notices(query, ["AAAA0001__x.md"], named, {"AAAA0001"}) == []
+    # ambiguous naming: the pair's two 2019 papers tie
+    named = find_works("Okafor Lindqvist 2019 method")
+    query = "Okafor Lindqvist 2019 method"
+    # one of them is among the references: nothing to say
+    assert named_work_notices(query, ["AAAA0003__x.md"], named, {"AAAA0001"}) == []
     out = named_work_notices(query, ["AAAA0009__citer.md"], named, {"AAAA0001"})
     assert len(out) == 2
     assert "Okafor" in out[0] and "(2019)" in out[0]
     assert out[0].endswith("not among the sources retrieved for this question.")
     assert "Third" in out[1] and "not in this knowledge base" in out[1]
+    # specific naming: only that work counts, even when a sibling is a source
+    query = "Okafor Lindqvist 2019 simulated residuals"
+    named = find_works(query)
+    out = named_work_notices(query, ["AAAA0003__x.md"], named, {"AAAA0003"})
+    assert (
+        len(out) == 1
+        and "residuals" in out[0]
+        and "not in this knowledge base" in out[0]
+    )
+    assert named_work_notices(query, ["AAAA0001__x.md"], named, {"AAAA0001"}) == []
     # no year: too weak a naming to warn about; nothing named: nothing
-    assert named_work_notices("Okafor Lindqvist residuals", [], named, set()) == []
+    assert (
+        named_work_notices("Okafor Lindqvist simulated residuals", [], named, set())
+        == []
+    )
     assert named_work_notices(query, [], [], set()) == []
 
 
@@ -295,6 +324,31 @@ async def test_named_and_cited_works_contribute_chunks(metadata):
 
 
 @pytest.mark.asyncio
+async def test_pin_marks_the_specific_work_only_when_one_is_named(metadata):
+    pinned = _Chunks(
+        {"metadata_chunk_top_k": 4, "citation_hop_top_k": 0, "named_work_pin": True}
+    )
+    # ambiguous naming: both tied works are pinned, the reranker decides later
+    chunks = await _get_metadata_context("Okafor Lindqvist 2019 method", pinned)
+    assert chunks and all(c.get("pinned") for c in chunks)
+    # specific naming: only the named work's chunks keep the pin
+    chunks = await _get_metadata_context(
+        "Okafor Lindqvist 2019 simulated residuals", pinned
+    )
+    assert {c["file_path"].split("__")[0] for c in chunks if c.get("pinned")} == {
+        "AAAA0001"
+    }
+    assert any(not c.get("pinned") for c in chunks)
+    # no year, or the option off: nothing pinned
+    chunks = await _get_metadata_context("Lindqvist Okafor residuals", pinned)
+    assert chunks and not any(c.get("pinned") for c in chunks)
+    plain = _Chunks({"metadata_chunk_top_k": 4, "citation_hop_top_k": 0})
+    chunks = await _get_metadata_context(
+        "Okafor Lindqvist 2019 simulated residuals", plain
+    )
+    assert chunks and not any(c.get("pinned") for c in chunks)
+
+
 async def test_legs_are_off_at_zero_and_independent(metadata):
     off = _Chunks({"metadata_chunk_top_k": 0, "citation_hop_top_k": 0})
     assert (
