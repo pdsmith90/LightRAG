@@ -244,6 +244,40 @@ def test_paper_identity_joins_copies_and_keeps_unknown_keys_apart(tmp_path):
         _reset(saved)
 
 
+def test_a_copy_of_the_leading_paper_is_no_runner_up(tmp_path):
+    # the pair's paper is filed twice; the second copy must not make the naming ambiguous
+    meta = {
+        "FFFF0001": {
+            "title": "Decorrelation of simulated range-rate residuals",
+            "authors": ["Okafor Chidi", "Lindqvist Maja"],
+            "year": "2019",
+        },
+        "FFFF0002": {
+            "title": "Decorrelation of simulated range-rate residuals",
+            "authors": ["Okafor Chidi", "Lindqvist Maja"],
+            "year": "2019",
+        },
+        "FFFF0003": {
+            "title": "An unrelated survey of the same year",
+            "authors": ["Okafor Chidi", "Lindqvist Maja"],
+            "year": "2019",
+        },
+    }
+    path = tmp_path / "zotero_metadata.json"
+    path.write_text(json.dumps(meta), encoding="utf-8")
+    saved = zc.METADATA_PATH
+    _reset(str(path))
+    try:
+        query = "Okafor Lindqvist 2019 simulated residuals"
+        named = find_works(query)
+        assert [k for k, _ in named] == ["FFFF0001", "FFFF0002", "FFFF0003"]
+        assert specific_named_work(query, named) == "FFFF0001"
+        # two copies and nothing else: specific
+        assert specific_named_work(query, named[:2]) == "FFFF0001"
+    finally:
+        _reset(saved)
+
+
 def test_citations_drop_the_title_markup(tmp_path):
     meta = {
         "CCCC0001": {

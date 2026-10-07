@@ -632,12 +632,16 @@ def specific_named_work(query: str, named: list[tuple[str, int]]) -> str | None:
     equal score, its title shares at least two more of the query's words than
     the runner-up's -- "Scanlon 2016 global evaluation of mascon products"
     means one of the three Scanlon 2016 papers, while one shared word such as
-    the mission's name decides nothing. Otherwise the query is ambiguous
-    between them.
+    the mission's name decides nothing. The runner-up is the first work that
+    is a different paper: a copy of the leading paper filed under another
+    Zotero item ties it exactly and decides nothing either. Otherwise the
+    query is ambiguous between them.
     """
     if not named:
         return None
-    if len(named) == 1:
+    leader = paper_identity(named[0][0])
+    others = [item for item in named[1:] if paper_identity(item[0]) != leader]
+    if not others:
         return named[0][0]
     _, _, _, works = _author_year_index()
     tokens = {t.lower() for t in _AY_TOKEN_RE.findall(query or "")}
@@ -646,7 +650,7 @@ def specific_named_work(query: str, named: list[tuple[str, int]]) -> str | None:
         key, score = item
         return (score, len(works.get(key, ((), "", frozenset()))[2] & tokens))
 
-    (score, overlap), (runner_score, runner_overlap) = rank(named[0]), rank(named[1])
+    (score, overlap), (runner_score, runner_overlap) = rank(named[0]), rank(others[0])
     if score > runner_score or (
         score == runner_score and overlap >= runner_overlap + 2
     ):
