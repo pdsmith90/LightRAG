@@ -170,6 +170,20 @@ def _plain_title(entry: dict) -> str:
     return re.sub(r"\s+", " ", title).strip().rstrip(".")
 
 
+def paper_identity(key_or_path: str) -> str:
+    """What a storage key or corpus path stands for: the paper, by
+    :func:`work_key`'s title-or-DOI identity when the metadata resolves it, else
+    the storage key itself, so copies of one paper filed under several Zotero
+    items compare equal and an unknown key still equals itself."""
+    key = zotero_key(key_or_path) or (
+        key_or_path if _KEY_RE.match(key_or_path or "") else None
+    )
+    if not key:
+        return "path:" + (key_or_path or "")
+    identity = work_key(f"{key}__")
+    return identity if not identity.startswith("path:") else "key:" + key
+
+
 def citation_for(file_path: str) -> str:
     """Full bibliographic citation for the appended reference block.
 
@@ -253,14 +267,16 @@ def named_work_notices(
     """
     if not named or not query_has_year(query):
         return []
-    cited = {zotero_key(path or "") for path in reference_file_paths}
+    # Copies of one paper filed under several Zotero items are one paper
+    # (paper_identity): a cited copy is the paper.
+    cited = {paper_identity(path or "") for path in reference_file_paths}
     specific = specific_named_work(query, named)
     if specific is not None:
-        if specific in cited:
+        if paper_identity(specific) in cited:
             return []
         candidates = [(specific, 0)]
     else:
-        if any(key in cited for key, _ in named):
+        if any(paper_identity(key) in cited for key, _ in named):
             return []
         candidates = named[:3]
     notices = []

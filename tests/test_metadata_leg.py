@@ -212,6 +212,38 @@ def test_specific_named_work_needs_a_clear_winner(metadata):
     assert specific_named_work("x", []) is None
 
 
+def test_paper_identity_joins_copies_and_keeps_unknown_keys_apart(tmp_path):
+    meta = {
+        "DDDD0001": {
+            "title": "A long enough title to name one paper",
+            "authors": ["Okafor Chidi"],
+            "year": "2019",
+        },
+        "DDDD0002": {
+            "title": "A long enough title to name one paper",
+            "authors": ["Okafor Chidi"],
+            "year": "2019",
+        },
+        "DDDD0003": {"title": "Short", "authors": ["Okafor Chidi"], "year": "2019"},
+    }
+    path = tmp_path / "zotero_metadata.json"
+    path.write_text(json.dumps(meta), encoding="utf-8")
+    saved = zc.METADATA_PATH
+    _reset(str(path))
+    try:
+        assert zc.paper_identity("DDDD0001") == zc.paper_identity("DDDD0002__copy.md")
+        assert (
+            zc.paper_identity("DDDD0003")
+            == zc.paper_identity("DDDD0003__x.md")
+            == "key:DDDD0003"
+        )
+        assert zc.paper_identity("DDDD0003") != zc.paper_identity("DDDD0001")
+        assert zc.paper_identity("EEEE9999") == "key:EEEE9999"
+        assert zc.paper_identity("notes/free text.md") == "path:notes/free text.md"
+    finally:
+        _reset(saved)
+
+
 def test_citations_drop_the_title_markup(tmp_path):
     meta = {
         "CCCC0001": {

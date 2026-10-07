@@ -20,6 +20,7 @@ from lightrag.zotero_citations import (
     cited_works_in,
     citation_short,
     find_works,
+    paper_identity,
     query_has_year,
     specific_named_work,
 )
@@ -5100,6 +5101,9 @@ async def kg_query(
             if retrieval_config.get("citation_hop_top_k")
             else ()
         ),
+        # The pin reorders the context: keyed only when on, so entries written
+        # without it keep their key.
+        *(("\n<named_work_pin>\n",) if retrieval_config.get("named_work_pin") else ()),
         *(
             ("\n<min_rerank_score>\n", query_param.min_rerank_score)
             if query_param.min_rerank_score is not None
@@ -5668,9 +5672,12 @@ async def _get_metadata_context(
         # the reranker picks among them.
         pin = bool(config.get("named_work_pin")) and query_has_year(query)
         specific = specific_named_work(query, found) if pin else None
+        # the specific work by paper identity: the named Zotero item may be an
+        # unindexed copy of a paper whose other copy holds the chunks
+        specific_paper = paper_identity(specific) if specific is not None else None
         for chunk in _work_rows_to_chunks(rows[:top_k], "metadata", pinned=pin):
-            if pin and specific is not None and chunk.get("pinned"):
-                if not (chunk.get("file_path") or "").startswith(specific + "__"):
+            if pin and specific_paper is not None and chunk.get("pinned"):
+                if paper_identity(chunk.get("file_path") or "") != specific_paper:
                     chunk.pop("pinned", None)
             chunks.append(chunk)
     if cited:
@@ -7544,6 +7551,7 @@ async def naive_query(
             if global_config.get("citation_hop_top_k")
             else ()
         ),
+        *(("\n<named_work_pin>\n",) if global_config.get("named_work_pin") else ()),
         *(
             ("\n<min_rerank_score>\n", query_param.min_rerank_score)
             if query_param.min_rerank_score is not None
