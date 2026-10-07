@@ -163,6 +163,13 @@ def _entry(file_path: str) -> dict | None:
     return got if isinstance(got, dict) else None
 
 
+def _plain_title(entry: dict) -> str:
+    """A title without the HTML markup Zotero keeps (small-caps spans, italics),
+    stripped and without a trailing period."""
+    title = re.sub(r"<[^>]+>", "", entry.get("title") or "")
+    return re.sub(r"\s+", " ", title).strip().rstrip(".")
+
+
 def citation_for(file_path: str) -> str:
     """Full bibliographic citation for the appended reference block.
 
@@ -179,7 +186,7 @@ def citation_for(file_path: str) -> str:
             return (
                 _deslug(file_path) if "__" in os.path.basename(file_path) else file_path
             )
-        title = (entry.get("title") or "").strip().rstrip(".")
+        title = _plain_title(entry)
         parts = [
             p
             for p in (
@@ -206,7 +213,7 @@ def citation_for_key(key: str) -> str:
         entry = _load().get(key)
         if not isinstance(entry, dict):
             return ""
-        title = (entry.get("title") or "").strip().rstrip(".")
+        title = _plain_title(entry)
         parts = [
             p
             for p in (

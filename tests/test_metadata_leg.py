@@ -212,6 +212,32 @@ def test_specific_named_work_needs_a_clear_winner(metadata):
     assert specific_named_work("x", []) is None
 
 
+def test_citations_drop_the_title_markup(tmp_path):
+    meta = {
+        "CCCC0001": {
+            "title": 'Spread <i>F</i> and <span style="font-variant:small-caps;">GRACE</span>.',
+            "authors": ["Okafor Chidi"],
+            "year": "2019",
+        }
+    }
+    path = tmp_path / "zotero_metadata.json"
+    path.write_text(json.dumps(meta), encoding="utf-8")
+    saved = zc.METADATA_PATH
+    _reset(str(path))
+    try:
+        assert (
+            zc.citation_for_key("CCCC0001")
+            == "Okafor Chidi. (2019). Spread F and GRACE"
+        )
+        assert (
+            zc.citation_for("CCCC0001__paper.md")
+            == "Okafor Chidi. (2019). Spread F and GRACE"
+        )
+        assert zc.citation_for_key("CCCC9999") == ""
+    finally:
+        _reset(saved)
+
+
 def test_notices_name_the_missing_works_and_say_why(metadata):
     # ambiguous naming: the pair's two 2019 papers tie
     named = find_works("Okafor Lindqvist 2019 method")
