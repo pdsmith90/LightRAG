@@ -490,6 +490,14 @@ _CITE_RE = re.compile(
     r"(?:\s+(?:and|&)\s+([A-Z][A-Za-z'\u2019\-]{2,})|\s+et\s+al\.?)?"
     r"[\s,]*\(?\s*((?:19|20)\d{2})[a-z]?\)?"
 )
+# "Okafor et al. (2019)", "Okafor and Lindqvist 2019": a citation form names its
+# first author. A bare "Okafor Lindqvist 2019" lists surnames in no order and
+# asserts no lead, so it is not matched here.
+_LEAD_RE = re.compile(
+    r"(?<![A-Za-z])([A-Z][A-Za-z'\u2019\-]{2,})"
+    r"(?:\s+(?:and|&)\s+[A-Z][A-Za-z'\u2019\-]{2,}|\s+et\s+al\.?)"
+    r"[\s,]*\(?\s*(?:19|20)\d{2}[a-z]?\)?"
+)
 # When one surname and one year still name more works than this, the query is
 # too ambiguous to act on (a common surname); the other legs keep running.
 _AY_MAX_TIES = 9
@@ -541,15 +549,19 @@ def _author_year_index() -> tuple:
         return _ay_index
     by_surname: dict[str, set[str]] = {}
     by_year: dict[str, set[str]] = {}
-    works: dict[str, tuple[frozenset[str], str, frozenset[str]]] = {}
+    works: dict[str, tuple[frozenset[str], str, frozenset[str], frozenset[str]]] = {}
     for key, entry in meta.items():
         if not isinstance(entry, dict):
             continue
         year = str(entry.get("year") or "").strip()[:4]
         names: set[str] = set()
+        lead: set[str] = set()
         for author in entry.get("authors") or []:
             if isinstance(author, str):
-                names |= _surname_forms(author)
+                forms = _surname_forms(author)
+                names |= forms
+                if not lead and forms:
+                    lead = forms  # the first author with a surname leads
         for name in names:
             by_surname.setdefault(name, set()).add(key)
         if year:
@@ -557,7 +569,7 @@ def _author_year_index() -> tuple:
         title_words = frozenset(
             w.lower() for w in _AY_TITLE_WORD_RE.findall(str(entry.get("title") or ""))
         )
-        works[key] = (frozenset(names), year, title_words)
+        works[key] = (frozenset(names), year, title_words, frozenset(lead))
     _ay_index = (_mtime, by_surname, by_year, works)
     return _ay_index
 
@@ -565,6 +577,10 @@ def _author_year_index() -> tuple:
 def find_works(query: str, max_works: int = 3) -> list[tuple[str, int]]:
     """Zotero keys of the works a query names by author surname(s) and year,
     best first, each with its match score (surnames matched, +1 for the year).
+
+    A citation form ("Okafor et al. (2019)", "Okafor and Lindqvist 2019")
+    names its first author, and a work that author led scores one more than
+    the works of that year the author merely co-wrote.
 
     A year in the query must match; a work of an adjacent year stands in
     without the year point when no work matches the year exactly, or when it
@@ -590,6 +606,13 @@ def find_works(query: str, max_works: int = 3) -> list[tuple[str, int]]:
     for name in surnames:
         for key in by_surname[name]:
             matched[key] = matched.get(key, 0) + 1
+    leads = {m.group(1).lower() for m in _LEAD_RE.finditer(query)}
+    if leads:
+        # "Save et al. (2016)" is the paper Save led, not a three-way tie with
+        # the two of that year Save co-wrote (2026-10-09 eval, case gf-44).
+        for key in matched:
+            if works[key][3] & leads:
+                matched[key] += 1
     scored: list[tuple[str, int]] = []
     if years:
         adjacent = {str(int(y) + d) for y in years for d in (-1, 1)} - years

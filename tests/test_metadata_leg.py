@@ -212,6 +212,47 @@ def test_specific_named_work_needs_a_clear_winner(metadata):
     assert specific_named_work("x", []) is None
 
 
+def test_a_citation_form_names_its_first_author(tmp_path):
+    # Three works of one year share an author: "Quux et al. (2015)" is the one
+    # Quux led, "Blorp and Quux 2015" the one Blorp led, and a bare
+    # "Quux Blorp 2015" lists surnames in no order, so the three stay tied.
+    meta = {
+        "AAAA0031": {
+            "title": "Led",
+            "authors": ["Quux Ada", "Blorp Ned"],
+            "year": "2015",
+        },
+        "AAAA0032": {
+            "title": "Second",
+            "authors": ["Blorp Ned", "Quux Ada"],
+            "year": "2015",
+        },
+        "AAAA0033": {
+            "title": "Third",
+            "authors": ["Zorp Kim", "Blorp Ned", "Quux Ada"],
+            "year": "2015",
+        },
+    }
+    path = tmp_path / "zotero_metadata.json"
+    path.write_text(json.dumps(meta), encoding="utf-8")
+    saved = zc.METADATA_PATH
+    _reset(str(path))
+    try:
+        query = (
+            "What distinguishes the solution of Quux et al. (2015) from other products?"
+        )
+        named = find_works(query)
+        assert named[0] == ("AAAA0031", 3)
+        assert {key for key, _ in named[1:]} == {"AAAA0032", "AAAA0033"}
+        assert specific_named_work(query, named) == "AAAA0031"
+        assert find_works("Blorp and Quux 2015")[0] == ("AAAA0032", 4)
+        bare = find_works("Quux Blorp 2015")
+        assert {score for _, score in bare} == {3} and len(bare) == 3
+        assert specific_named_work("Quux Blorp 2015", bare) is None
+    finally:
+        _reset(saved)
+
+
 def test_paper_identity_joins_copies_and_keeps_unknown_keys_apart(tmp_path):
     meta = {
         "DDDD0001": {
