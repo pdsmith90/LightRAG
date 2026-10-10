@@ -5665,6 +5665,10 @@ async def _get_metadata_context(
     if named:
         per_work = max(1, -(-top_k // len(named)))
         rows = await fetch(named, query, per_work)
+        # The storage returns works in key order; cut in find_works' order, so a
+        # tie of more works than top_k drops the weakest, never the named one.
+        rank = {key: i for i, key in enumerate(named)}
+        rows = sorted(rows, key=lambda row: rank.get(row.get("work"), len(rank)))
         # NAMED_WORK_PIN: a work named with its year keeps its chunks through the
         # rerank floor, chunk_top_k and the token budget (utils.pin_named_work_chunks);
         # a bare surname names too weakly to pin. When the query names one work
@@ -6311,6 +6315,12 @@ async def _merge_all_chunks(
     logger.info(
         f"Round-robin merged chunks: {origin_len} -> {len(merged_chunks)} (deduplicated {origin_len - len(merged_chunks)})"
     )
+    # The pin belongs to the chunk: a copy another leg brought in first, in the
+    # lexical interleave or the round robin, carries it too.
+    pinned_ids = {c.get("chunk_id") for c in metadata_chunks or () if c.get("pinned")}
+    for chunk in merged_chunks:
+        if chunk["chunk_id"] in pinned_ids:
+            chunk["pinned"] = True
 
     # Backfill heading path before token truncation so it counts toward the budget
     if text_chunks_db and text_chunks_db.global_config.get(

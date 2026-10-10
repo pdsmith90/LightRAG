@@ -515,6 +515,48 @@ async def test_pin_marks_the_specific_work_only_when_one_is_named(metadata):
     assert chunks and not any(c.get("pinned") for c in chunks)
 
 
+class _ChunksByKey(_Chunks):
+    """Rows in the storage's order: by work key, not by the keys' order."""
+
+    async def get_chunks_for_works(self, keys, query, per_work):
+        rows = await super().get_chunks_for_works(keys, query, per_work)
+        return sorted(rows, key=lambda row: (row["work"], row["chunk_order_index"]))
+
+
+@pytest.mark.asyncio
+async def test_the_cut_keeps_the_named_work_whatever_its_key(tmp_path):
+    # Six works tie on the names and the year and only four rows fit; the one
+    # the query names by its title sorts last by key and must not be cut.
+    meta = {
+        f"AAAA005{i}": {
+            "title": f"Other {i}",
+            "authors": ["Blorp Ned", "Zorp Kim"],
+            "year": "2015",
+        }
+        for i in range(1, 6)
+    }
+    meta["ZZZZ0001"] = {
+        "title": "Viscoelastic response of a compressible layered model",
+        "authors": ["Blorp Ned", "Zorp Kim"],
+        "year": "2015",
+    }
+    path = tmp_path / "zotero_metadata.json"
+    path.write_text(json.dumps(meta), encoding="utf-8")
+    saved = zc.METADATA_PATH
+    _reset(str(path))
+    try:
+        db = _ChunksByKey(
+            {"metadata_chunk_top_k": 4, "citation_hop_top_k": 0, "named_work_pin": True}
+        )
+        chunks = await _get_metadata_context(
+            "Blorp Zorp 2015 viscoelastic compressible model", db
+        )
+        assert len(chunks) == 4
+        assert [c["chunk_id"] for c in chunks if c.get("pinned")] == ["ZZZZ0001-0"]
+    finally:
+        _reset(saved)
+
+
 async def test_legs_are_off_at_zero_and_independent(metadata):
     off = _Chunks({"metadata_chunk_top_k": 0, "citation_hop_top_k": 0})
     assert (
@@ -579,3 +621,19 @@ async def test_merge_puts_metadata_chunks_first():
         metadata_chunks=[_chunk("m1"), _chunk("v2")],
     )
     assert [c["chunk_id"] for c in merged] == ["m1", "l1", "v2", "v1"]
+
+
+@pytest.mark.asyncio
+async def test_a_pinned_chunk_keeps_its_pin_when_another_leg_brings_it_first():
+    # the lexical leg ranks the named work's chunk first, so its unpinned copy
+    # enters the interleave before the pinned one second among the metadata
+    merged = await _merge_all_chunks(
+        filtered_entities=[],
+        filtered_relations=[],
+        vector_chunks=[_chunk("v1")],
+        query="q",
+        lexical_chunks=[_chunk("m2")],
+        metadata_chunks=[_chunk("m1"), {**_chunk("m2"), "pinned": True}],
+    )
+    assert [c["chunk_id"] for c in merged] == ["m1", "m2", "v1"]
+    assert [c["chunk_id"] for c in merged if c.get("pinned")] == ["m2"]
