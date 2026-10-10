@@ -492,12 +492,15 @@ _CITE_RE = re.compile(
 )
 # "Okafor et al. (2019)", "Okafor and Lindqvist 2019": a citation form names its
 # first author. A bare "Okafor Lindqvist 2019" lists surnames in no order and
-# asserts no lead, so it is not matched here.
+# asserts no lead, so it is not matched here. Group 2 marks the "and" form.
 _LEAD_RE = re.compile(
     r"(?<![A-Za-z])([A-Z][A-Za-z'\u2019\-]{2,})"
-    r"(?:\s+(?:and|&)\s+[A-Z][A-Za-z'\u2019\-]{2,}|\s+et\s+al\.?)"
+    r"(?:(\s+(?:and|&)\s+[A-Z][A-Za-z'\u2019\-]{2,})|\s+et\s+al\.?)"
     r"[\s,]*\(?\s*(?:19|20)\d{2}[a-z]?\)?"
 )
+# "Varga, Okafor and Lindqvist 2019": a name and a comma before the "and" form
+# make it the tail of a longer list, whose first author came earlier.
+_LIST_BEFORE_RE = re.compile(r"[A-Za-z][A-Za-z'\u2019\-]*,\s*$")
 # When one surname and one year still name more works than this, the query is
 # too ambiguous to act on (a common surname); the other legs keep running.
 _AY_MAX_TIES = 9
@@ -606,7 +609,11 @@ def find_works(query: str, max_works: int = 3) -> list[tuple[str, int]]:
     for name in surnames:
         for key in by_surname[name]:
             matched[key] = matched.get(key, 0) + 1
-    leads = {m.group(1).lower() for m in _LEAD_RE.finditer(query)}
+    leads = {
+        m.group(1).lower()
+        for m in _LEAD_RE.finditer(query)
+        if not (m.group(2) and _LIST_BEFORE_RE.search(query, 0, m.start()))
+    }
     if leads:
         # "Save et al. (2016)" is the paper Save led, not a three-way tie with
         # the two of that year Save co-wrote (2026-10-09 eval, case gf-44).

@@ -253,6 +253,39 @@ def test_a_citation_form_names_its_first_author(tmp_path):
         _reset(saved)
 
 
+def test_the_last_two_names_of_a_list_name_no_first_author(tmp_path):
+    # "Q, Blorp and Zorp (2015)" is a three-author list: Blorp is its second
+    # author, so Blorp's own 2015 paper earns no lead point. The listed paper is
+    # filed a year off under a lead whose surname is too short to count.
+    meta = {
+        "AAAA0041": {
+            "title": "Viscoelastic response of a compressible layered model",
+            "authors": ["Wenli Q", "Blorp Ned", "Zorp Kim"],
+            "year": "2014",
+        },
+        "AAAA0042": {
+            "title": "Horizontal loading displacements",
+            "authors": ["Blorp Ned", "Quux Ada"],
+            "year": "2015",
+        },
+    }
+    path = tmp_path / "zotero_metadata.json"
+    path.write_text(json.dumps(meta), encoding="utf-8")
+    saved = zc.METADATA_PATH
+    _reset(str(path))
+    try:
+        query = (
+            "What kind of layered model did Q, Blorp and Zorp (2015) build for the"
+            " viscoelastic response?"
+        )
+        named = find_works(query)
+        assert specific_named_work(query, named) == "AAAA0041"
+        # without the list the same two names still say Blorp led
+        assert find_works("Blorp and Zorp (2015)")[0] == ("AAAA0042", 3)
+    finally:
+        _reset(saved)
+
+
 def test_paper_identity_joins_copies_and_keeps_unknown_keys_apart(tmp_path):
     meta = {
         "DDDD0001": {
