@@ -2012,6 +2012,10 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                 llm_timeout=self.default_embedding_timeout,
                 queue_name="Embedding func",
                 concurrency_group="embedding",
+                # Unbounded: a vector flush gathers every batch at once, so a cap
+                # saves no memory, and past it a query-priority call waits for
+                # admission behind the whole overflow before its priority counts.
+                max_queue_size=0,
             )(self.embedding_func.func)
             # Use dataclasses.replace() to create a new instance, leaving the original unchanged
             self.embedding_func = replace(self.embedding_func, func=wrapped_func)

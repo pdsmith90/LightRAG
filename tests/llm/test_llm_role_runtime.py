@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 from lightrag import LightRAG, ROLES, RoleLLMConfig
+from lightrag.constants import DEFAULT_QUERY_PRIORITY
 from lightrag.llm.binding_options import OpenAILLMOptions
 from lightrag.utils import EmbeddingFunc, Tokenizer, priority_limit_async_func_call
 
@@ -888,6 +889,56 @@ async def test_embedding_and_rerank_queue_status_are_observable(tmp_path):
     assert rerank_status["available"] is True
     assert rerank_status["queue_name"] == "Rerank func"
     assert rerank_status["max_async"] == rag.rerank_model_max_async
+
+
+@pytest.mark.asyncio
+async def test_query_embedding_is_not_queued_behind_a_flush_backlog(tmp_path):
+    """A vector flush submits every embedding batch at once. Past a bounded
+    queue's capacity those calls wait for admission in arrival order, and a
+    query's priority only counts once it is admitted -- so a query sent during
+    a big flush used to wait for the whole overflow to drain first."""
+    gate = asyncio.Event()
+    order: list[str] = []
+
+    async def gated_embedding(texts: list[str]) -> np.ndarray:
+        await gate.wait()
+        order.append(texts[0])
+        return np.zeros((len(texts), 16))
+
+    rag = LightRAG(
+        working_dir=str(tmp_path / "flush-backlog"),
+        workspace="flush-backlog",
+        llm_model_func=_base_llm,
+        embedding_func=EmbeddingFunc(
+            embedding_dim=16, max_token_size=4096, func=gated_embedding
+        ),
+        embedding_func_max_async=1,
+        tokenizer=Tokenizer("mock-tokenizer", _SimpleTokenizerImpl()),
+    )
+
+    async def settled(in_flight: int) -> None:
+        for _ in range(500):
+            status = await rag.get_embedding_queue_status()
+            if status["in_flight"] == in_flight and status["running"] == 1:
+                return
+            await asyncio.sleep(0.01)
+        raise AssertionError(f"embedding queue never settled: {status}")
+
+    backlog = [
+        asyncio.create_task(rag.embedding_func([f"batch-{i}"], context="document"))
+        for i in range(1100)
+    ]
+    await settled(1100)
+    query = asyncio.create_task(
+        rag.embedding_func(["query"], context="query", _priority=DEFAULT_QUERY_PRIORITY)
+    )
+    await settled(1101)
+    gate.set()
+    await asyncio.gather(query, *backlog)
+    await rag.finalize_storages()
+
+    # Only the batch already running at the gate may finish before the query.
+    assert order.index("query") <= 1, order.index("query")
 
 
 @pytest.mark.asyncio
