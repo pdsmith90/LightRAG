@@ -340,3 +340,31 @@ async def test_a_document_that_never_returns_gets_its_summaries_rebuilt_anyway(
     await rag._resummarize_kept_summaries(status, lock)
     assert calls and calls[0]["entities_to_rebuild"] == {"QUUX": ["c1", "c9"]}
     assert load_json(rag._kept_summaries_path()) == {}
+
+
+@pytest.mark.asyncio
+async def test_a_hub_over_the_chunk_cap_is_left_to_the_merge(tmp_path, monkeypatch):
+    report = KGRebuildReport()
+    report.kept_entities.update({"QUUX", "HUB"})
+    report.kept_relationships.add(("BLORP", "QUUX"))
+    rag = _resummary_rag(tmp_path, {"d1": {"status": "processed"}})
+    cap = rag._KEPT_SUMMARIES_MAX_CHUNKS
+    rag.entity_chunks.data["HUB"] = {
+        "chunk_ids": [f"h{i}" for i in range(cap + 1)],
+        "count": cap + 1,
+    }
+    rag._record_kept_summaries("d1", report)
+    calls = []
+
+    async def spy(**kwargs):
+        calls.append(kwargs)
+        return KGRebuildReport()
+
+    monkeypatch.setattr("lightrag.lightrag.rebuild_knowledge_from_chunks", spy)
+    status, lock = _status()
+    await rag._resummarize_kept_summaries(status, lock)
+    # the hub keeps its summary for the merge; the small entity and the relation
+    # are rebuilt, and the document's entry is done either way
+    assert calls and calls[0]["entities_to_rebuild"] == {"QUUX": ["c1", "c9"]}
+    assert calls[0]["relationships_to_rebuild"] == {("BLORP", "QUUX"): ["c9"]}
+    assert load_json(rag._kept_summaries_path()) == {}

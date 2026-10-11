@@ -6975,6 +6975,13 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
     _KEPT_SUMMARIES_FILE = "kg_kept_summaries.json"
     # A document not back after this long is rebuilt anyway, from what remains.
     _KEPT_SUMMARIES_MAX_AGE_S = 3 * 86400
+    # A hub -- an entity or relation with more chunks than this -- is left to the
+    # merge: the document's own fragments are a sliver of its summary, the merge
+    # re-summarizes it once force_llm_summary_on_merge fragments accumulate, and a
+    # full rebuild is a map-reduce over hundreds of fragments. Measured on one
+    # batch, 174 of 840 kept entities had over 100 chunks and made 73 % of the
+    # cache reads.
+    _KEPT_SUMMARIES_MAX_CHUNKS = 100
 
     def _kept_summaries_path(self) -> str:
         return os.path.join(self.working_dir, self._KEPT_SUMMARIES_FILE)
@@ -7006,8 +7013,10 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         self, pipeline_status: dict, pipeline_status_lock: Any
     ) -> None:
         """Rebuild, with the LLM, every summary a keep_summaries deletion kept for a
-        document that is processed again. Called by the pipeline after each batch,
-        while no merge runs; a failure is logged and the entry waits for the next."""
+        document that is processed again, except a hub's (over
+        _KEPT_SUMMARIES_MAX_CHUNKS chunks), which the merge re-summarizes in its
+        own time. Called by the pipeline after each batch, while no merge runs; a
+        failure is logged and the entry waits for the next."""
         try:
             path = self._kept_summaries_path()
             if not os.path.exists(path):
@@ -7036,16 +7045,22 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                 if pairs
                 else []
             )
+            cap = self._KEPT_SUMMARIES_MAX_CHUNKS
             entities = {
                 name: list(row["chunk_ids"])
                 for name, row in zip(names, entity_rows)
-                if row and row.get("chunk_ids")
+                if row and row.get("chunk_ids") and len(row["chunk_ids"]) <= cap
             }
             relations = {
                 pair: list(row["chunk_ids"])
                 for pair, row in zip(pairs, relation_rows)
-                if row and row.get("chunk_ids")
+                if row and row.get("chunk_ids") and len(row["chunk_ids"]) <= cap
             }
+            hubs = sum(
+                1
+                for row in (*entity_rows, *relation_rows)
+                if row and len(row.get("chunk_ids") or ()) > cap
+            )
             if entities or relations:
                 await rebuild_knowledge_from_chunks(
                     entities_to_rebuild=entities,
@@ -7068,6 +7083,11 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             logger.info(
                 f"[keep_summaries] rebuilt {len(entities)} entity and {len(relations)} "
                 f"relation summaries for {len(back)} re-ingested document(s)"
+                + (
+                    f"; {hubs} hub(s) over {cap} chunks left to the merge"
+                    if hubs
+                    else ""
+                )
             )
         except Exception as e:
             logger.warning(
