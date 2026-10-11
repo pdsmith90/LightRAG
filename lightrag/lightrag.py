@@ -6973,6 +6973,8 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
     # Fork (KEEP SUMMARIES): the entities/relations a keep_summaries deletion left
     # with their old description, per document, until its re-ingest rebuilds them.
     _KEPT_SUMMARIES_FILE = "kg_kept_summaries.json"
+    # A document not back after this long is rebuilt anyway, from what remains.
+    _KEPT_SUMMARIES_MAX_AGE_S = 3 * 86400
 
     def _kept_summaries_path(self) -> str:
         return os.path.join(self.working_dir, self._KEPT_SUMMARIES_FILE)
@@ -7015,10 +7017,12 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                 return
             doc_ids = list(registry)
             rows = await self.doc_status.get_by_ids(doc_ids)
+            too_old = time.time() - self._KEPT_SUMMARIES_MAX_AGE_S
             back = [
                 doc_id
                 for doc_id, row in zip(doc_ids, rows)
-                if row and row.get("status") == DocStatus.PROCESSED
+                if (row and row.get("status") == DocStatus.PROCESSED)
+                or registry[doc_id].get("kept_at", 0) < too_old
             ]
             if not back:
                 return

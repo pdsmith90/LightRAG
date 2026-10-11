@@ -23,7 +23,7 @@ from lightrag.operate import (
     _rebuild_single_entity,
     _rebuild_single_relationship,
 )
-from lightrag.utils import Tokenizer, load_json, make_relation_chunk_key
+from lightrag.utils import Tokenizer, load_json, make_relation_chunk_key, write_json
 from tests.extraction.test_rebuild_synthesis import (
     DummyGraph,
     DummyKV,
@@ -314,3 +314,29 @@ async def test_a_failed_resummary_keeps_the_entry_for_the_next_batch(
     status, lock = _status()
     await rag._resummarize_kept_summaries(status, lock)  # logs, never raises
     assert "d1" in load_json(rag._kept_summaries_path())
+
+
+@pytest.mark.asyncio
+async def test_a_document_that_never_returns_gets_its_summaries_rebuilt_anyway(
+    tmp_path, monkeypatch
+):
+    report = KGRebuildReport()
+    report.kept_entities.add("QUUX")
+    rag = _resummary_rag(tmp_path, {})  # the document is gone from doc_status
+    rag._record_kept_summaries("d1", report)
+    calls = []
+
+    async def spy(**kwargs):
+        calls.append(kwargs)
+        return KGRebuildReport()
+
+    monkeypatch.setattr("lightrag.lightrag.rebuild_knowledge_from_chunks", spy)
+    status, lock = _status()
+    await rag._resummarize_kept_summaries(status, lock)
+    assert calls == []  # recent: it may still come back
+    registry = load_json(rag._kept_summaries_path())
+    registry["d1"]["kept_at"] -= rag._KEPT_SUMMARIES_MAX_AGE_S + 1
+    write_json(registry, rag._kept_summaries_path())
+    await rag._resummarize_kept_summaries(status, lock)
+    assert calls and calls[0]["entities_to_rebuild"] == {"QUUX": ["c1", "c9"]}
+    assert load_json(rag._kept_summaries_path()) == {}
