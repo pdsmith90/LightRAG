@@ -2102,6 +2102,11 @@ class _PipelineMixin:
                     ingress=ingress,
                     token=token,
                 )
+                # Fork (KEEP SUMMARIES): a document this batch re-ingested gets the
+                # summaries its deletion kept rebuilt now, while no merge runs.
+                await self._resummarize_kept_summaries(
+                    pipeline_status, pipeline_status_lock
+                )
 
                 # Atomic exit handoff: if a wake-up signal arrived during this
                 # batch (a manual retry request, the auto-rescan flag, resident

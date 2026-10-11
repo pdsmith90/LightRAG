@@ -170,6 +170,10 @@ class KGRebuildReport:
     degraded_relationships: dict[tuple[str, str], list[str]] = field(
         default_factory=dict
     )
+    # Fork (KEEP SUMMARIES): entities/relations whose current description was kept
+    # because a new one would have needed the LLM; rebuilt after the re-ingest.
+    kept_entities: set[str] = field(default_factory=set)
+    kept_relationships: set[tuple[str, str]] = field(default_factory=set)
 
     @property
     def has_warnings(self) -> bool:
@@ -389,6 +393,11 @@ def _parse_mm_display_name(content: str, fallback: str) -> str:
     return fallback
 
 
+class _KeptSummary(str):
+    """The llm_fallback text _handle_entity_relation_summary returned in place of
+    an LLM summary (fork; KEEP SUMMARIES), so a rebuild can tell it kept one."""
+
+
 async def _handle_entity_relation_summary(
     description_type: str,
     entity_or_relation_name: str,
@@ -471,7 +480,9 @@ async def _handle_entity_relation_summary(
                 return final_description if final_description else "", llm_was_used
             else:
                 if llm_fallback is not None:
-                    return sanitize_text_for_encoding(llm_fallback), llm_was_used
+                    return _KeptSummary(
+                        sanitize_text_for_encoding(llm_fallback)
+                    ), llm_was_used
                 if total_tokens > summary_context_size and len(current_list) <= 2:
                     logger.warning(
                         f"Summarizing {entity_or_relation_name}: Oversize description found"
@@ -489,7 +500,7 @@ async def _handle_entity_relation_summary(
                 return final_summary, True  # LLM was used for final summarization
 
         if llm_fallback is not None:
-            return sanitize_text_for_encoding(llm_fallback), llm_was_used
+            return _KeptSummary(sanitize_text_for_encoding(llm_fallback)), llm_was_used
 
         # Need to split into chunks - Map phase
         # Ensure each chunk has minimum 2 descriptions to guarantee progress
@@ -1492,6 +1503,7 @@ async def rebuild_knowledge_from_chunks(
                         chunk_data_by_id=chunk_data_by_id,
                         structural_fallback=structural_fallback,
                         keep_summaries=keep_summaries,
+                        kept=report.kept_entities if keep_summaries else None,
                     )
                     rebuilt_entities_count += 1
                     if degraded:
@@ -1534,6 +1546,7 @@ async def rebuild_knowledge_from_chunks(
                         chunk_data_by_id=chunk_data_by_id,
                         structural_fallback=structural_fallback,
                         keep_summaries=keep_summaries,
+                        kept=report.kept_relationships if keep_summaries else None,
                     )
                     rebuilt_relationships_count += 1
                     if degraded:
@@ -1953,6 +1966,7 @@ async def _rebuild_single_entity(
     chunk_data_by_id: dict[str, dict[str, Any]] | None = None,
     structural_fallback: bool = False,
     keep_summaries: bool = False,
+    kept: set[str] | None = None,
 ) -> bool:
     """Rebuild a single entity from cached extraction results"""
 
@@ -2114,6 +2128,10 @@ async def _rebuild_single_entity(
                 if keep_summaries
                 else None,
             )
+            if isinstance(final_description, _KeptSummary):
+                final_description = str(final_description)
+                if kept is not None:
+                    kept.add(entity_name)
         else:
             final_description = current_entity.get("description", "")
 
@@ -2192,6 +2210,10 @@ async def _rebuild_single_entity(
             if keep_summaries
             else None,
         )
+        if isinstance(final_description, _KeptSummary):
+            final_description = str(final_description)
+            if kept is not None:
+                kept.add(entity_name)
     else:
         final_description = current_entity.get("description", "")
 
@@ -2235,6 +2257,7 @@ async def _rebuild_single_relationship(
     chunk_data_by_id: dict[str, dict[str, Any]] | None = None,
     structural_fallback: bool = False,
     keep_summaries: bool = False,
+    kept: set[tuple[str, str]] | None = None,
 ) -> bool:
     """Rebuild a single relationship from cached extraction results
 
@@ -2412,6 +2435,10 @@ async def _rebuild_single_relationship(
             if keep_summaries
             else None,
         )
+        if isinstance(final_description, _KeptSummary):
+            final_description = str(final_description)
+            if kept is not None:
+                kept.add((src, tgt))
     else:
         # fallback to keep current(unchanged)
         final_description = current_relationship.get("description", "")

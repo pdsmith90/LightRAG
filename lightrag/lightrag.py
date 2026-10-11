@@ -218,6 +218,8 @@ from lightrag.utils import (
     TokenLimitTruncationTally,
     LLM_TRUNCATION_METADATA_KEY,
     merge_truncation_metadata,
+    load_json,
+    write_json,
 )
 from lightrag.types import KnowledgeGraph
 from dotenv import load_dotenv
@@ -6968,6 +6970,107 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
 
         return rebuild_report
 
+    # Fork (KEEP SUMMARIES): the entities/relations a keep_summaries deletion left
+    # with their old description, per document, until its re-ingest rebuilds them.
+    _KEPT_SUMMARIES_FILE = "kg_kept_summaries.json"
+
+    def _kept_summaries_path(self) -> str:
+        return os.path.join(self.working_dir, self._KEPT_SUMMARIES_FILE)
+
+    def _record_kept_summaries(
+        self, doc_id: str, report: KGRebuildReport | None
+    ) -> None:
+        if report is None or not (report.kept_entities or report.kept_relationships):
+            return
+        path = self._kept_summaries_path()
+        registry = load_json(path) or {}
+        entry = registry.get(doc_id) or {"entities": [], "relations": []}
+        entities = sorted(set(entry["entities"]) | report.kept_entities)
+        relations = sorted(
+            {tuple(pair) for pair in entry["relations"]} | report.kept_relationships
+        )
+        registry[doc_id] = {
+            "entities": entities,
+            "relations": [list(pair) for pair in relations],
+            "kept_at": int(time.time()),
+        }
+        write_json(registry, path)
+        logger.info(
+            f"[keep_summaries] {doc_id}: {len(report.kept_entities)} entity and "
+            f"{len(report.kept_relationships)} relation summaries kept until its re-ingest"
+        )
+
+    async def _resummarize_kept_summaries(
+        self, pipeline_status: dict, pipeline_status_lock: Any
+    ) -> None:
+        """Rebuild, with the LLM, every summary a keep_summaries deletion kept for a
+        document that is processed again. Called by the pipeline after each batch,
+        while no merge runs; a failure is logged and the entry waits for the next."""
+        try:
+            path = self._kept_summaries_path()
+            if not os.path.exists(path):
+                return
+            registry = load_json(path) or {}
+            if not registry:
+                return
+            doc_ids = list(registry)
+            rows = await self.doc_status.get_by_ids(doc_ids)
+            back = [
+                doc_id
+                for doc_id, row in zip(doc_ids, rows)
+                if row and row.get("status") == DocStatus.PROCESSED
+            ]
+            if not back:
+                return
+            names = sorted({n for d in back for n in registry[d]["entities"]})
+            pairs = sorted({tuple(p) for d in back for p in registry[d]["relations"]})
+            entity_rows = await self.entity_chunks.get_by_ids(names) if names else []
+            relation_rows = (
+                await self.relation_chunks.get_by_ids(
+                    [make_relation_chunk_key(s, t) for s, t in pairs]
+                )
+                if pairs
+                else []
+            )
+            entities = {
+                name: list(row["chunk_ids"])
+                for name, row in zip(names, entity_rows)
+                if row and row.get("chunk_ids")
+            }
+            relations = {
+                pair: list(row["chunk_ids"])
+                for pair, row in zip(pairs, relation_rows)
+                if row and row.get("chunk_ids")
+            }
+            if entities or relations:
+                await rebuild_knowledge_from_chunks(
+                    entities_to_rebuild=entities,
+                    relationships_to_rebuild=relations,
+                    knowledge_graph_inst=self.chunk_entity_relation_graph,
+                    entities_vdb=self.entities_vdb,
+                    relationships_vdb=self.relationships_vdb,
+                    text_chunks_storage=self.text_chunks,
+                    llm_response_cache=self.llm_response_cache,
+                    global_config=self._build_global_config(),
+                    pipeline_status=pipeline_status,
+                    pipeline_status_lock=pipeline_status_lock,
+                    entity_chunks_storage=self.entity_chunks,
+                    relation_chunks_storage=self.relation_chunks,
+                )
+                await self._insert_done()
+            for doc_id in back:
+                registry.pop(doc_id, None)
+            write_json(registry, path)
+            logger.info(
+                f"[keep_summaries] rebuilt {len(entities)} entity and {len(relations)} "
+                f"relation summaries for {len(back)} re-ingested document(s)"
+            )
+        except Exception as e:
+            logger.warning(
+                f"[keep_summaries] rebuilding kept summaries failed, kept for the "
+                f"next batch: {e}"
+            )
+
     async def adelete_by_doc_id(
         self, doc_id: str, delete_llm_cache: bool = False, keep_summaries: bool = False
     ) -> DeletionResult:
@@ -7226,7 +7329,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                 # a document that no longer exists.
                 try:
                     deletion_stage = "validate_recovery_anchors"
-                    await self._purge_kg_contributions(
+                    purge_report = await self._purge_kg_contributions(
                         doc_id,
                         chunk_ids,
                         keep_summaries=keep_summaries,
@@ -7236,6 +7339,8 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                 except _PurgeStageError as purge_error:
                     deletion_stage = purge_error.purge_stage
                     raise
+                if keep_summaries:
+                    self._record_kept_summaries(doc_id, purge_report)
 
                 # Mark that deletion operations have started
                 deletion_operations_started = True
@@ -7408,7 +7513,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             # it always did.
             try:
                 deletion_stage = "validate_recovery_anchors"
-                await self._purge_kg_contributions(
+                purge_report = await self._purge_kg_contributions(
                     doc_id,
                     chunk_ids,
                     keep_summaries=keep_summaries,
@@ -7418,6 +7523,8 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             except _PurgeStageError as purge_error:
                 deletion_stage = purge_error.purge_stage
                 raise
+            if keep_summaries:
+                self._record_kept_summaries(doc_id, purge_report)
 
             # 9. Delete LLM cache while the document status still exists so a failure
             # remains retryable via the same doc_id.

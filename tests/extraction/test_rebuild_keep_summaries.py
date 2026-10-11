@@ -23,14 +23,21 @@ from lightrag.operate import (
     _rebuild_single_entity,
     _rebuild_single_relationship,
 )
-from lightrag.utils import Tokenizer
+from lightrag.utils import Tokenizer, load_json, make_relation_chunk_key
 from tests.extraction.test_rebuild_synthesis import (
     DummyGraph,
     DummyKV,
     DummyVector,
     _DummyTokenizer,
 )
-from tests.pipeline.test_purge_primitive import _KV, _Graph, _make_rag, _node, _status
+from tests.pipeline.test_purge_primitive import (
+    _KV,
+    _DocStatus,
+    _Graph,
+    _make_rag,
+    _node,
+    _status,
+)
 
 pytestmark = pytest.mark.offline
 
@@ -208,3 +215,102 @@ async def test_the_purge_passes_keep_summaries_to_the_rebuild(monkeypatch):
             pipeline_status_lock=lock,
         )
     assert seen == [True, False]
+
+
+@pytest.mark.asyncio
+async def test_the_rebuild_reports_which_summaries_it_kept():
+    graph = DummyGraph()
+    await graph.upsert_node(
+        "QUUX", {"description": "Kept", "entity_type": "METHOD", "source_id": "c0"}
+    )
+    await graph.upsert_node(
+        "BLORP", {"description": "Old", "entity_type": "METHOD", "source_id": "c0"}
+    )
+    kept: set = set()
+    many = {
+        f"c{i}": {"QUUX": [{"entity_type": "METHOD", "description": f"q{i}"}]}
+        for i in (1, 2, 3)
+    }
+    for name, chunk_ids, chunk_entities in (
+        ("QUUX", ["c1", "c2", "c3"], many),
+        ("BLORP", ["c1"], {"c1": {"BLORP": [{"description": "Fresh"}]}}),
+    ):
+        await _rebuild_single_entity(
+            knowledge_graph_inst=graph,
+            entities_vdb=DummyVector(),
+            entity_name=name,
+            chunk_ids=chunk_ids,
+            chunk_entities=chunk_entities,
+            llm_response_cache=DummyKV(),
+            global_config=_config(),
+            keep_summaries=True,
+            kept=kept,
+        )
+    # only the entity whose summary would have needed the LLM is reported
+    assert kept == {"QUUX"}
+
+
+def _resummary_rag(tmp_path, statuses):
+    rag = _make_rag(
+        graph=_Graph(nodes={"QUUX": _node("QUUX", ["c1", "c9"])}),
+        entity_chunks=_KV({"QUUX": {"chunk_ids": ["c1", "c9"], "count": 2}}),
+        relation_chunks=_KV(
+            {make_relation_chunk_key("BLORP", "QUUX"): {"chunk_ids": ["c9"]}}
+        ),
+        doc_status=_DocStatus(statuses),
+    )
+    rag.working_dir = str(tmp_path)
+    return rag
+
+
+@pytest.mark.asyncio
+async def test_kept_summaries_are_rebuilt_once_the_document_is_back(
+    tmp_path, monkeypatch
+):
+    report = KGRebuildReport()
+    report.kept_entities.add("QUUX")
+    report.kept_relationships.add(("BLORP", "QUUX"))
+    rag = _resummary_rag(tmp_path, {"d1": {"status": "processing"}})
+    rag._record_kept_summaries("d1", report)
+    registry = load_json(rag._kept_summaries_path())
+    assert registry["d1"]["entities"] == ["QUUX"]
+    assert registry["d1"]["relations"] == [["BLORP", "QUUX"]]
+
+    calls = []
+
+    async def spy(**kwargs):
+        calls.append(kwargs)
+        return KGRebuildReport()
+
+    monkeypatch.setattr("lightrag.lightrag.rebuild_knowledge_from_chunks", spy)
+    status, lock = _status()
+    # not processed yet: nothing rebuilt, the entry waits
+    await rag._resummarize_kept_summaries(status, lock)
+    assert calls == [] and "d1" in load_json(rag._kept_summaries_path())
+
+    # back in the KB: rebuilt with the LLM from every current chunk, entry dropped
+    rag.doc_status.data["d1"]["status"] = "processed"
+    await rag._resummarize_kept_summaries(status, lock)
+    assert len(calls) == 1
+    assert calls[0]["entities_to_rebuild"] == {"QUUX": ["c1", "c9"]}
+    assert calls[0]["relationships_to_rebuild"] == {("BLORP", "QUUX"): ["c9"]}
+    assert not calls[0].get("keep_summaries")
+    assert load_json(rag._kept_summaries_path()) == {}
+
+
+@pytest.mark.asyncio
+async def test_a_failed_resummary_keeps_the_entry_for_the_next_batch(
+    tmp_path, monkeypatch
+):
+    report = KGRebuildReport()
+    report.kept_entities.add("QUUX")
+    rag = _resummary_rag(tmp_path, {"d1": {"status": "processed"}})
+    rag._record_kept_summaries("d1", report)
+
+    async def boom(**kwargs):
+        raise RuntimeError("llm down")
+
+    monkeypatch.setattr("lightrag.lightrag.rebuild_knowledge_from_chunks", boom)
+    status, lock = _status()
+    await rag._resummarize_kept_summaries(status, lock)  # logs, never raises
+    assert "d1" in load_json(rag._kept_summaries_path())
