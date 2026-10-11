@@ -1318,7 +1318,9 @@ async def rebuild_knowledge_from_chunks(
         keep_summaries: Fork (KEEP SUMMARIES), for a deletion the same
             document's re-ingestion will follow: where the surviving fragments
             would need an LLM summary, keep the current description and rewrite
-            only the provenance; the re-ingest merge summarizes it again.
+            only the provenance. The re-ingest merge adds the document's new
+            fragments to it as to a fresh summary; the kept text still carries
+            the document's old contribution until the entity is next summarized.
     """
     if rebuild_policy not in ("best_effort", "rollback"):
         raise ValueError(f"Unsupported KG rebuild policy: {rebuild_policy}")

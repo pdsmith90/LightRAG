@@ -4,9 +4,11 @@ follow can rebuild the entities and relations it shared without the LLM.
 Where the surviving fragments join without a summary, the rebuild is exact as
 before. Where they would need an LLM summary, the current description stays and
 only the provenance (source chunks, file paths, type, keywords, weight) is
-rewritten from the survivors: the re-ingested document's merge reads the kept
-summary as one fragment and summarizes it with its own new fragments, so the
-deletion's LLM pass is skipped rather than moved. Fixtures are invented.
+rewritten from the survivors. The re-ingested document's merge reads the kept
+summary as one fragment and adds its new fragments to it, as it would to a fresh
+summary, so the deletion's LLM pass is skipped, not moved. The cost: the kept
+summary still carries the deleted document's old contribution until that entity
+is next summarized. Fixtures are invented.
 """
 
 from contextlib import asynccontextmanager
