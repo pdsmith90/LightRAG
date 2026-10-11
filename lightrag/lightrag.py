@@ -6261,6 +6261,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         candidate_relations: list[tuple[str, str]] | None = None,
         patch_only: bool = False,
         rebuild_policy: Literal["best_effort", "rollback"] = "best_effort",
+        keep_summaries: bool = False,
         pipeline_status: dict,
         pipeline_status_lock: Any,
     ) -> KGRebuildReport:
@@ -6409,6 +6410,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                     proof.patch_candidate_relations if proof is not None else ()
                 ),
                 rebuild_policy=rebuild_policy,
+                keep_summaries=keep_summaries,
                 pipeline_status=pipeline_status,
                 pipeline_status_lock=pipeline_status_lock,
             )
@@ -6512,6 +6514,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         extra_candidate_entities: tuple[str, ...] = (),
         extra_candidate_relations: tuple[tuple[str, str], ...] = (),
         rebuild_policy: Literal["best_effort", "rollback"],
+        keep_summaries: bool = False,
         pipeline_status: dict,
         pipeline_status_lock: Any,
     ) -> KGRebuildReport:
@@ -6941,6 +6944,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                     entity_chunks_storage=self.entity_chunks,
                     relation_chunks_storage=self.relation_chunks,
                     rebuild_policy=rebuild_policy,
+                    keep_summaries=keep_summaries,
                 )
             except Exception as e:
                 logger.error(f"[purge] Failed to rebuild knowledge from chunks: {e}")
@@ -6965,7 +6969,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         return rebuild_report
 
     async def adelete_by_doc_id(
-        self, doc_id: str, delete_llm_cache: bool = False
+        self, doc_id: str, delete_llm_cache: bool = False, keep_summaries: bool = False
     ) -> DeletionResult:
         """Delete a document and all its related data, including chunks, graph elements.
 
@@ -6998,6 +7002,10 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             doc_id (str): The unique identifier of the document to be deleted.
             delete_llm_cache (bool): Whether to delete cached LLM extraction results
                 associated with the document. Defaults to False.
+            keep_summaries (bool): Fork (KEEP SUMMARIES). For a deletion the
+                document's re-ingestion will follow: rebuild the shared entities and
+                relations without the LLM, keeping a current description wherever a
+                new one would need an LLM summary. Defaults to False.
 
         Returns:
             DeletionResult: An object containing the outcome of the deletion process.
@@ -7221,6 +7229,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                     await self._purge_kg_contributions(
                         doc_id,
                         chunk_ids,
+                        keep_summaries=keep_summaries,
                         pipeline_status=pipeline_status,
                         pipeline_status_lock=pipeline_status_lock,
                     )
@@ -7402,6 +7411,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                 await self._purge_kg_contributions(
                     doc_id,
                     chunk_ids,
+                    keep_summaries=keep_summaries,
                     pipeline_status=pipeline_status,
                     pipeline_status_lock=pipeline_status_lock,
                 )

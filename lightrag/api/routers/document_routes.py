@@ -1073,6 +1073,12 @@ class DeleteDocRequest(BaseModel):
         default=False,
         description="Whether to delete cached LLM extraction results for the documents.",
     )
+    keep_summaries: bool = Field(
+        default=False,
+        description="For a deletion the documents' re-ingestion will follow: rebuild "
+        "the entities and relations they shared without the LLM, keeping a current "
+        "description wherever a new one would need an LLM summary (fork).",
+    )
 
     @field_validator("doc_ids", mode="after")
     @classmethod
@@ -4154,6 +4160,7 @@ async def background_delete_documents(
     delete_file: bool = False,
     delete_llm_cache: bool = False,
     token: str | None = None,
+    keep_summaries: bool = False,
 ):
     """Background task to delete multiple documents"""
     from lightrag.kg.shared_storage import (
@@ -4235,7 +4242,9 @@ async def background_delete_documents(
                 file_preservation_reason = None
 
                 result = await rag.adelete_by_doc_id(
-                    doc_id, delete_llm_cache=delete_llm_cache
+                    doc_id,
+                    delete_llm_cache=delete_llm_cache,
+                    **({"keep_summaries": True} if keep_summaries else {}),
                 )
                 file_path = (
                     getattr(result, "file_path", "-") if "result" in locals() else "-"
@@ -6561,6 +6570,7 @@ def create_document_routes(
                 delete_request.delete_file,
                 delete_request.delete_llm_cache,
                 destructive_token,
+                keep_summaries=delete_request.keep_summaries,
             )
 
         async def _delete_backstop():

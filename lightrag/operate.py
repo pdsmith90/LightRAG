@@ -399,6 +399,7 @@ async def _handle_entity_relation_summary(
     truncation_tally: TokenLimitTruncationTally | None = None,
     truncation_write_ahead: Callable[[TokenLimitTruncationTally], Awaitable[None]]
     | None = None,
+    llm_fallback: str | None = None,
 ) -> tuple[str, bool]:
     """Handle entity relation description summary using map-reduce approach.
 
@@ -414,6 +415,8 @@ async def _handle_entity_relation_summary(
         description_list: List of description strings to summarize
         global_config: Global configuration containing tokenizer and limits
         llm_response_cache: Optional cache for LLM responses
+        llm_fallback: Fork (KEEP SUMMARIES). When set, returned unchanged
+            wherever the LLM would be called; joins without the LLM still happen
 
     Returns:
         Tuple of (final_summarized_description_string, llm_was_used_boolean)
@@ -467,6 +470,8 @@ async def _handle_entity_relation_summary(
                 )
                 return final_description if final_description else "", llm_was_used
             else:
+                if llm_fallback is not None:
+                    return sanitize_text_for_encoding(llm_fallback), llm_was_used
                 if total_tokens > summary_context_size and len(current_list) <= 2:
                     logger.warning(
                         f"Summarizing {entity_or_relation_name}: Oversize description found"
@@ -482,6 +487,9 @@ async def _handle_entity_relation_summary(
                     truncation_write_ahead=truncation_write_ahead,
                 )
                 return final_summary, True  # LLM was used for final summarization
+
+        if llm_fallback is not None:
+            return sanitize_text_for_encoding(llm_fallback), llm_was_used
 
         # Need to split into chunks - Map phase
         # Ensure each chunk has minimum 2 descriptions to guarantee progress
@@ -1280,6 +1288,7 @@ async def rebuild_knowledge_from_chunks(
     entity_chunks_storage: BaseKVStorage | None = None,
     relation_chunks_storage: BaseKVStorage | None = None,
     rebuild_policy: KGRebuildPolicy = "best_effort",
+    keep_summaries: bool = False,
 ) -> KGRebuildReport:
     """Rebuild entity and relationship descriptions from cached extraction results with parallel processing
 
@@ -1306,6 +1315,10 @@ async def rebuild_knowledge_from_chunks(
             structurally rewrites provenance from the surviving chunks, while
             propagating operational graph/vector/tracking failures so the
             rollback journal remains retryable.
+        keep_summaries: Fork (KEEP SUMMARIES), for a deletion the same
+            document's re-ingestion will follow: where the surviving fragments
+            would need an LLM summary, keep the current description and rewrite
+            only the provenance; the re-ingest merge summarizes it again.
     """
     if rebuild_policy not in ("best_effort", "rollback"):
         raise ValueError(f"Unsupported KG rebuild policy: {rebuild_policy}")
@@ -1476,6 +1489,7 @@ async def rebuild_knowledge_from_chunks(
                         entity_chunks_storage=entity_chunks_storage,
                         chunk_data_by_id=chunk_data_by_id,
                         structural_fallback=structural_fallback,
+                        keep_summaries=keep_summaries,
                     )
                     rebuilt_entities_count += 1
                     if degraded:
@@ -1517,6 +1531,7 @@ async def rebuild_knowledge_from_chunks(
                         entity_chunks_storage=entity_chunks_storage,
                         chunk_data_by_id=chunk_data_by_id,
                         structural_fallback=structural_fallback,
+                        keep_summaries=keep_summaries,
                     )
                     rebuilt_relationships_count += 1
                     if degraded:
@@ -1935,6 +1950,7 @@ async def _rebuild_single_entity(
     entity_chunks_storage: BaseKVStorage | None = None,
     chunk_data_by_id: dict[str, dict[str, Any]] | None = None,
     structural_fallback: bool = False,
+    keep_summaries: bool = False,
 ) -> bool:
     """Rebuild a single entity from cached extraction results"""
 
@@ -2092,6 +2108,9 @@ async def _rebuild_single_entity(
                 GRAPH_FIELD_SEP,
                 global_config,
                 llm_response_cache=llm_response_cache,
+                llm_fallback=current_entity.get("description", "")
+                if keep_summaries
+                else None,
             )
         else:
             final_description = current_entity.get("description", "")
@@ -2167,6 +2186,9 @@ async def _rebuild_single_entity(
             GRAPH_FIELD_SEP,
             global_config,
             llm_response_cache=llm_response_cache,
+            llm_fallback=current_entity.get("description", "")
+            if keep_summaries
+            else None,
         )
     else:
         final_description = current_entity.get("description", "")
@@ -2210,6 +2232,7 @@ async def _rebuild_single_relationship(
     entity_chunks_storage: BaseKVStorage | None = None,
     chunk_data_by_id: dict[str, dict[str, Any]] | None = None,
     structural_fallback: bool = False,
+    keep_summaries: bool = False,
 ) -> bool:
     """Rebuild a single relationship from cached extraction results
 
@@ -2383,6 +2406,9 @@ async def _rebuild_single_relationship(
             GRAPH_FIELD_SEP,
             global_config,
             llm_response_cache=llm_response_cache,
+            llm_fallback=current_relationship.get("description", "")
+            if keep_summaries
+            else None,
         )
     else:
         # fallback to keep current(unchanged)
