@@ -14,6 +14,9 @@ edge back to its owning documents via chunk ``source_id`` → ``text_chunks`` �
 
 - reports per-document anchor gaps (graph contributions missing from
   ``full_entities`` / ``full_relations``);
+- reports owner documents whose anchor row in one namespace is missing or
+  unusable while the purge guard requires both — without repair they are
+  permanently undeletable;
 - reports irrecoverable orphans (contributions whose source chunks no longer
   exist, so no document can be determined);
 - with ``apply=True``, unions the missing entries into the per-document
@@ -52,6 +55,40 @@ def _split_sources(record: dict[str, Any] | None) -> list[str]:
     return [chunk_id for chunk_id in raw.split(GRAPH_FIELD_SEP) if chunk_id]
 
 
+def _anchor_rows_usable(entities_row: Any, relations_row: Any) -> tuple[bool, bool]:
+    """Mirror of the purge guard's anchor test: present AND the payload a list.
+
+    The guard refuses a purge when either namespace fails this test, so the
+    audit must classify rows exactly the same way — a present-but-malformed
+    row is as undeletable-making as an absent one.
+    """
+    entities_ok = isinstance(entities_row, dict) and isinstance(
+        entities_row.get("entity_names"), list
+    )
+    relations_ok = isinstance(relations_row, dict) and isinstance(
+        relations_row.get("relation_pairs"), list
+    )
+    return entities_ok, relations_ok
+
+
+async def _clear_unusable_anchor_rows(rag, doc_id: str) -> None:
+    """Delete present-but-unusable anchor rows before the union repair.
+
+    ``_union_doc_recovery_anchors`` merges the EXISTING payload into the new
+    row; a malformed payload (say ``relation_pairs`` holding a string) would
+    be unioned in as garbage items. Removing the bad row first makes the
+    union start from nothing and write a clean, well-formed row. Absent rows
+    need no clearing — the union already treats them as empty.
+    """
+    entities_row = await rag.full_entities.get_by_id(doc_id)
+    relations_row = await rag.full_relations.get_by_id(doc_id)
+    entities_ok, relations_ok = _anchor_rows_usable(entities_row, relations_row)
+    if entities_row is not None and not entities_ok:
+        await rag.full_entities.delete([doc_id])
+    if relations_row is not None and not relations_ok:
+        await rag.full_relations.delete([doc_id])
+
+
 async def _map_chunks_to_docs(
     rag, chunk_ids: set[str], batch_size: int
 ) -> dict[str, str]:
@@ -81,10 +118,17 @@ async def audit_kg_integrity(
     - ``missing_entity_anchors`` / ``missing_relation_anchors``:
       ``{doc_id: [entity_name | [src, tgt], ...]}`` contributions absent from
       the document's anchor row;
+    - ``incomplete_anchor_docs``: owners of graph contributions whose
+      ``full_entities`` / ``full_relations`` row is missing or unusable in at
+      least one namespace. The purge guard requires BOTH rows, and such a
+      document is invisible to the per-namespace gap checks for the namespace
+      it owns nothing in and to the anchorless certification (it owns
+      something), so without this class it would be permanently undeletable.
+      Repaired additively with ``apply=True``;
     - ``orphan_entities`` / ``orphan_relations``: contributions with no
       resolvable source chunk (reported, never modified);
-    - ``anchorless_docs``: documents with no anchor rows that own nothing in
-      the graph — see below;
+    - ``anchorless_docs``: documents with no usable anchor rows that own
+      nothing in the graph — see below;
     - ``repaired_docs``: doc ids whose anchors were updated (``apply=True``).
 
     **Certifying absence.** A document can legitimately own nothing in the
@@ -152,22 +196,35 @@ async def audit_kg_integrity(
         for doc_id in docs:
             doc_relations.setdefault(doc_id, set()).add(pair)
 
-    # Compare with the stored anchor rows.
+    # Compare with the stored anchor rows. One pass over every owner so a row
+    # that is missing or unusable in the namespace the document owns NOTHING
+    # in is still seen: the legacy shape (a complete full_entities row, no
+    # full_relations row at all, no relation contributions) is refused by the
+    # purge guard but was invisible to both per-namespace gap checks before.
     missing_entity_anchors: dict[str, list[str]] = {}
-    for doc_id, names in doc_entities.items():
-        row = await rag.full_entities.get_by_id(doc_id)
-        anchored = set((row or {}).get("entity_names") or [])
-        missing = sorted(names - anchored)
-        if missing:
-            missing_entity_anchors[doc_id] = missing
-
     missing_relation_anchors: dict[str, list[list[str]]] = {}
-    for doc_id, pairs in doc_relations.items():
-        row = await rag.full_relations.get_by_id(doc_id)
-        anchored = {tuple(p) for p in ((row or {}).get("relation_pairs") or [])}
-        missing = sorted(pairs - anchored)
-        if missing:
-            missing_relation_anchors[doc_id] = [list(p) for p in missing]
+    incomplete_anchor_docs: list[str] = []
+    for doc_id in sorted(set(doc_entities) | set(doc_relations)):
+        entities_row = await rag.full_entities.get_by_id(doc_id)
+        relations_row = await rag.full_relations.get_by_id(doc_id)
+        entities_ok, relations_ok = _anchor_rows_usable(entities_row, relations_row)
+        if not (entities_ok and relations_ok):
+            incomplete_anchor_docs.append(doc_id)
+        # An unusable row anchors nothing: every owned contribution counts as
+        # missing and the union repair (after clearing the bad row) rewrites
+        # the full, well-formed set.
+        anchored_names = set(entities_row["entity_names"]) if entities_ok else set()
+        missing_names = sorted(doc_entities.get(doc_id, set()) - anchored_names)
+        if missing_names:
+            missing_entity_anchors[doc_id] = missing_names
+        anchored_pairs = (
+            {tuple(p) for p in relations_row["relation_pairs"]}
+            if relations_ok
+            else set()
+        )
+        missing_pairs = sorted(doc_relations.get(doc_id, set()) - anchored_pairs)
+        if missing_pairs:
+            missing_relation_anchors[doc_id] = [list(p) for p in missing_pairs]
 
     # Documents that own nothing in the graph AND carry no anchor rows. The
     # completed scan above is what makes this a positive statement rather than
@@ -178,10 +235,14 @@ async def audit_kg_integrity(
     )
 
     repaired_docs: list[str] = []
-    if apply and (missing_entity_anchors or missing_relation_anchors):
-        for doc_id in sorted(
-            set(missing_entity_anchors) | set(missing_relation_anchors)
-        ):
+    repair_ids = (
+        set(missing_entity_anchors)
+        | set(missing_relation_anchors)
+        | set(incomplete_anchor_docs)
+    )
+    if apply and repair_ids:
+        for doc_id in sorted(repair_ids):
+            await _clear_unusable_anchor_rows(rag, doc_id)
             await rag._union_doc_recovery_anchors(
                 doc_id,
                 missing_entity_anchors.get(doc_id, []),
@@ -197,6 +258,7 @@ async def audit_kg_integrity(
         # namespaces, so a document with no contributions ends up with the
         # present-and-empty pair that IS the normal proof for one.
         for doc_id in anchorless_docs:
+            await _clear_unusable_anchor_rows(rag, doc_id)
             await rag._union_doc_recovery_anchors(doc_id, [], [])
             repaired_docs.append(doc_id)
         logger.info(
@@ -209,6 +271,7 @@ async def audit_kg_integrity(
         "relations_total": len(edge_sources),
         "missing_entity_anchors": missing_entity_anchors,
         "missing_relation_anchors": missing_relation_anchors,
+        "incomplete_anchor_docs": incomplete_anchor_docs,
         "orphan_entities": sorted(orphan_entities),
         "orphan_relations": sorted(orphan_relations),
         "anchorless_docs": anchorless_docs,
@@ -222,7 +285,7 @@ async def _find_anchorless_docs(
     doc_relations: dict[str, set[tuple[str, str]]],
     batch_size: int,
 ) -> list[str]:
-    """Documents proven to own nothing in the graph and holding no anchor rows.
+    """Documents proven to own nothing in the graph and holding no usable anchors.
 
     Only documents in a TERMINAL state are considered. A document still moving
     through the pipeline may be about to write its anchors, and while writing
@@ -256,9 +319,12 @@ async def _find_anchorless_docs(
         for doc_id, entities_row, relations_row in zip(
             batch, entity_rows, relation_rows
         ):
-            # Row PRESENCE is the test, matching the purge contract: a present
-            # but empty row already is a valid proof and needs no repair.
-            if isinstance(entities_row, dict) and isinstance(relations_row, dict):
+            # Row USABILITY is the test, mirroring the purge contract exactly:
+            # a present but empty row already is a valid proof and needs no
+            # repair, while a present but malformed one (payload not a list)
+            # is refused by the guard exactly like an absent one.
+            entities_ok, relations_ok = _anchor_rows_usable(entities_row, relations_row)
+            if entities_ok and relations_ok:
                 continue
             anchorless.append(doc_id)
     return anchorless
@@ -274,6 +340,10 @@ def _print_report(report: dict[str, Any], verbose: bool) -> None:
     )
     print(f"Documents with anchor gaps: {len(missing_docs)}")
     print(
+        f"Owner documents with a missing/unusable anchor row: "
+        f"{len(report['incomplete_anchor_docs'])}"
+    )
+    print(
         f"Orphans (no resolvable source chunk): "
         f"{len(report['orphan_entities'])} entities, "
         f"{len(report['orphan_relations'])} relations"
@@ -283,6 +353,8 @@ def _print_report(report: dict[str, Any], verbose: bool) -> None:
     if verbose:
         for doc_id, names in report["missing_entity_anchors"].items():
             print(f"  {doc_id}: missing entity anchors: {names}")
+        for doc_id in report["incomplete_anchor_docs"]:
+            print(f"  {doc_id}: anchor row missing/unusable in one namespace")
         for doc_id, pairs in report["missing_relation_anchors"].items():
             print(f"  {doc_id}: missing relation anchors: {pairs}")
         for name in report["orphan_entities"]:

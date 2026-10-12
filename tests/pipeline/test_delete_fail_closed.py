@@ -262,6 +262,86 @@ async def test_audit_repair_unblocks_the_refused_delete(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_audit_repairs_owner_whose_relation_anchor_row_never_existed(tmp_path):
+    """The production legacy shape: a complete ``full_entities`` row, NO
+    ``full_relations`` row at all, and the document owns entities but no
+    relations.
+
+    The guard refuses (both rows are the proof), yet the document used to be
+    invisible to the audit: it owns nothing in the relations namespace, so the
+    relation-gap check never looked at it, and owning entities excluded it
+    from the anchorless certification. Without the ``incomplete_anchor_docs``
+    class it stayed permanently undeletable.
+    """
+    rag = await _build_rag(tmp_path, f"dfc-{uuid4().hex[:8]}")
+    try:
+        doc_id = await _ingest(rag)
+        # Reduce the document to entity-only ownership: drop the edge from the
+        # graph, then drop its relations anchor row.
+        await rag.chunk_entity_relation_graph.remove_edges([("ACME", "ALICE")])
+        await rag.full_relations.delete([doc_id])
+        await rag.full_relations.index_done_callback()
+        assert await rag.full_entities.get_by_id(doc_id) is not None
+        assert await rag.full_relations.get_by_id(doc_id) is None
+
+        assert (await rag.adelete_by_doc_id(doc_id)).status_code == 409
+
+        report = await audit_kg_integrity(rag)
+        assert report["incomplete_anchor_docs"] == [doc_id]
+        assert report["missing_entity_anchors"] == {}
+        assert report["missing_relation_anchors"] == {}
+        assert report["anchorless_docs"] == []
+
+        report = await audit_kg_integrity(rag, apply=True)
+        assert doc_id in report["repaired_docs"]
+        row = await rag.full_relations.get_by_id(doc_id)
+        assert row is not None and row["relation_pairs"] == []
+        # The entities anchor survives the repair intact.
+        entities_row = await rag.full_entities.get_by_id(doc_id)
+        assert "ALICE" in entities_row["entity_names"]
+
+        result = await rag.adelete_by_doc_id(doc_id)
+        assert result.status == "success", result.message
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_audit_certifies_anchorless_doc_with_unusable_relation_row(tmp_path):
+    """A present-but-malformed row refuses exactly like an absent one.
+
+    The anchorless certification used to test row PRESENCE; a document whose
+    ``relation_pairs`` payload is corrupt (not a list) was skipped as already
+    proven while the guard still refused it. The repair must produce a CLEAN
+    empty row, not union the garbage payload into the new one.
+    """
+    rag = await _build_rag(tmp_path, f"dfc-{uuid4().hex[:8]}")
+    try:
+        doc_id = await _ingest_skip_kg(rag)  # provably owns nothing in the graph
+        # A skip_kg document carries the pre_graph write-state marker, which
+        # is itself a proof; strip it so the anchors are the only proof left,
+        # as for a legacy document written before the marker existed.
+        await _strip_write_state(rag, doc_id)
+        await rag.full_relations.upsert(
+            {doc_id: {"relation_pairs": "corrupt", "count": 0}}
+        )
+        await rag.full_relations.index_done_callback()
+
+        assert (await rag.adelete_by_doc_id(doc_id)).status_code == 409
+
+        report = await audit_kg_integrity(rag, apply=True)
+        assert doc_id in report["anchorless_docs"]
+        assert doc_id in report["repaired_docs"]
+        row = await rag.full_relations.get_by_id(doc_id)
+        assert row is not None and row["relation_pairs"] == []
+
+        result = await rag.adelete_by_doc_id(doc_id)
+        assert result.status == "success", result.message
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
 async def test_delete_without_anchors_used_to_orphan_the_graph(tmp_path):
     """Differential guard for the exact regression in the issue report.
 
