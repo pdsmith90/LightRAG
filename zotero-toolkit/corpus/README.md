@@ -107,6 +107,38 @@ token on a line counts. An entry is one of two things:
 `build_corpus.py` skips denylisted outputs, and `quarantine_junk.py` moves them out.
 Both scripts use the same loader.
 
+### edition_gate.py — the newer edition supersedes
+
+**Policy.** When the library holds more than one edition of a book, only the newest
+is kept, at download and at ingest alike. A fetcher that finds several editions takes
+the newest, and the item record is updated to describe the edition attached. An
+older-edition record whose newer edition the library already holds is merged into the
+newer one, as Zotero's Merge Items does it: the newer record takes the old one's
+collections and a `dc:replaces` relation, and the old record goes to the trash. An
+edition *older* than the record is not attached. At ingest, `edition_gate.py` appends
+every attachment of an older edition to a denylist, so `build_corpus.py` never builds
+it and `quarantine_junk.py` moves aside anything already built.
+
+Two `book` items are editions of one work when the first creators share a surname
+(case and accents folded), the main titles match (subtitle and `(… ed.)` note dropped),
+any volume number or roman numeral in them is equal, and, when both carry a subtitle,
+the subtitles match too. The newer edition must be strictly later and hold a PDF, EPUB
+or DjVu attachment. Items in the Zotero trash are ignored. Run it after
+`build_metadata.py` and before `build_corpus.py`:
+
+```bash
+python3 corpus/edition_gate.py --zotero ~/Zotero --denylist dupe_denylist.txt --dry-run
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--zotero DIR` | `~/Zotero` | Zotero data directory (contains `zotero.sqlite`, opened read-only). |
+| `--denylist FILE` | required | Denylist the superseded attachment keys are appended to. Keys already listed are skipped, so a rerun adds nothing. Pass the same file to `build_corpus.py` and `quarantine_junk.py`. |
+| `--dry-run` | off | Print the entries without writing them. |
+
+Like `quarantine_junk.py`, this keeps an edition out of the corpus. An older edition
+LightRAG has already ingested stays in the index until its document is deleted there.
+
 ## Output
 
 ### File names
