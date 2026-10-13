@@ -494,10 +494,11 @@ def extract_markdown(
         if stripped.startswith("$$"):
             consumed, latex = _consume_block_equation(lines, i)
             if consumed > 0:
-                ref = _next_ref("e")
-                out.equations[ref] = latex
-                cur_lines.append(equation_marker(ref))
-                has_block_payload = True
+                if latex:  # an empty ``$$`` pair carries nothing to analyze
+                    ref = _next_ref("e")
+                    out.equations[ref] = latex
+                    cur_lines.append(equation_marker(ref))
+                    has_block_payload = True
                 i += consumed
                 continue
 
@@ -565,26 +566,60 @@ def extract_markdown(
     return out
 
 
+_EQUATION_TAG_RE = re.compile(r"\(\s*([0-9A-Za-z][0-9A-Za-z.\-]*)\s*\)")
+
+
+def _closing_tail(rest: str) -> str | None:
+    """Classify the text after a closing ``$$``.
+
+    ``""`` for nothing or a lone punctuation mark, ``"\\tag{N}"`` for an
+    equation number ``(N)``, ``None`` when it is prose (not a closing fence).
+    """
+    rest = rest.strip()
+    if rest in ("", ".", ",", ";", ":"):
+        return ""
+    match = _EQUATION_TAG_RE.fullmatch(rest)
+    return f"\\tag{{{match.group(1)}}}" if match else None
+
+
 def _consume_block_equation(lines: list[str], start: int) -> tuple[int, str]:
     """Parse a ``$$``-delimited block equation starting at ``lines[start]``.
 
     Returns ``(lines_consumed, latex)`` or ``(0, "")`` when the block is not
     closed (treated as plain text by the caller). Only paragraph-level math is
     recognised: the opening line's stripped text must start with ``$$``.
+
+    A block ends at its paragraph: TeX forbids a blank line inside display
+    math, so an unpaired fence (common in OCR Markdown) stays plain text
+    instead of pairing with the next equation's fence and flipping every
+    later block inside out. An equation number after the closing fence,
+    ``$$ (24)``, closes the block and is kept as ``\\tag{24}``.
     """
     first = lines[start].strip()
     inner_first = first[2:]
-    # Single-line ``$$ … $$``.
-    if inner_first.rstrip().endswith("$$") and len(inner_first.rstrip()) >= 2:
-        latex = inner_first.rstrip()[:-2].strip()
-        return 1, latex
-    # Multi-line: collect until a line whose stripped text ends with ``$$``.
+    # Single-line ``$$ … $$``, optionally numbered: ``$$ … $$ (3)``.
+    close = inner_first.find("$$")
+    if close >= 0:
+        tail = _closing_tail(inner_first[close + 2 :])
+        if tail is not None:
+            return 1, "\n".join(p for p in (inner_first[:close].strip(), tail) if p)
+    # Multi-line: collect until a closing fence within the same paragraph.
     body: list[str] = []
     if inner_first.strip():
         body.append(inner_first.strip())
     j = start + 1
     while j < len(lines):
         s = lines[j].strip()
+        if not s:
+            return 0, ""
+        if s.startswith("$$"):
+            tail = _closing_tail(s[2:])
+            if tail is None:
+                # Another equation opens here: this one was never closed.
+                return 0, ""
+            if tail:
+                body.append(tail)
+            return (j - start + 1), "\n".join(body).strip()
         if s.endswith("$$"):
             tail = s[:-2].strip()
             if tail:

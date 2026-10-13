@@ -480,6 +480,42 @@ def test_unclosed_block_equation_is_plain_text():
     assert "$$" in ex.blocks[0]["content"]
 
 
+def test_equation_number_after_closing_fence_closes_the_block():
+    md = "$$\nE = mc^2\n$$ (24)\n\nprose between\n\n$$\nF = ma\n$$\n"
+    ex = _extract(md)
+    assert list(ex.equations.values()) == ["E = mc^2\n\\tag{24}", "F = ma"]
+    assert "prose between" in ex.blocks[0]["content"]
+
+
+def test_unpaired_fence_does_not_pair_with_the_next_equation():
+    md = "$$\n\nprose one\n\n$$\nA = 1\n$$\n\nprose two\n"
+    ex = _extract(md)
+    assert list(ex.equations.values()) == ["A = 1"]
+    content = ex.blocks[0]["content"]
+    assert "prose one" in content and "prose two" in content
+
+
+def test_adjacent_blocks_and_an_empty_pair_yield_no_empty_equation():
+    md = "$$\nA = 1\n$$\n\n$$\nB = 2\n$$\n\n$$\n$$\n\ntail\n"
+    ex = _extract(md)
+    assert list(ex.equations.values()) == ["A = 1", "B = 2"]
+    assert "tail" in ex.blocks[0]["content"]
+
+
+def test_numbered_single_line_equation():
+    ex = _extract("$$ L = [a \\quad b] $$ (B.13)\n")
+    assert list(ex.equations.values()) == ["L = [a \\quad b]\n\\tag{B.13}"]
+
+
+def test_prose_after_a_single_line_equation_stays_plain_text():
+    md = (
+        "$$u = v$$ (A.2) Because the u are scalars\n\nnext paragraph\n\n$$\nB = 2\n$$\n"
+    )
+    ex = _extract(md)
+    assert list(ex.equations.values()) == ["B = 2"]
+    assert "Because the u are scalars" in ex.blocks[0]["content"]
+
+
 def test_inline_image_local_and_external_and_dedup():
     md = "![a](one.png) and ![b](one.png) and ![c](http://x/y.png)"
     resolver = _StubResolver()

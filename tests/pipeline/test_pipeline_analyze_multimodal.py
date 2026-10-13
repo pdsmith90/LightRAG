@@ -936,6 +936,36 @@ async def test_equation_omitted_field_falls_back_to_sidecar_latex(
 
 
 @pytest.mark.asyncio
+async def test_empty_equation_is_skipped_not_fatal(tmp_path):
+    """An empty equation item (an older native parse of OCR Markdown with
+    malformed ``$$`` fences) is skipped like an empty table instead of
+    failing the whole document, and costs no LLM call."""
+    extract_log: list[dict] = []
+    rag = _build_rag(
+        tmp_path,
+        vlm_process_enable=True,
+        vlm_func=_make_vlm_mock([]),
+        extract_func=_make_extract_mock(extract_log),
+    )
+    await rag.initialize_storages()
+    try:
+        doc_id, parsed_data, equations_path = _write_equation_fixture(tmp_path, "")
+        await rag.analyze_multimodal(
+            doc_id=doc_id,
+            file_path="fixture.pdf",
+            parsed_data=parsed_data,
+            process_options="e",
+        )
+        assert extract_log == []
+        payload = json.loads(equations_path.read_text(encoding="utf-8"))
+        result = payload["equations"]["eq-001"]["llm_analyze_result"]
+        assert result["status"] == "skipped"
+        assert result["message"] == "missing equation content"
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
 async def test_equation_equ_alias_accepted(
     tmp_path, caplog, _propagate_lightrag_logger
 ):
