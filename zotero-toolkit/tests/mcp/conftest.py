@@ -109,6 +109,10 @@ class FakeLightRAG:
                 pass
 
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        # server_close() then joins the handler threads: a slow route whose client already
+        # timed out must not still be writing to stderr at interpreter shutdown, which
+        # aborts the run (exit 134) after every test has passed.
+        self.httpd.daemon_threads = False
         self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}"
         self.thread = threading.Thread(
             target=self.httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
