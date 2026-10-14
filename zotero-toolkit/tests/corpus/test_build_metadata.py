@@ -127,6 +127,32 @@ def test_rebuild_carries_forward_keys_zotero_no_longer_has(tmp_path):
     assert "orphan" not in json.loads(out.read_text(encoding="utf-8"))["TEST0101"]
 
 
+def test_parent_metadata_edit_updates_existing_attachment_without_file_change(tmp_path):
+    zdir, out = tmp_path / "zotero", tmp_path / "meta.json"
+    make_zotero_db(zdir, LIBRARY)
+    assert (
+        run_script("build_metadata.py", "--zotero", zdir, "--out", out).returncode == 0
+    )
+    old = json.loads(out.read_text(encoding="utf-8"))
+
+    changed = [dict(item) for item in LIBRARY]
+    changed[0] = {
+        **changed[0],
+        "fields": {**changed[0]["fields"], "title": "Corrected title", "date": "2016"},
+        "creators": [("LeCun", "Yann-Pierre")],
+    }
+    make_zotero_db(zdir, changed)
+    assert (
+        run_script("build_metadata.py", "--zotero", zdir, "--out", out).returncode == 0
+    )
+    fresh = json.loads(out.read_text(encoding="utf-8"))
+    assert fresh["TEST0101"]["title"] == "Corrected title"
+    assert fresh["TEST0101"]["authors"] == ["LeCun Yann-Pierre"]
+    assert fresh["TEST0101"]["year"] == "2016"
+    assert "orphan" not in fresh["TEST0101"]
+    assert fresh["TEST0102"] == old["TEST0102"]
+
+
 def test_unreadable_previous_output_is_replaced_not_fatal(tmp_path):
     zdir, out = tmp_path / "zotero", tmp_path / "meta.json"
     make_zotero_db(zdir, LIBRARY)

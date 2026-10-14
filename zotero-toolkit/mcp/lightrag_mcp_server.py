@@ -65,9 +65,20 @@ MAX_TOP_K = max(1, int(os.environ.get("LIGHTRAG_MCP_MAX_TOP_K", "40")))
 META_PATH = os.path.expanduser(
     os.environ.get("ZOTERO_METADATA") or "~/Zotero/zotero_metadata.json"
 )
+_META_SIGNATURE = None
+_BAD_SIGNATURE = None
+
+
+def _signature(stat):
+    return stat.st_ino, stat.st_mtime_ns, stat.st_size
+
+
 try:
     with open(META_PATH, encoding="utf-8") as _f:
         _META = json.load(_f)
+        if not isinstance(_META, dict):
+            raise ValueError("metadata must be a JSON object")
+        _META_SIGNATURE = _signature(os.fstat(_f.fileno()))
 except Exception as _e:
     _META = {}
     # stderr, never stdout: stdout carries the MCP protocol.
@@ -77,6 +88,34 @@ except Exception as _e:
         f"back to file names",
         file=sys.stderr,
     )
+
+
+def _metadata() -> dict:
+    """Refresh citations after an atomic metadata rebuild, without restarting MCP."""
+    global _META, _META_SIGNATURE, _BAD_SIGNATURE
+    try:
+        signature = _signature(os.stat(META_PATH))
+    except OSError:
+        return _META
+    if signature == _META_SIGNATURE:
+        return _META
+    try:
+        with open(META_PATH, encoding="utf-8") as source:
+            updated = json.load(source)
+            if not isinstance(updated, dict):
+                raise ValueError("metadata must be a JSON object")
+            signature = _signature(os.fstat(source.fileno()))
+    except (OSError, ValueError) as exc:
+        if signature != _BAD_SIGNATURE:
+            print(
+                f"lightrag_mcp_server: cannot refresh {META_PATH}: {exc}",
+                file=sys.stderr,
+            )
+            _BAD_SIGNATURE = signature
+        return _META
+    _META, _META_SIGNATURE, _BAD_SIGNATURE = updated, signature, None
+    return _META
+
 
 mcp = MCPServer("zotero-lightrag")
 
@@ -105,13 +144,14 @@ def _strip_llm_refs(text: str) -> str:
     return "\n".join(out).rstrip()
 
 
-def _cite(file_path: str) -> str:
+def _cite(file_path: str, server_citation: str = "") -> str:
     name = os.path.basename(file_path or "")
     if not re.match(r"^[A-Z0-9]{8}__", name):
         return name or "(untitled source)"  # notes / non-corpus sources
     key = name[:8]
-    m = _META.get(key)
-    if m:
+    if server_citation:
+        cite = server_citation
+    elif m := _metadata().get(key):
         authors = ", ".join(m.get("authors") or []) or None
         parts = [
             p
@@ -134,7 +174,7 @@ def _compiled_refs(references: list, label: str) -> str:
     if not references:
         return ""
     lines = [
-        f"- [{r.get('reference_id', '?')}] {_cite(r.get('file_path', ''))}"
+        f"- [{r.get('reference_id', '?')}] {_cite(r.get('file_path', ''), r.get('citation') or '')}"
         for r in references
     ]
     return f"\n\n### {label}\n" + "\n".join(lines)

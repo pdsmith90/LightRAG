@@ -39,9 +39,10 @@ every entry, in the server's order, keeping the server's `reference_id`s so inli
 markers in an answer still line up.
 
 - A file named `<KEY>__<slug>.md`, where `KEY` is the 8-character Zotero attachment key,
-  is looked up in `zotero_metadata.json`. The result is
-  `Authors. (Year). Title. Publication. doi:DOI [zotero://select/library/items/KEY]`, and
-  empty fields are skipped.
+  uses the LightRAG server's current `citation` when supplied; otherwise it is looked up
+  in the local `zotero_metadata.json`. The local fallback formats
+  `Authors. (Year). Title. Publication. doi:DOI [zotero://select/library/items/KEY]`;
+  the server's citation is kept verbatim with the same Zotero link appended.
 - If the key is not in the metadata, the slug is de-slugged into a title (`Some_Paper_Title`
   becomes `Some Paper Title`) and the `zotero://` link is kept.
 - Any other file name, such as a note added with `add_note`, is listed as the bare file
@@ -62,9 +63,10 @@ by attachment key. The proxy reads only these fields of each entry:
 }
 ```
 
-The file is read once at startup. Restart the MCP server (reconnect it in your client)
-after regenerating it. If the file is missing or unreadable, the server still runs, prints
-one warning to stderr, and cites de-slugged file names.
+The proxy checks the file for changes when compiling citations and reloads it without a
+restart. An atomic replacement takes effect on the next request. If the file becomes
+unreadable, the last valid metadata is retained until it recovers; if it was absent at
+startup, citations fall back to de-slugged file names until the file appears.
 
 ### Answer mode (`answer=True`)
 

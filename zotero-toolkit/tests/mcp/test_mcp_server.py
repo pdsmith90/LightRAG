@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import re
 import time
 
@@ -70,6 +72,57 @@ def test_cite_unresolvable_file_is_bare_filename(load_server):
 def test_cite_uses_basename_of_nested_paths(load_server):
     srv = load_server()
     assert srv._cite("/srv/inputs/__parsed__/AAAA0001__x.md") == VASWANI
+
+
+def test_citation_metadata_refreshes_after_atomic_replacement(
+    load_server, metadata_file
+):
+    srv = load_server()
+    path = "AAAA0001__Attention_Is_All_You_Need.md"
+    assert srv._cite(path) == VASWANI
+
+    updated = json.loads(metadata_file.read_text(encoding="utf-8"))
+    updated["AAAA0001"]["title"] = "Attention Revisited"
+    replacement = metadata_file.with_suffix(".tmp")
+    replacement.write_text(json.dumps(updated), encoding="utf-8")
+    os.replace(replacement, metadata_file)
+    assert srv._cite(path) == VASWANI.replace(
+        "Attention Is All You Need", "Attention Revisited"
+    )
+
+    metadata_file.write_text("{bad json", encoding="utf-8")
+    assert srv._cite(path) == VASWANI.replace(
+        "Attention Is All You Need", "Attention Revisited"
+    )
+    updated["AAAA0001"]["year"] = "2018"
+    replacement.write_text(json.dumps(updated), encoding="utf-8")
+    os.replace(replacement, metadata_file)
+    assert "(2018)" in srv._cite(path)
+
+
+def test_citation_metadata_appearing_after_start_is_used(
+    load_server, tmp_path, metadata_file
+):
+    late = tmp_path / "later.json"
+    srv = load_server(ZOTERO_METADATA=str(late))
+    assert "Attention Is All You Need" not in srv._cite("AAAA0001__x.md")
+    late.write_text(metadata_file.read_text(encoding="utf-8"), encoding="utf-8")
+    assert srv._cite("AAAA0001__x.md") == VASWANI
+
+
+def test_server_citation_wins_over_unsynced_local_metadata(fake_lightrag, load_server):
+    ref = {
+        "reference_id": "1",
+        "file_path": "AAAA0001__Attention_Is_All_You_Need.md",
+        "citation": "Vaswani Ashish. (2018). Corrected by Zotero",
+    }
+    fake_lightrag.routes[("POST", "/query")] = _answer_route("RAW CONTEXT", [ref])
+    srv = load_server()
+    assert srv.search_library("attention").startswith(
+        "### Retrieved documents (compiled citations)\n"
+        "- [1] Vaswani Ashish. (2018). Corrected by Zotero "
+        "[zotero://select/library/items/AAAA0001]"
+    )
 
 
 def test_missing_metadata_degrades_and_warns_on_stderr(load_server, tmp_path, capsys):

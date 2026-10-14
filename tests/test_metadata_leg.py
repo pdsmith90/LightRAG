@@ -9,6 +9,7 @@ the best candidate chunks to library works. Fixtures are invented.
 """
 
 import json
+import os
 
 import pytest
 
@@ -376,6 +377,24 @@ def test_citations_drop_the_title_markup(tmp_path):
         assert zc.citation_for_key("CCCC9999") == ""
     finally:
         _reset(saved)
+
+
+def test_metadata_replacement_updates_citations_and_named_work_lookup(metadata):
+    assert find_works("Okafor 2021") == [("AAAA0002", 2)]
+    updated = json.loads(metadata.read_text(encoding="utf-8"))
+    updated["AAAA0002"] = {
+        "title": "Revised orbit model",
+        "authors": ["Sable Mira"],
+        "year": "2023",
+    }
+    replacement = metadata.with_suffix(".tmp")
+    replacement.write_text(json.dumps(updated), encoding="utf-8")
+    os.replace(replacement, metadata)
+    zc._next_stat = 0.0  # simulate the five-second stat interval passing
+
+    assert zc.citation_for_key("AAAA0002") == "Sable Mira. (2023). Revised orbit model"
+    assert find_works("Sable 2023") == [("AAAA0002", 2)]
+    assert find_works("Okafor 2021") == []
 
 
 def test_notices_name_the_missing_works_and_say_why(metadata):

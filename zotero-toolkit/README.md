@@ -138,8 +138,8 @@ identifies a document by its file name and sets aside a file whose name it has a
 processed. To re-index a changed attachment, or everything a `--force` rebuild produced,
 first delete the old document in LightRAG together with its files, then rebuild and scan;
 [corpus/README.md](corpus/README.md#re-indexing-a-changed-attachment) has the steps.
-Restart the MCP server after regenerating `zotero_metadata.json`, because it reads the
-file once at startup.
+The MCP server reloads `zotero_metadata.json` when it changes; the LightRAG server's
+current citation takes precedence while a client's local copy is still syncing.
 
 ## Configuration
 
