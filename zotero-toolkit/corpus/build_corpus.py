@@ -660,6 +660,9 @@ def _strip_back_index(md: str) -> str:
 
 
 def clean_md(md: str) -> str:
+    md = md.replace(
+        "\x0c", "\n\n"
+    )  # expand form-feeds before stripping C0 controls so page-split documents retain paragraph breaks (2026-10-12)
     md = _ctrl_re.sub("", md)  # C0 control codes: PostgreSQL refuses NUL in text, and a
     # glyph mapped to a control code carries no text anyway (2026-10-06)
     md = _pic_re.sub("", md)  # drop OCR'd figure-scribble noise
@@ -1026,7 +1029,7 @@ def _textlayer_page_md(page) -> str:
 
 
 # ---------- per-format extractors ----------
-def pdf_to_md(path: str) -> str:
+def pdf_to_md(path: str, is_ocr: bool = False) -> str:
     import pymupdf
     import pymupdf4llm
 
@@ -1037,15 +1040,16 @@ def pdf_to_md(path: str) -> str:
     name = os.path.basename(path)
     try:
         doc = pymupdf.open(path)
-        empty, hits, sampled = _image_only_doc(doc)
-        if empty:
-            doc.close()
-            print(
-                f"[build_corpus] IMAGE-ONLY {name}: {hits}/{sampled} sampled pages are a "
-                "full-page image with no text layer -> OCR route",
-                flush=True,
-            )
-            return ""
+        if not is_ocr:
+            empty, hits, sampled = _image_only_doc(doc)
+            if empty:
+                doc.close()
+                print(
+                    f"[build_corpus] IMAGE-ONLY {name}: {hits}/{sampled} sampled pages are a "
+                    "full-page image with no text layer -> OCR route",
+                    flush=True,
+                )
+                return ""
         chunks = pymupdf4llm.to_markdown(
             path, page_chunks=True, show_progress=False, use_ocr=False
         )
@@ -1121,7 +1125,8 @@ def pdf_to_md(path: str) -> str:
         doc.close()
         md = "".join(out)
         if (
-            ocr_pages
+            not is_ocr
+            and ocr_pages
             and ocr_pages >= OCR_PARTIAL_MAX_SHARE * max(len(chunks), 1)
             and CFG.get("ocr_vlm") == "auto"
             and CFG.get("ocr", "auto") in ("auto", "force")
@@ -1296,15 +1301,16 @@ def _vlm_endpoint():
     return found
 
 
-def _vlm_ocr_page(base: str, png: bytes) -> str:
+def _vlm_ocr_page(base: str, img_bytes: bytes) -> str:
     """One page image -> Markdown. Raises on any non-success (the caller abandons the VLM for the document)."""
     import base64
     import urllib.request
 
+    mime = "image/png" if img_bytes.startswith(b"\x89PNG") else "image/jpeg"
     body = {
         "model": OCR_VLM_MODEL,
         "temperature": 0,
-        "repeat_penalty": 1.05,
+        "repeat_penalty": 1.15,
         "max_tokens": OCR_VLM_MAX_TOKENS,
         "chat_template_kwargs": {"enable_thinking": False},
         "messages": [
@@ -1314,8 +1320,8 @@ def _vlm_ocr_page(base: str, png: bytes) -> str:
                     {
                         "type": "image_url",
                         "image_url": {
-                            "url": "data:image/png;base64,"
-                            + base64.b64encode(png).decode()
+                            "url": f"data:{mime};base64,"
+                            + base64.b64encode(img_bytes).decode()
                         },
                     },
                     {"type": "text", "text": OCR_VLM_PROMPT},
@@ -1358,6 +1364,8 @@ def vlm_ocr_pdf_to_md(path: str) -> str:
                 side = max(page.rect.width, page.rect.height) * dpi / 72.0
                 if side > OCR_VLM_MAX_SIDE:
                     dpi = max(60, int(dpi * OCR_VLM_MAX_SIDE / side))
+                # Lossless PNG at the full DPI: shrinking a page to fit a request-size cap costs
+                # dense pages their small print, so raise the proxy's body limit instead.
                 parts.append(
                     _vlm_ocr_page(base, page.get_pixmap(dpi=dpi).tobytes("png"))
                 )
@@ -1478,7 +1486,7 @@ def ocr_pdf_to_md(path: str, pages=None) -> str:
                     flush=True,
                 )
                 subprocess.run(args + [plain, out], check=True, timeout=timeout)
-            return pdf_to_md(out)
+            return pdf_to_md(out, is_ocr=True)
         except Exception as e:
             print(
                 f"[build_corpus] WARN: ocrmypdf failed on {os.path.basename(path)} "
@@ -1831,7 +1839,9 @@ def convert(key: str):
         method += "_empty"
     doc = header(meta, key) + body + "\n"
     tmp = out + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
+    # errors="replace": an OCR text layer can carry a lone surrogate, and this write sits
+    # outside convert()'s try, so a strict encode stopped the whole build (2026-10-14).
+    with open(tmp, "w", encoding="utf-8", errors="replace") as f:
         f.write(doc)
     os.replace(tmp, out)
     if os.path.exists(parsed):

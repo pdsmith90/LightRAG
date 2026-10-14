@@ -134,3 +134,13 @@ def test_pick_primary_prefers_named_file_then_kind_then_size(tmp_path):
     empty.mkdir()
     (empty / ".zotero-ft-cache").write_text("cached text")
     assert pick_primary(str(empty), None) == (None, None)
+
+
+def test_formfeed_preserves_page_breaks():
+    # pdftotext and slide extractions use \x0c (form feed) as page separators without newlines
+    md = "Slide 1 Title\nSlide 1 body text.\x0cSlide 2 Title\nSlide 2 body text.\x0cSlide 3 Title"
+    out = clean_md(md)
+    assert "Slide 1 body text.\n\nSlide 2 Title" in out
+    assert "Slide 2 body text.\n\nSlide 3 Title" in out
+    lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+    assert len(lines) == 5

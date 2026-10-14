@@ -44,7 +44,7 @@ def ocr_with(original, rc, decrypt):
         patched(bc.shutil, "which", lambda name: "/usr/bin/ocrmypdf"),
         patched(bc.subprocess, "run", fake_run),
         patched(bc, "_decrypted_copy", decrypt),
-        patched(bc, "pdf_to_md", lambda path: "ocr text"),
+        patched(bc, "pdf_to_md", lambda path, is_ocr: "ocr text"),
         contextlib.redirect_stdout(out),
     ):
         result = bc.ocr_pdf_to_md(original)

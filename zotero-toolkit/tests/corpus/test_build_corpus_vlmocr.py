@@ -345,6 +345,110 @@ def test_majority_ocr_layer_scan_is_reocrd_by_the_vlm():
         assert bc._pdf_method == "pdf+ocrlayer", bc._pdf_method
 
 
+def test_vlm_ocr_page_payload_and_repeat_penalty():
+    import json
+    import urllib.request
+
+    sent = []
+
+    class FakeResponse:
+        def read(self):
+            return json.dumps(
+                {
+                    "choices": [
+                        {"message": {"content": "page text"}, "finish_reason": "stop"}
+                    ]
+                }
+            ).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+    def fake_urlopen(req, timeout=300):
+        sent.append(json.loads(req.data.decode()))
+        return FakeResponse()
+
+    orig_urlopen = urllib.request.urlopen
+    urllib.request.urlopen = fake_urlopen
+    try:
+        png_bytes = b"\x89PNG\r\n\x1a\nfake"
+        res1 = bc._vlm_ocr_page("http://127.0.0.1:18000", png_bytes)
+        assert res1 == "page text"
+        assert sent[0]["repeat_penalty"] == 1.15
+        assert sent[0]["messages"][0]["content"][0]["image_url"]["url"].startswith(
+            "data:image/png;base64,"
+        )
+
+        jpg_bytes = b"\xff\xd8\xff\xe0fake"
+        res2 = bc._vlm_ocr_page("http://127.0.0.1:18000", jpg_bytes)
+        assert res2 == "page text"
+        assert sent[1]["repeat_penalty"] == 1.15
+        assert sent[1]["messages"][0]["content"][0]["image_url"]["url"].startswith(
+            "data:image/jpeg;base64,"
+        )
+    finally:
+        urllib.request.urlopen = orig_urlopen
+
+
+def test_pdf_to_md_is_ocr_skips_image_only_check():
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, "scan.pdf")
+        image_only_pdf(path, pages=2)
+        bc.CFG.clear()
+        bc.CFG.update({"ocr": "auto", "ocr_vlm": "off"})
+        # Normal pdf_to_md flags it as image-only and returns ""
+        assert bc.pdf_to_md(path) == ""
+        # With is_ocr=True, image-only check is bypassed
+        with fake_llm(["Slide 1 text", "Slide 2 text"]):
+            res = bc.pdf_to_md(path, is_ocr=True)
+            assert "Slide 1 text" in res
+
+
+def test_vlm_ocr_sends_a_dense_page_whole_as_png():
+    calls = []
+
+    def fake_page(base, img_bytes):
+        calls.append(img_bytes)
+        return "transcribed"
+
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, "big.pdf")
+        doc = pymupdf.open()
+        page = doc.new_page(width=1000, height=1000)
+        import numpy as np
+
+        arr = np.random.randint(0, 255, (1000, 1000, 3), dtype=np.uint8)
+        pix = pymupdf.Pixmap(pymupdf.csRGB, 1000, 1000, arr.tobytes(), False)
+        page.insert_image(page.rect, pixmap=pix)
+        doc.save(path)
+        doc.close()
+
+        with (
+            patched(bc, "_vlm_endpoint", lambda: ("local", "http://127.0.0.1:1")),
+            patched(bc, "_vlm_ocr_page", fake_page),
+        ):
+            md = bc.vlm_ocr_pdf_to_md(path)
+        assert md == "transcribed"
+        assert len(calls) == 1
+        # lossless and not shrunk to fit a request-size cap
+        assert calls[0].startswith(b"\x89PNG")
+        assert len(calls[0]) > 1_000_000
+
+
+def test_a_lone_surrogate_in_ocr_text_does_not_stop_the_build():
+    with (
+        tempfile.TemporaryDirectory() as td,
+        fake_llm([]),
+        vlm(page_fn=lambda b, p: VLM_PAGE + " glyph \udc80 end"),
+    ):
+        method, body, log = run_convert(td, image_only_pdf)
+    assert method == "pdf+vlmocr", method
+    assert "glyph ? end" in body
+
+
 if __name__ == "__main__":
     names = [n for n in dir() if n.startswith("test_")]
     for n in names:

@@ -300,7 +300,7 @@ def test_ocr_arguments_and_timeout(tmp_path, monkeypatch):
         doc.close()
     monkeypatch.setattr(bc.shutil, "which", lambda name: "/usr/bin/ocrmypdf")
     monkeypatch.setattr(bc.subprocess, "run", fake_run)
-    monkeypatch.setattr(bc, "pdf_to_md", lambda path: "ocr text")
+    monkeypatch.setattr(bc, "pdf_to_md", lambda path, is_ocr: "ocr text")
     assert bc.ocr_pdf_to_md(ten, [1]) == "ocr text"
     assert bc.ocr_pdf_to_md(ten, list(range(8))) == "ocr text"
     assert bc.ocr_pdf_to_md(ten) == "ocr text"
