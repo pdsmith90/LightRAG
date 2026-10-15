@@ -335,6 +335,10 @@ guards against that in four ways:
   (`--worker-mem-gib`). A document that needs more fails with `error:MemoryError`
   instead of falling back to OCR, and is recorded in the `--oom-keys` file. External
   tools (`ocrmypdf`, pandoc, `djvutxt`, the OCR server) run without the ceiling.
+  The ceiling is on address space, not resident memory, and the layout model's
+  onnxruntime starts about one thread per CPU core: the same document that stays near
+  1.4 GiB resident peaks at roughly 3.3-4.4 GiB of address space on 8 cores and
+  5.3-6.3 GiB on 32. Raise `--worker-mem-gib` on machines with many cores.
 - **A dead worker costs one document.** If a worker dies (killed by the kernel, or a
   crash in a native library), the document it was converting is reported as
   `error:worker_killed` and recorded, and the pool is rebuilt for the rest. A crash

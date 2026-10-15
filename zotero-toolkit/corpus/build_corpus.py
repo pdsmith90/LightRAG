@@ -2173,8 +2173,7 @@ def run_pool(
                 if p.exitcode not in (None, 0, -signal.SIGTERM) and pid in inflight
             }
             # A SIGKILL (the kernel's OOM killer) is recorded at once: converting it again is the blow-up
-            # again. Any other death (a native crash inside the PDF library on an ordinary page, seen
-            # sporadically and never twice in a row on the same document) gets ONE more try before the
+            # again. Any other death (a native crash in a C extension) gets ONE more try before the
             # document is recorded.
             culprits, retried = {}, []
             for pid in died:
