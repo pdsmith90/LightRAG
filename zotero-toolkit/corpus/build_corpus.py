@@ -33,15 +33,20 @@ Run  `python3 build_corpus.py --help`  for all options.
 
 from __future__ import annotations
 import argparse
+import contextlib
 import glob
 import json
+import multiprocessing
 import os
 import re
+import signal
+import sys
 import time
 import shutil
 import subprocess
 import tempfile
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 
 # Denylist semantics are shared with quarantine_junk.py, which runs immediately
 # after this script and would move any denylisted output straight back out.
@@ -1028,6 +1033,56 @@ def _textlayer_page_md(page) -> str:
     return "\n\n".join(paras)
 
 
+# pymupdf4llm's layout model (pymupdf.layout, a graph network over the text boxes of ONE page) builds
+# some 25 dense N x N matrices per page (get_edge_by_directional_nn), about 125 bytes per N^2 by
+# measurement. A page of program output with 12,000-20,000 text spans (a typical book page has about
+# 500) took one pool worker to 16-25 GiB: the kernel's OOM killer took the LightRAG server before it got
+# to the worker, and the build died with BrokenProcessPool. The same page loop also calls
+# page.get_drawings() once per page (a Python dict per vector path, ~4 KB each): one plot page of some
+# 770,000 paths (139 MB of content stream) took a worker to 3.8 GiB and a minute on its own. Such pages
+# never reach the layout model: they are read from the text layer.
+LAYOUT_MAX_BOXES = int(
+    os.environ.get("BUILD_LAYOUT_MAX_BOXES", "3500")
+)  # text spans; N^2 memory, ~3 GiB at the limit; 0 = off
+LAYOUT_MAX_CONTENT_BYTES = int(
+    float(os.environ.get("BUILD_LAYOUT_MAX_CONTENT_MB", "30")) * 2**20
+)  # ~165k paths; 0 = off
+
+
+def _heavy_pages(doc) -> dict:
+    """0-based page -> (text spans, content-stream bytes) for the pages too heavy for the layout model:
+    more than LAYOUT_MAX_BOXES text spans, or a content stream above LAYOUT_MAX_CONTENT_BYTES (see the
+    note above)."""
+    heavy: dict = {}
+    if LAYOUT_MAX_BOXES <= 0 and LAYOUT_MAX_CONTENT_BYTES <= 0:
+        return heavy
+    for pno in range(doc.page_count):
+        try:
+            page = doc[pno]
+            spans, nbytes = 0, 0
+            # a span holds at least one word: counting words first is a cheap pre-filter
+            if LAYOUT_MAX_BOXES > 0 and len(page.get_text("words")) > LAYOUT_MAX_BOXES:
+                spans = sum(
+                    len(ln["spans"])
+                    for b in page.get_text("dict")["blocks"]
+                    if b.get("type") == 0
+                    for ln in b["lines"]
+                )
+            if LAYOUT_MAX_CONTENT_BYTES > 0:
+                nbytes = len(page.read_contents() or b"")
+        except MemoryError:
+            # it cannot even be measured under the worker's ceiling: keep it from the model
+            heavy[pno] = (0, 0)
+            continue
+        except Exception:
+            continue
+        if (LAYOUT_MAX_BOXES > 0 and spans > LAYOUT_MAX_BOXES) or (
+            LAYOUT_MAX_CONTENT_BYTES > 0 and nbytes > LAYOUT_MAX_CONTENT_BYTES
+        ):
+            heavy[pno] = (spans, nbytes)
+    return heavy
+
+
 # ---------- per-format extractors ----------
 def pdf_to_md(path: str, is_ocr: bool = False) -> str:
     import pymupdf
@@ -1050,9 +1105,46 @@ def pdf_to_md(path: str, is_ocr: bool = False) -> str:
                     flush=True,
                 )
                 return ""
-        chunks = pymupdf4llm.to_markdown(
-            path, page_chunks=True, show_progress=False, use_ocr=False
-        )
+        heavy = _heavy_pages(doc)
+        pending_heavy = sorted(heavy)
+        if heavy:
+            print(
+                f"[build_corpus] LAYOUT-SKIP {name}: {len(heavy)} page(s) too heavy for the layout model "
+                f"(> {LAYOUT_MAX_BOXES} text spans or > {LAYOUT_MAX_CONTENT_BYTES >> 20} MB of content; "
+                f"p. {', '.join(str(p + 1) for p in pending_heavy[:8])}{', ...' if len(heavy) > 8 else ''}; "
+                f"max {max(v[0] for v in heavy.values())} spans, "
+                f"{max(v[1] for v in heavy.values()) >> 20} MB) -> read from the text layer",
+                flush=True,
+            )
+        keep = [p for p in range(doc.page_count) if p not in heavy]
+        if not heavy:
+            chunks = pymupdf4llm.to_markdown(
+                path, page_chunks=True, show_progress=False, use_ocr=False
+            )
+        elif keep:
+            chunks = pymupdf4llm.to_markdown(
+                path, page_chunks=True, show_progress=False, use_ocr=False, pages=keep
+            )
+            if not all(
+                isinstance(c, dict) and (c.get("metadata") or {}).get("page_number")
+                for c in chunks
+            ):
+                # The legacy engine (no layout model, so no N x N matrices) numbers its chunks
+                # differently: with a page subset the order of heavy and kept pages cannot be
+                # guaranteed. Convert the whole document, no skip.
+                print(
+                    f"[build_corpus] LAYOUT-SKIP {name}: the engine's chunks carry no page_number "
+                    "-> skip disabled for this document",
+                    flush=True,
+                )
+                heavy, pending_heavy = {}, []
+                chunks = pymupdf4llm.to_markdown(
+                    path, page_chunks=True, show_progress=False, use_ocr=False
+                )
+        else:
+            chunks = []
+        # the document's page count whenever the skip is on; len(chunks), as before, when it is off
+        n_pages = len(chunks) + len(heavy)
         out: list[str] = []
         repaired = regained = total = kept = 0
         ocr_pages = ocr_soup = 0
@@ -1060,6 +1152,21 @@ def pdf_to_md(path: str, is_ocr: bool = False) -> str:
         garbled: list[int] = []
         why: dict[str, int] = {}
         _pdf_page_count = doc.page_count
+
+        def _take_heavy(upto: int) -> None:
+            """Emit the skipped heavy pages numbered below `upto`, in page order, from the text layer."""
+            while pending_heavy and pending_heavy[0] < upto:
+                hp = pending_heavy.pop(0)
+                htext = _textlayer_page_md(doc[hp])
+                bad_layer = garble_reason(htext, GARBLED_PAGE_MIN_NONSPACE)
+                if bad_layer:
+                    # letter soup: dropped, and OCR'd by convert() like any garbled page
+                    garbled.append(hp)
+                    why[bad_layer] = why.get(bad_layer, 0) + 1
+                    htext = ""
+                # not counted as "repaired": the engine never saw the page (the LAYOUT-SKIP line)
+                out.append(htext)
+
         for i, ch in enumerate(chunks):
             text = ch.get("text", "") if isinstance(ch, dict) else str(ch)
             pno = (
@@ -1070,6 +1177,7 @@ def pdf_to_md(path: str, is_ocr: bool = False) -> str:
             if not (0 <= pno < doc.page_count):
                 out.append(text)
                 continue
+            _take_heavy(pno)
             layer, got = _nonws_len(doc[pno].get_text("text")), _nonws_len(text)
             total += layer
             kept += got
@@ -1122,12 +1230,13 @@ def pdf_to_md(path: str, is_ocr: bool = False) -> str:
                     repaired += 1
                     regained += layer
             out.append(text)
+        _take_heavy(doc.page_count)
         doc.close()
         md = "".join(out)
         if (
             not is_ocr
             and ocr_pages
-            and ocr_pages >= OCR_PARTIAL_MAX_SHARE * max(len(chunks), 1)
+            and ocr_pages >= OCR_PARTIAL_MAX_SHARE * max(n_pages, 1)
             and CFG.get("ocr_vlm") == "auto"
             and CFG.get("ocr", "auto") in ("auto", "force")
         ):
@@ -1136,7 +1245,7 @@ def pdf_to_md(path: str, is_ocr: bool = False) -> str:
             if vlm and not garble_reason(vlm):
                 _pdf_method = "pdf+vlmocr"
                 print(
-                    f"[build_corpus] OCR-LAYER {name}: {ocr_pages}/{len(chunks)} Tesseract-layer page(s) "
+                    f"[build_corpus] OCR-LAYER {name}: {ocr_pages}/{n_pages} Tesseract-layer page(s) "
                     f"re-OCR'd by {OCR_VLM_MODEL} ({_ocr_backend})",
                     flush=True,
                 )
@@ -1145,7 +1254,7 @@ def pdf_to_md(path: str, is_ocr: bool = False) -> str:
             _pdf_method = "pdf+textlayer"
             print(
                 f"[build_corpus] TEXTLAYER {name}: pymupdf4llm kept {kept} of {total} text-layer "
-                f"chars ({kept / max(total, 1):.0%}); {repaired}/{len(chunks)} page(s) replaced by "
+                f"chars ({kept / max(total, 1):.0%}); {repaired}/{n_pages} page(s) replaced by "
                 f"their text layer (+{regained} chars)",
                 flush=True,
             )
@@ -1153,7 +1262,7 @@ def pdf_to_md(path: str, is_ocr: bool = False) -> str:
             if not _pdf_method:
                 _pdf_method = "pdf+ocrlayer"
             print(
-                f"[build_corpus] OCR-LAYER {name}: {ocr_pages}/{len(chunks)} page(s) carry a Tesseract text "
+                f"[build_corpus] OCR-LAYER {name}: {ocr_pages}/{n_pages} page(s) carry a Tesseract text "
                 f"layer -> read in its reading order ({ocr_soup} dropped as letter soup)",
                 flush=True,
             )
@@ -1161,7 +1270,7 @@ def pdf_to_md(path: str, is_ocr: bool = False) -> str:
             if not _pdf_method:
                 _pdf_method = "pdf+columns"
             print(
-                f"[build_corpus] COLUMNS {name}: {col_pages}/{len(chunks)} two-column page(s) re-read from their "
+                f"[build_corpus] COLUMNS {name}: {col_pages}/{n_pages} two-column page(s) re-read from their "
                 f"blocks (pymupdf4llm merged the columns"
                 + (f"; {glued_pages} glued word into word)" if glued_pages else ")"),
                 flush=True,
@@ -1169,12 +1278,14 @@ def pdf_to_md(path: str, is_ocr: bool = False) -> str:
         if garbled:
             _pdf_garbled_pages = sorted(garbled)
             print(
-                f"[build_corpus] GARBLED pages {name}: {len(garbled)}/{len(chunks)} page(s) are glyph "
+                f"[build_corpus] GARBLED pages {name}: {len(garbled)}/{n_pages} page(s) are glyph "
                 f"garbage in pymupdf4llm's output and in the text layer "
                 f"({', '.join(f'{k} {v}' for k, v in sorted(why.items()))}) -> dropped here, OCR route",
                 flush=True,
             )
         return clean_md(md)
+    except MemoryError:
+        raise  # the worker's memory ceiling (see _init): OCR would only repeat the blow-up
     except Exception as e:
         # pymupdf4llm raises on some malformed PDFs instead of degrading. Seen
         # on a large scanned PDF: a table is detected but its grid is not, and
@@ -1283,7 +1394,7 @@ def _vlm_endpoint():
         found = ("remote", OCR_VLM_REMOTE_URL)
     elif OCR_VLM_LOCAL_START and os.access(OCR_VLM_LOCAL_START, os.X_OK):
         try:
-            subprocess.run(
+            _run_child(
                 [OCR_VLM_LOCAL_START, "start", "--for-build"],
                 check=True,
                 timeout=900,
@@ -1387,13 +1498,19 @@ def vlm_ocr_pdf_to_md(path: str) -> str:
 def _vlm_local_stop() -> None:
     """End of a build: stop the local OCR server if this build started it (ocr_server.sh keeps the marker)."""
     if OCR_VLM_LOCAL_START and os.access(OCR_VLM_LOCAL_START, os.X_OK):
-        subprocess.run(
-            [OCR_VLM_LOCAL_START, "stop", "--if-build"],
-            timeout=120,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
+        try:
+            _run_child(
+                [OCR_VLM_LOCAL_START, "stop", "--if-build"],
+                timeout=180,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except Exception as e:  # runs in main()'s finally: it must never replace the build's own outcome
+            print(
+                f"[build_corpus] WARN: ocr_server.sh stop failed ({type(e).__name__}: {str(e)[:80]})",
+                flush=True,
+            )
 
 
 OCRMYPDF_ENCRYPTED = 8  # ocrmypdf's exit code for an encrypted input, even one that opens without a password
@@ -1472,7 +1589,7 @@ def ocr_pdf_to_md(path: str, pages=None) -> str:
         out = os.path.join(td, "ocr.pdf")
         try:
             try:
-                subprocess.run(args + [path, out], check=True, timeout=timeout)
+                _run_child(args + [path, out], check=True, timeout=timeout)
             except subprocess.CalledProcessError as e:
                 if e.returncode != OCRMYPDF_ENCRYPTED:
                     raise
@@ -1485,7 +1602,7 @@ def ocr_pdf_to_md(path: str, pages=None) -> str:
                     f"[build_corpus] DECRYPTED {os.path.basename(path)} for OCR",
                     flush=True,
                 )
-                subprocess.run(args + [plain, out], check=True, timeout=timeout)
+                _run_child(args + [plain, out], check=True, timeout=timeout)
             return pdf_to_md(out, is_ocr=True)
         except Exception as e:
             print(
@@ -1499,7 +1616,7 @@ def ocr_pdf_to_md(path: str, pages=None) -> str:
 def docx_to_md(path: str) -> str:
     if shutil.which("pandoc"):
         try:
-            return subprocess.run(
+            return _run_child(
                 ["pandoc", path, "-t", "gfm"],
                 capture_output=True,
                 text=True,
@@ -1538,7 +1655,7 @@ def pptx_to_md(path: str) -> str:
 def epub_to_md(path: str) -> str:
     if shutil.which("pandoc"):
         try:
-            return subprocess.run(
+            return _run_child(
                 ["pandoc", path, "-t", "gfm"],
                 capture_output=True,
                 text=True,
@@ -1565,7 +1682,7 @@ def epub_to_md(path: str) -> str:
 def djvu_to_md(path: str) -> str:
     if shutil.which("djvutxt"):
         try:
-            return subprocess.run(
+            return _run_child(
                 ["djvutxt", path], capture_output=True, text=True, timeout=300
             ).stdout
         except Exception:
@@ -1576,7 +1693,7 @@ def djvu_to_md(path: str) -> str:
 def html_to_md(path: str) -> str:
     if shutil.which("pandoc"):
         try:
-            return subprocess.run(
+            return _run_child(
                 ["pandoc", path, "-t", "gfm"],
                 capture_output=True,
                 text=True,
@@ -1628,10 +1745,92 @@ def header(meta: dict, key: str) -> str:
 
 # ---------- worker ----------
 CFG = {}  # populated per-process via initializer
+_MEM_CAP = [0]  # this worker's RLIMIT_AS soft limit in bytes (0 = none); set by _init
+
+# Pool workers are long-lived, and one document can take one to 16-25 GiB (the layout model's N x N
+# matrices, see LAYOUT_MAX_BOXES); the kernel's OOM killer then took the LightRAG server before it got
+# to the worker, and the build died.
+#   * oom_score_adj 1000: if the kernel must kill something, it takes a build worker first.
+#   * RLIMIT_AS (--worker-mem-gib, default 7): the allocation that would take the worker past it raises
+#     MemoryError, a clean per-document failure (convert's `error:MemoryError`, recorded in the
+#     --oom-keys file). Address space rather than RSS because it is enforced synchronously, at the
+#     allocation, in-process: a numpy array of 1.6 GB appears faster than a monitor could poll. A normal
+#     worker peaked at ~2.5 GiB RSS and 3.3-4.4 GiB of address space by measurement, so 7 leaves
+#     headroom and stops a runaway near 5 GiB RSS. Children (ocrmypdf, tesseract, pandoc,
+#     ocr_server.sh -> llama-server) must not inherit it: _run_child lifts it.
+WORKER_MEM_GIB = float(os.environ.get("BUILD_WORKER_MEM_GIB", "7"))
+POOL_MAX_RESTARTS = int(os.environ.get("BUILD_POOL_MAX_RESTARTS", "8"))
+OOM_RETRY_DAYS = float(os.environ.get("BUILD_OOM_RETRY_DAYS", "30"))
 
 
 def _init(cfg):
     CFG.update(cfg)
+    # main()'s exit-on-signal handler (inherited through fork) is not for workers
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, signal.SIG_DFL)
+    try:
+        with open("/proc/self/oom_score_adj", "w") as f:
+            f.write("1000")
+    except OSError:
+        pass
+    gib = cfg.get("worker_mem_gib") or 0
+    if gib > 0:
+        import resource
+
+        try:
+            _, hard = resource.getrlimit(resource.RLIMIT_AS)
+            cap = int(gib * 2**30)
+            if hard == resource.RLIM_INFINITY or cap <= hard:
+                resource.setrlimit(resource.RLIMIT_AS, (cap, hard))
+                _MEM_CAP[0] = cap
+        except (ValueError, OSError):
+            pass
+
+
+@contextlib.contextmanager
+def _uncapped():
+    """The memory ceiling lifted for the duration (a child started inside inherits no limit)."""
+    cap = _MEM_CAP[0]
+    if not cap:
+        yield
+        return
+    import resource
+
+    _, hard = resource.getrlimit(resource.RLIMIT_AS)
+    resource.setrlimit(resource.RLIMIT_AS, (hard, hard))
+    try:
+        yield
+    finally:
+        resource.setrlimit(resource.RLIMIT_AS, (cap, hard))
+
+
+def _run_child(*args, **kw):
+    """subprocess.run for a child that must not inherit the worker's RLIMIT_AS (llama-server maps
+    gigabytes of address space)."""
+    with _uncapped():
+        return subprocess.run(*args, **kw)
+
+
+def _convert_tracked(key: str):
+    """convert(), with a pid -> key marker on disk while it runs: when a worker dies (kernel OOM kill,
+    segfault) the parent reads the markers to learn which document it was converting."""
+    marker = None
+    d = CFG.get("inflight_dir")
+    if d:
+        marker = os.path.join(d, str(os.getpid()))
+        try:
+            with open(marker, "w") as f:
+                f.write(key)
+        except OSError:
+            marker = None
+    try:
+        return convert(key)
+    finally:
+        if marker:
+            try:
+                os.unlink(marker)
+            except OSError:
+                pass
 
 
 def _not_a_pdf(path: str) -> str:
@@ -1745,6 +1944,9 @@ def convert(key: str):
         done = max([parsed] + copies, key=os.path.getmtime)
     if (not CFG["force"]) and done and os.path.getmtime(done) >= os.path.getmtime(src):
         return (key, "skip", done, os.path.getsize(done))
+    if key in CFG.get("oom_skip", ()):
+        # exhausted a worker's memory ceiling or killed one (--oom-keys); retried after OOM_RETRY_DAYS
+        return (key, "oom_skip", "", 0)
 
     method = kind
     try:
@@ -1855,6 +2057,168 @@ def convert(key: str):
     return (key, method, out, len(doc))
 
 
+# ---------- documents that exhaust or kill a worker ----------
+def load_oom_keys(path: str, max_age_days: float = OOM_RETRY_DAYS) -> set:
+    """Storage keys recorded by record_oom_key() less than max_age_days ago. Delete a line to retry a
+    key sooner."""
+    keys: set = set()
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) < 2 or not parts[0] or parts[0].startswith("#"):
+                    continue
+                try:
+                    age = time.time() - time.mktime(
+                        time.strptime(parts[1], "%Y-%m-%d %H:%M:%S")
+                    )
+                except ValueError:
+                    age = 0.0
+                if age < max_age_days * 86400:
+                    keys.add(parts[0])
+    except OSError:
+        pass
+    return keys
+
+
+def record_oom_key(path: str, key: str, reason: str) -> None:
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"{key}\t{time.strftime('%Y-%m-%d %H:%M:%S')}\t{reason}\n")
+    except OSError as e:
+        print(
+            f"[build_corpus] WARN: could not record {key} in {path} ({e})", flush=True
+        )
+
+
+def run_pool(
+    keys,
+    jobs,
+    cfg,
+    on_result,
+    max_restarts=POOL_MAX_RESTARTS,
+    oom_file=None,
+    inflight_dir=None,
+):
+    """convert() every key on a process pool, calling on_result(result) once per key, in completion order.
+    A worker that dies (kernel OOM kill, segfault) breaks the whole pool; the key it was converting is
+    recorded in `oom_file` and reported as `error:worker_killed`, and the pool is rebuilt for the keys not
+    yet finished. A death that cannot be pinned on a worker holding a marker records nothing; a worker that
+    crashed (not SIGKILLed) gets its document one more try before it is recorded. After `max_restarts`
+    rebuilds the remaining keys are returned unfinished. Returns that list (empty = all done)."""
+    own_dir = inflight_dir is None
+    inflight_dir = inflight_dir or tempfile.mkdtemp(prefix="build_corpus_inflight_")
+    cfg = dict(cfg, inflight_dir=inflight_dir)
+    # fork, the Linux default before Python 3.14 made it forkserver: every worker is started at the first
+    # submit, so the pid snapshot below is complete, and the workers inherit the parent's module state.
+    ctx = multiprocessing.get_context("fork")
+    pending, finished, crashed, restarts = list(keys), set(), set(), 0
+    try:
+        while pending:
+            ex = ProcessPoolExecutor(
+                max_workers=jobs, mp_context=ctx, initializer=_init, initargs=(cfg,)
+            )
+            futs, procs, broken = {}, {}, False
+            for k in pending:
+                try:
+                    futs[ex.submit(_convert_tracked, k)] = k
+                except BrokenProcessPool:
+                    # a worker died while the keys were still being queued
+                    broken = True
+                    break
+            procs = dict(getattr(ex, "_processes", None) or {})
+            try:
+                for fut in as_completed(futs):
+                    k = futs[fut]
+                    try:
+                        res = fut.result()
+                    except BrokenProcessPool:
+                        broken = True
+                        continue
+                    except Exception as e:  # raised out of convert() itself: this key fails, the build goes on
+                        res = (k, f"error:{type(e).__name__}", "", 0)
+                    finished.add(k)
+                    on_result(res)
+            except BaseException:
+                # SystemExit from the SIGTERM handler, KeyboardInterrupt
+                for p in procs.values():
+                    try:
+                        p.terminate()
+                    except Exception:
+                        pass
+                ex.shutdown(wait=False, cancel_futures=True)
+                raise
+            ex.shutdown(wait=True, cancel_futures=True)
+            pending = [k for k in pending if k not in finished]
+            if not broken:
+                continue
+            inflight = {}
+            try:
+                for name in os.listdir(inflight_dir):
+                    try:
+                        with open(os.path.join(inflight_dir, name)) as f:
+                            inflight[int(name)] = f.read().strip()
+                        os.unlink(os.path.join(inflight_dir, name))
+                    except (OSError, ValueError):
+                        pass
+            except OSError:
+                pass
+            # Only a worker that really died (any exit but 0 and the executor's own SIGTERM) AND left a
+            # marker is a victim: a worker killed between documents, or whose marker could not be written,
+            # convicts nobody. The survivors' in-flight keys are simply converted again by the next pool;
+            # `max_restarts` bounds a pool that keeps dying.
+            died = {
+                pid
+                for pid, p in procs.items()
+                if p.exitcode not in (None, 0, -signal.SIGTERM) and pid in inflight
+            }
+            # A SIGKILL (the kernel's OOM killer) is recorded at once: converting it again is the blow-up
+            # again. Any other death (a native crash inside the PDF library on an ordinary page, seen
+            # sporadically and never twice in a row on the same document) gets ONE more try before the
+            # document is recorded.
+            culprits, retried = {}, []
+            for pid in died:
+                k, code = inflight[pid], procs[pid].exitcode
+                if code == -signal.SIGKILL or k in crashed:
+                    culprits[k] = (
+                        f"worker pid {pid} died (exit {code}) while converting it"
+                    )
+                else:
+                    crashed.add(k)
+                    retried.append(k)
+            print(
+                f"[build_corpus] WARN: a pool worker died (BrokenProcessPool); in flight: "
+                f"{', '.join(sorted(inflight.values())) or 'unknown'}; "
+                f"recorded: {', '.join(sorted(culprits)) or 'none'}; "
+                f"retried once: {', '.join(sorted(retried)) or 'none'}; "
+                f"{len([k for k in pending if k not in culprits])} key(s) left",
+                flush=True,
+            )
+            for k, why in culprits.items():
+                if oom_file:
+                    record_oom_key(oom_file, k, why)
+                finished.add(k)
+                on_result((k, "error:worker_killed", "", 0))
+            pending = [k for k in pending if k not in finished]
+            restarts += 1
+            if pending and restarts > max_restarts:
+                print(
+                    f"[build_corpus] FATAL: {restarts} pool deaths, giving up with "
+                    f"{len(pending)} key(s) unconverted",
+                    flush=True,
+                )
+                return pending
+        return []
+    finally:
+        if own_dir:
+            shutil.rmtree(inflight_dir, ignore_errors=True)
+
+
+def _exit_on_signal(signum, frame):
+    """SIGTERM/SIGHUP become a normal exit, so main()'s finally (OCR server teardown) runs."""
+    raise SystemExit(128 + signum)
+
+
 # ---------- main ----------
 def main():
     ap = argparse.ArgumentParser(
@@ -1931,9 +2295,32 @@ def main():
         help="Optional dir of previously extracted text, <pdf stem>.md, used "
         "as a last resort for image-only PDFs (default: none).",
     )
+    ap.add_argument(
+        "--worker-mem-gib",
+        type=float,
+        default=WORKER_MEM_GIB,
+        help="Per-worker address-space ceiling in GiB (RLIMIT_AS; a document needing more "
+        "fails with MemoryError and is recorded in --oom-keys). 0 = none. "
+        "Default: $BUILD_WORKER_MEM_GIB or 7.",
+    )
+    ap.add_argument(
+        "--max-pool-restarts",
+        type=int,
+        default=POOL_MAX_RESTARTS,
+        help="Rebuild the process pool at most this many times after a worker dies "
+        "(default: $BUILD_POOL_MAX_RESTARTS or 8).",
+    )
+    ap.add_argument(
+        "--oom-keys",
+        default=None,
+        help=f"Keys of documents that exhausted or killed a worker, skipped for "
+        f"{OOM_RETRY_DAYS:g} days ($BUILD_OOM_RETRY_DAYS) "
+        "(default: <out>/.build_oom_keys.tsv).",
+    )
     a = ap.parse_args()
 
     a.out = a.out or os.path.join(a.zotero, "rag_corpus")
+    a.oom_keys = a.oom_keys or os.path.join(a.out, ".build_oom_keys.tsv")
     a.meta = (
         a.meta
         or os.environ.get("ZOTERO_METADATA")
@@ -1951,6 +2338,7 @@ def main():
 
     deny = load_denylist(a.denylist)
 
+    oom_skip = load_oom_keys(a.oom_keys)
     cfg = {
         "meta": meta,
         "zotero": a.zotero,
@@ -1963,44 +2351,79 @@ def main():
         "held": a.held_dir,
         "ocr_cache": a.ocr_cache_dir,
         "fallback_md": a.fallback_md_dir,
+        "oom_skip": oom_skip,
+        "worker_mem_gib": a.worker_mem_gib,
     }
     print(
         f"[build_corpus] {len(keys)} storage folders -> {a.out}  "
-        f"(jobs={a.jobs}, ocr={a.ocr}, ocr_vlm={a.ocr_vlm}, denylist={len(deny)})",
+        f"(jobs={a.jobs}, ocr={a.ocr}, ocr_vlm={a.ocr_vlm}, denylist={len(deny)}, "
+        f"worker_mem={a.worker_mem_gib:g}GiB, oom_skip={len(oom_skip)})",
         flush=True,
     )
 
     manifest = open(os.path.join(a.out, ".manifest.jsonl"), "w", encoding="utf-8")
     counts, done, t0 = {}, 0, time.time()
-    with ProcessPoolExecutor(
-        max_workers=a.jobs, initializer=_init, initargs=(cfg,)
-    ) as ex:
-        futs = {ex.submit(convert, k): k for k in keys}
-        for fut in as_completed(futs):
-            key, method, out, size = fut.result()
-            base = method.split(":")[0]
-            counts[base] = counts.get(base, 0) + 1
-            manifest.write(
-                json.dumps(
-                    {
-                        "key": key,
-                        "method": method,
-                        "out": os.path.basename(out),
-                        "chars": size,
-                    }
-                )
-                + "\n"
+
+    def on_result(res):
+        nonlocal done
+        key, method, out, size = res
+        base = method.split(":")[0]
+        counts[base] = counts.get(base, 0) + 1
+        if method == "error:MemoryError":
+            print(
+                f"[build_corpus] WARN: {key} exceeded the worker's {a.worker_mem_gib:g} GiB memory "
+                f"ceiling -> nothing written; recorded in {os.path.basename(a.oom_keys)}",
+                flush=True,
             )
-            done += 1
-            if done % 50 == 0 or done == len(keys):
-                dt = time.time() - t0
-                print(
-                    f"  {done}/{len(keys)}  ({dt:.0f}s)  "
-                    + "  ".join(f"{k}={v}" for k, v in sorted(counts.items())),
-                    flush=True,
-                )
-    manifest.close()
-    _vlm_local_stop()
+            record_oom_key(
+                a.oom_keys,
+                key,
+                f"MemoryError under the {a.worker_mem_gib:g} GiB worker ceiling",
+            )
+        manifest.write(
+            json.dumps(
+                {
+                    "key": key,
+                    "method": method,
+                    "out": os.path.basename(out),
+                    "chars": size,
+                }
+            )
+            + "\n"
+        )
+        done += 1
+        if done % 50 == 0 or done == len(keys):
+            dt = time.time() - t0
+            print(
+                f"  {done}/{len(keys)}  ({dt:.0f}s)  "
+                + "  ".join(f"{k}={v}" for k, v in sorted(counts.items())),
+                flush=True,
+            )
+
+    # Whatever ends the pool -- normal completion, an exception, SIGTERM (cron, `kill`) -- the local
+    # OCR server this build started is stopped: left running, it holds the GPU after the build is gone.
+    old_handlers = {
+        sig: signal.signal(sig, _exit_on_signal)
+        for sig in (signal.SIGTERM, signal.SIGHUP)
+    }
+    try:
+        unfinished = run_pool(
+            keys,
+            a.jobs,
+            cfg,
+            on_result,
+            max_restarts=a.max_pool_restarts,
+            oom_file=a.oom_keys,
+        )
+    finally:
+        manifest.close()
+        try:
+            _vlm_local_stop()
+        finally:
+            for sig, h in old_handlers.items():
+                signal.signal(sig, h)
+    if unfinished:
+        sys.exit(1)
     print("\n[done] methods:", json.dumps(counts, indent=2))
     need = counts.get("pdf_needs_ocr", 0)
     if need:

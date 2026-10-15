@@ -55,8 +55,8 @@ deleted: see [Re-indexing a changed attachment](#re-indexing-a-changed-attachmen
 
 ## Settings
 
-All paths come from flags. The single environment variable is `ZOTERO_METADATA`,
-which the MCP server in this toolkit also reads to resolve citations. Set it to
+All paths come from flags. The single environment variable for a path is
+`ZOTERO_METADATA`, which the MCP server in this toolkit also reads to resolve citations. Set it to
 one absolute path, and the metadata builder, the corpus builder and the MCP server
 all use the same file.
 
@@ -83,6 +83,9 @@ all use the same file.
 | `--held-dir DIR` | none | Optional. A directory where an external ingest scheduler parks built but not yet ingested files. An up-to-date file there counts as built. |
 | `--ocr-cache-dir DIR` | none | Optional. Text you have already OCR'd, named `<pdf stem>.pdf.txt`. It is reused for image-only PDFs before `ocrmypdf` runs. |
 | `--fallback-md-dir DIR` | none | Optional. Text extracted earlier (for example, old `pdftotext` output), named `<pdf stem>.md`. It is the last resort for image-only PDFs. |
+| `--worker-mem-gib N` | `$BUILD_WORKER_MEM_GIB`, else `7` | Address-space ceiling (`RLIMIT_AS`) of each worker process, in GiB; `0` = none. See *Memory limits and dead workers*. |
+| `--max-pool-restarts N` | `$BUILD_POOL_MAX_RESTARTS`, else `8` | Rebuild the worker pool at most N times after a worker dies; after that the build exits 1. |
+| `--oom-keys FILE` | `<out>/.build_oom_keys.tsv` | Documents that exhausted or killed a worker. They are skipped for `$BUILD_OOM_RETRY_DAYS` (default 30) days. |
 | `--engine` | `pymupdf4llm` | The only PDF engine. |
 
 ### quarantine_junk.py
@@ -313,6 +316,36 @@ A numbered copy counts as built whether LightRAG indexed it or only set it aside
 each rebuild reaches LightRAG once instead of coming back to the corpus root on every
 run.
 
+### Memory limits and dead workers
+
+One pathological PDF page can take a worker to tens of GiB, and the kernel's OOM killer
+may then pick another process (the LightRAG server, say) before the worker. The build
+guards against that in four ways:
+
+- **Heavy pages skip the layout model.** pymupdf4llm's layout model needs memory in the
+  square of a page's text spans, and its drawing pass a Python object per vector path.
+  A page with more than `BUILD_LAYOUT_MAX_BOXES` text spans (default 3500) or a content
+  stream above `BUILD_LAYOUT_MAX_CONTENT_MB` (default 30) is read from its text layer
+  instead, in page order (`LAYOUT-SKIP <file>: k page(s) too heavy ...` in the log). A
+  skipped page whose text layer is glyph garbage takes the OCR route like any garbled
+  page. `0` turns either limit off. If the engine's page chunks carry no `page_number`,
+  the skip is turned off for that document and it is converted whole.
+- **A memory ceiling per worker.** Each worker runs with `oom_score_adj` 1000, so the
+  kernel kills a worker before anything else, and with an address-space ceiling
+  (`--worker-mem-gib`). A document that needs more fails with `error:MemoryError`
+  instead of falling back to OCR, and is recorded in the `--oom-keys` file. External
+  tools (`ocrmypdf`, pandoc, `djvutxt`, the OCR server) run without the ceiling.
+- **A dead worker costs one document.** If a worker dies (killed by the kernel, or a
+  crash in a native library), the document it was converting is reported as
+  `error:worker_killed` and recorded, and the pool is rebuilt for the rest. A crash
+  other than SIGKILL gets one more try first. Documents in the `--oom-keys` file are
+  reported as `oom_skip` until their entry is older than `BUILD_OOM_RETRY_DAYS`; delete
+  a line to retry a document sooner. An exception raised out of the conversion itself
+  fails that document only.
+- **The OCR server is stopped on every exit.** A local OCR server the build started
+  (`fronts/ocr_server.sh start --for-build`) is stopped when the build ends, fails or
+  receives SIGTERM or SIGHUP.
+
 ### Manifest
 
 `<out>/.manifest.jsonl` is rewritten on every run. It holds one line per storage
@@ -334,6 +367,9 @@ folder:
 | `skip` | Up to date. |
 | `denylist` | Blocked by `--denylist`. |
 | `no_source` | No convertible file in the folder. |
+| `oom_skip` | Listed in the `--oom-keys` file; not converted. |
+| `error:MemoryError` | The worker's memory ceiling was reached; recorded in the `--oom-keys` file. |
+| `error:worker_killed` | The worker died while converting it; recorded in the `--oom-keys` file. |
 | `error:<Type>` | The extractor raised an exception. |
 
 ## zotero_metadata.json schema
