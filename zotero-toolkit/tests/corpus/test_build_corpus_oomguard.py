@@ -668,6 +668,141 @@ def test_a_page_of_vector_paths_skips_the_layout_model_too():
         assert calls == [None], calls
 
 
+def lines_pdf(path, n_lines, page=1, as_form=False):
+    """Three dense text pages; `page` (0-based) also carries n_lines separately stroked short lines, drawn on the page
+    itself or, as_form=True, inside a form XObject (what LaTeX's \\includegraphics of a PDF plot produces)."""
+    make_pdf(
+        path, [dense_page("alpha", 12), dense_page("beta", 12), dense_page("gamma", 12)]
+    )
+    doc = pymupdf.open(path)
+    src = pymupdf.open()
+    target = src.new_page(width=595, height=842) if as_form else doc[page]
+    for i in range(n_lines):
+        target.draw_line((10 + i % 500, 300), (12 + i % 500, 310 + i % 7))
+    if as_form:
+        doc[page].show_pdf_page(doc[page].rect, src, 0)
+    doc.save(path + "2", garbage=0)
+    doc.close()
+    src.close()
+    return path + "2"
+
+
+def test_the_paint_counter_counts_operators_not_names_or_string_text():
+    data = b"/F1 9 Tf (S f) Tj 0 0 m 1 1 l S 0 0 1 1 re f* q n Q 1 0 0 1 0 0 cm /Fm0 Do B b*\nF\ts"
+    assert len(bc._PAINT_OP.findall(data)) == 7, bc._PAINT_OP.findall(
+        data
+    )  # S f* n B b* F s
+    assert (
+        bc._PAINT_OP.findall(b"S") == [b"S"]
+        and bc._PAINT_OP.findall(b"/Sh0 sh BT ET") == []
+    )
+    assert (
+        len(bc._PAINT_OP.findall(b"0 0 m 1 1 l S% a comment\n0 0 m 1 1 l\x00f*\x00"))
+        == 2
+    )  # % and NUL delimit
+
+
+def test_a_memoryerror_while_counting_paths_makes_the_page_heavy():
+    with tempfile.TemporaryDirectory() as td:
+        path = lines_pdf(os.path.join(td, "a.pdf"), 50)
+
+        def oom(doc, page, contents):
+            if page.number == 1:
+                raise MemoryError("forms of page 2")
+            return 0
+
+        with pymupdf.open(path) as doc, patched(bc, "_painted_paths", oom):
+            assert bc._heavy_pages(doc) == {1: (0, 0, 0)}
+
+
+def test_a_page_of_many_painted_paths_under_the_byte_limit_skips_the_layout_model():
+    with tempfile.TemporaryDirectory() as td:
+        path = lines_pdf(
+            os.path.join(td, "a.pdf"), 4000
+        )  # ~4,000 paths in ~100 KB: far under the 30 MB limit
+        with pymupdf.open(path) as doc:
+            assert sorted(bc._heavy_pages(doc)) == []  # default limit 100,000
+            with patched(bc, "LAYOUT_MAX_PATHS", 1000):
+                heavy = bc._heavy_pages(doc)
+            assert sorted(heavy) == [1] and heavy[1][2] >= 4000, heavy
+        bc.CFG.clear()
+        bc.CFG.update({"ocr": "off", "ocr_vlm": "off"})
+        calls, log = [], io.StringIO()
+        with (
+            patched(bc, "LAYOUT_MAX_PATHS", 1000),
+            fake_llm_recording(calls),
+            contextlib.redirect_stdout(log),
+        ):
+            md = bc.pdf_to_md(path)
+        assert calls == [[0, 2]], calls
+        assert (
+            "LAYOUT-SKIP" in log.getvalue()
+            and "p. 2" in log.getvalue()
+            and "painted paths" in log.getvalue()
+        ), log.getvalue()
+        assert (
+            md.index("[engine p1]") < md.index("beta entry 0") < md.index("[engine p3]")
+        ), md[:200]
+        calls = []
+        with (
+            patched(bc, "LAYOUT_MAX_PATHS", 0),
+            fake_llm_recording(calls),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            bc.pdf_to_md(path)
+        assert calls == [None], calls
+
+
+def test_painted_paths_inside_a_form_xobject_count_too():
+    with tempfile.TemporaryDirectory() as td:
+        path = lines_pdf(os.path.join(td, "a.pdf"), 4000, as_form=True)
+        with pymupdf.open(path) as doc:
+            assert len(doc[1].read_contents()) < 4000, len(
+                doc[1].read_contents()
+            )  # the page itself only says "Do"
+            with patched(bc, "LAYOUT_MAX_PATHS", 1000):
+                heavy = bc._heavy_pages(doc)
+        assert sorted(heavy) == [1] and heavy[1][2] >= 4000, heavy
+
+
+def test_streams_too_short_to_reach_the_path_limit_are_not_scanned():
+    with tempfile.TemporaryDirectory() as td:
+        path = lines_pdf(os.path.join(td, "a.pdf"), 50)
+        scanned = []
+        real = bc._PAINT_OP
+
+        class Spy:
+            def finditer(self, data):
+                scanned.append(len(data))
+                return real.finditer(data)
+
+        with pymupdf.open(path) as doc, patched(bc, "_PAINT_OP", Spy()):
+            assert (
+                bc._painted_paths(doc, doc[1], doc[1].read_contents()) == 0
+            )  # default limit: 200 KB floor
+            assert scanned == []
+            with patched(bc, "LAYOUT_MAX_PATHS", 10):
+                assert bc._painted_paths(doc, doc[1], doc[1].read_contents()) >= 50
+            assert scanned
+
+
+def test_a_failing_path_count_keeps_the_byte_verdict():
+    with tempfile.TemporaryDirectory() as td:
+        path = lines_pdf(os.path.join(td, "a.pdf"), 4000)
+
+        def boom(doc, page, contents):
+            raise ValueError("broken resources")
+
+        with (
+            pymupdf.open(path) as doc,
+            patched(bc, "_painted_paths", boom),
+            patched(bc, "LAYOUT_MAX_CONTENT_BYTES", 50_000),
+            patched(bc, "LAYOUT_MAX_PATHS", 1000),
+        ):
+            heavy = bc._heavy_pages(doc)
+        assert sorted(heavy) == [1] and heavy[1][2] == 0 and heavy[1][1] > 50_000, heavy
+
+
 def test_heavy_page_order_holds_against_the_real_pymupdf4llm():
     import pymupdf4llm as real
 

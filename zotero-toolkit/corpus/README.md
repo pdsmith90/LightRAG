@@ -324,11 +324,15 @@ guards against that in four ways:
 
 - **Heavy pages skip the layout model.** pymupdf4llm's layout model needs memory in the
   square of a page's text spans, and its drawing pass a Python object per vector path.
-  A page with more than `BUILD_LAYOUT_MAX_BOXES` text spans (default 3500) or a content
-  stream above `BUILD_LAYOUT_MAX_CONTENT_MB` (default 30) is read from its text layer
-  instead, in page order (`LAYOUT-SKIP <file>: k page(s) too heavy ...` in the log). A
-  skipped page whose text layer is glyph garbage takes the OCR route like any garbled
-  page. `0` turns either limit off. If the engine's page chunks carry no `page_number`,
+  Its text extraction also tests every painted vector path as an underline/strikeout
+  candidate, which slows down faster than linearly: one plot page of 531,000 separate
+  strokes held a build for hours. A page with more than `BUILD_LAYOUT_MAX_BOXES` text
+  spans (default 3500), a content stream above `BUILD_LAYOUT_MAX_CONTENT_MB` (default
+  30) or more than `BUILD_LAYOUT_MAX_PATHS` painted paths (default 100000, counted in the
+  page and its form XObjects) is read from its text layer instead, in page order
+  (`LAYOUT-SKIP <file>: k page(s) too heavy ...` in the log). A skipped page whose text
+  layer is glyph garbage takes the OCR route like any garbled page. `0` turns any limit
+  off. If the engine's page chunks carry no `page_number`,
   the skip is turned off for that document and it is converted whole.
 - **A memory ceiling per worker.** Each worker runs with `oom_score_adj` 1000, so the
   kernel kills a worker before anything else, and with an address-space ceiling

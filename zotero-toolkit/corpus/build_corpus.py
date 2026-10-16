@@ -1047,19 +1047,54 @@ LAYOUT_MAX_BOXES = int(
 LAYOUT_MAX_CONTENT_BYTES = int(
     float(os.environ.get("BUILD_LAYOUT_MAX_CONTENT_MB", "30")) * 2**20
 )  # ~165k paths; 0 = off
+# The layout path extracts each page with pymupdf4llm's FLAGS, which include TEXT_COLLECT_STYLES: MuPDF
+# then tests the page's vector paths as underline/strikeout candidates, at a cost that grows faster than
+# linearly with the number of separately PAINTED paths (not segments: a plot of 1.6M segments in 62k
+# paths takes 0.3 s). One book's plot pages of 450,000-680,000 one-segment strokes, each under the byte
+# limit above, made a single get_textpage call run for hours and held the whole build. Without
+# COLLECT_STYLES such a page takes 0.3 s; with it, 127k paths took 15 s and 295k took 10 s (geometry
+# matters too). 13 of 16,027 pages in a 500-PDF sample of a research library carry over 100k, all figures.
+LAYOUT_MAX_PATHS = int(
+    os.environ.get("BUILD_LAYOUT_MAX_PATHS", "100000")
+)  # painted paths, page + its forms; 0 = off
+# S s f F f* B B* b b* n, as operators only (% and NUL delimit too)
+_PAINT_OP = re.compile(rb"(?<![^\s\x00\])>])[SsfFBbn]\*?(?![^\s\x00\[(</%])")
+
+
+def _painted_paths(doc, page, contents: bytes) -> int:
+    """Path-painting operators in the page's content stream and its form XObjects (each form counted
+    once, however often it is drawn; tiling patterns are not read). Returns 0 without scanning when the
+    streams are too short to hold LAYOUT_MAX_PATHS of them (an operator and its separator take >= 2
+    bytes); a form that cannot be read is left out, a MemoryError propagates (the page is then heavy, as
+    in _heavy_pages)."""
+    data = [contents]
+    for xref, *_ in page.get_xobjects():
+        try:
+            data.append(doc.xref_stream(xref) or b"")
+        except MemoryError:
+            raise
+        except Exception:
+            continue
+    if sum(len(d) for d in data) < 2 * LAYOUT_MAX_PATHS:
+        return 0
+    return sum(sum(1 for _ in _PAINT_OP.finditer(d)) for d in data)
 
 
 def _heavy_pages(doc) -> dict:
-    """0-based page -> (text spans, content-stream bytes) for the pages too heavy for the layout model:
-    more than LAYOUT_MAX_BOXES text spans, or a content stream above LAYOUT_MAX_CONTENT_BYTES (see the
-    note above)."""
+    """0-based page -> (text spans, content-stream bytes, painted paths) for the pages too heavy for the
+    layout model: more than LAYOUT_MAX_BOXES text spans, a content stream above LAYOUT_MAX_CONTENT_BYTES,
+    or more than LAYOUT_MAX_PATHS painted paths (see the notes above)."""
     heavy: dict = {}
-    if LAYOUT_MAX_BOXES <= 0 and LAYOUT_MAX_CONTENT_BYTES <= 0:
+    if (
+        LAYOUT_MAX_BOXES <= 0
+        and LAYOUT_MAX_CONTENT_BYTES <= 0
+        and LAYOUT_MAX_PATHS <= 0
+    ):
         return heavy
     for pno in range(doc.page_count):
         try:
             page = doc[pno]
-            spans, nbytes = 0, 0
+            spans, nbytes, paths = 0, 0, 0
             # a span holds at least one word: counting words first is a cheap pre-filter
             if LAYOUT_MAX_BOXES > 0 and len(page.get_text("words")) > LAYOUT_MAX_BOXES:
                 spans = sum(
@@ -1068,18 +1103,29 @@ def _heavy_pages(doc) -> dict:
                     if b.get("type") == 0
                     for ln in b["lines"]
                 )
-            if LAYOUT_MAX_CONTENT_BYTES > 0:
-                nbytes = len(page.read_contents() or b"")
+            if LAYOUT_MAX_CONTENT_BYTES > 0 or LAYOUT_MAX_PATHS > 0:
+                contents = page.read_contents() or b""
+                nbytes = len(contents)
+                if LAYOUT_MAX_PATHS > 0:
+                    try:
+                        paths = _painted_paths(doc, page, contents)
+                    except MemoryError:
+                        raise
+                    except Exception:
+                        # an unreadable resource must not cost the page its span and byte verdicts
+                        paths = 0
         except MemoryError:
             # it cannot even be measured under the worker's ceiling: keep it from the model
-            heavy[pno] = (0, 0)
+            heavy[pno] = (0, 0, 0)
             continue
         except Exception:
             continue
-        if (LAYOUT_MAX_BOXES > 0 and spans > LAYOUT_MAX_BOXES) or (
-            LAYOUT_MAX_CONTENT_BYTES > 0 and nbytes > LAYOUT_MAX_CONTENT_BYTES
+        if (
+            (LAYOUT_MAX_BOXES > 0 and spans > LAYOUT_MAX_BOXES)
+            or (LAYOUT_MAX_CONTENT_BYTES > 0 and nbytes > LAYOUT_MAX_CONTENT_BYTES)
+            or (LAYOUT_MAX_PATHS > 0 and paths > LAYOUT_MAX_PATHS)
         ):
-            heavy[pno] = (spans, nbytes)
+            heavy[pno] = (spans, nbytes, paths)
     return heavy
 
 
@@ -1110,10 +1156,12 @@ def pdf_to_md(path: str, is_ocr: bool = False) -> str:
         if heavy:
             print(
                 f"[build_corpus] LAYOUT-SKIP {name}: {len(heavy)} page(s) too heavy for the layout model "
-                f"(> {LAYOUT_MAX_BOXES} text spans or > {LAYOUT_MAX_CONTENT_BYTES >> 20} MB of content; "
+                f"(> {LAYOUT_MAX_BOXES} text spans, > {LAYOUT_MAX_CONTENT_BYTES >> 20} MB of content or "
+                f"> {LAYOUT_MAX_PATHS} painted paths; "
                 f"p. {', '.join(str(p + 1) for p in pending_heavy[:8])}{', ...' if len(heavy) > 8 else ''}; "
                 f"max {max(v[0] for v in heavy.values())} spans, "
-                f"{max(v[1] for v in heavy.values()) >> 20} MB) -> read from the text layer",
+                f"{max(v[1] for v in heavy.values()) >> 20} MB, "
+                f"{max(v[2] for v in heavy.values())} paths) -> read from the text layer",
                 flush=True,
             )
         keep = [p for p in range(doc.page_count) if p not in heavy]
