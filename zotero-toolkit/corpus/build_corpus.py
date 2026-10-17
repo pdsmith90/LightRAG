@@ -1360,6 +1360,22 @@ OCR_TIMEOUT_PER_PAGE_S = (
 OCR_PARTIAL_MAX_SHARE = (
     0.5  # OCR only the garbled pages while they are fewer than this share
 )
+OCR_MIN_CHARS_PER_PAGE = 25  # non-space chars per page below which a whole-document ocrmypdf result is rejected
+
+
+def ocr_too_thin(text: str, pages: int) -> str:
+    """Why an OCR result over `pages` pages is too thin to stand for the document, or "" when it is not.
+    2026-10-17: a scanned book came out of ocrmypdf as its copyright page and nothing else. Its page images
+    use an Indexed palette shorter than declared; Ghostscript, ocrmypdf's rasterizer, drops them, Tesseract
+    reads blank pages and ocrmypdf exits 0 (MuPDF, which the VLM route renders with, draws them fine). Real
+    documents carry hundreds to thousands of non-space characters per page and slide decks tens; that book
+    had under 4. The VLM route needs no such floor: it already refuses an empty page."""
+    n = _nonws_len(text)
+    if pages <= 0 or n >= OCR_MIN_CHARS_PER_PAGE * pages:
+        return ""
+    return (
+        f"{n} non-space chars over {pages} page(s), under {OCR_MIN_CHARS_PER_PAGE}/page"
+    )
 
 
 # ---------- VLM OCR (2026-10-07): PepperOCR-VL turns a page image into Markdown with LaTeX math ----------
@@ -1651,7 +1667,18 @@ def ocr_pdf_to_md(path: str, pages=None) -> str:
                     flush=True,
                 )
                 _run_child(args + [plain, out], check=True, timeout=timeout)
-            return pdf_to_md(out, is_ocr=True)
+            md = pdf_to_md(out, is_ocr=True)
+            thin = (
+                ocr_too_thin(md, n_pages) if todo == n_pages else ""
+            )  # whole-document runs only: a --pages run keeps the other pages' own text
+            if thin:
+                print(
+                    f"[build_corpus] OCR-EMPTY {os.path.basename(path)}: ocrmypdf gave {thin} -> rejected",
+                    flush=True,
+                )
+                _ocr_backend = "ocrmypdf:empty"
+                return ""
+            return md
         except Exception as e:
             print(
                 f"[build_corpus] WARN: ocrmypdf failed on {os.path.basename(path)} "
@@ -2028,6 +2055,10 @@ def convert(key: str):
                         method = "pdf+vlmocr"
                 elif pre and os.path.exists(pre):
                     body, method = txt_to_md(pre), "pdf+ocr_cache"
+                elif _ocr_backend == "ocrmypdf:empty":
+                    # nothing written: a header-only file would count as done and never be converted
+                    # again; the next build tries afresh, the VLM first
+                    return (key, "ocr_empty", "", 0)
                 elif CFG["ocr"] in ("auto", "force"):
                     method = "pdf_needs_ocr"
                 # 2) last resort: previously extracted text (e.g. old pdftotext output)

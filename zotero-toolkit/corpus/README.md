@@ -371,6 +371,7 @@ folder:
 | `pdf+ocr_cache` | Taken from `--ocr-cache-dir`. |
 | `pdf_legacy_md` | Taken from `--fallback-md-dir`. |
 | `pdf_needs_ocr` | Image-only PDF, or one whose text layer is glyph codes, and OCR was unavailable, off or failed. It is indexed by its header only. |
+| `ocr_empty` | `ocrmypdf` ran on the whole document but returned fewer than 25 non-space characters per page (for example when Ghostscript cannot draw the page images). Nothing is written, so the next build tries again. |
 | `…_empty` suffix | The body came out shorter than `--min-chars`. |
 | `skip` | Up to date. |
 | `denylist` | Blocked by `--denylist`. |

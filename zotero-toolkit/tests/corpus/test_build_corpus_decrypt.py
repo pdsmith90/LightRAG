@@ -45,6 +45,7 @@ def ocr_with(original, rc, decrypt):
         patched(bc.subprocess, "run", fake_run),
         patched(bc, "_decrypted_copy", decrypt),
         patched(bc, "pdf_to_md", lambda path, is_ocr: "ocr text"),
+        patched(bc, "OCR_MIN_CHARS_PER_PAGE", 0),  # the floor has its own tests
         contextlib.redirect_stdout(out),
     ):
         result = bc.ocr_pdf_to_md(original)
