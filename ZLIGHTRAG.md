@@ -22,6 +22,7 @@ starting with [README.md](./README.md), applies as written.
 | [Lexical retrieval leg](#lexical-retrieval-leg) | `LEXICAL_CHUNK_TOP_K` | `0` (off) |
 | [PostgreSQL edge removal in plain SQL](#postgresql-edge-removal-in-plain-sql) | none | always active |
 | [Named-work pin and notice](#named-work-pin-and-notice) | `NAMED_WORK_PIN`, `NAMED_WORK_NOTICE` | `false`, `false` |
+| [Paper filter in the graph view](#paper-filter-in-the-graph-view) | none; reference lists via `ZOTERO_REFERENCES` | always active |
 
 ### Reference lists compiled from Zotero metadata
 
@@ -202,6 +203,32 @@ stay until deleted. Off by default.
 links it to every entity extracted from its chunk with an "associated with, contained
 in" edge (upstream behaviour, `all`). On a paper corpus those edges were about a tenth
 of the graph, every one generic.
+
+### Paper filter in the graph view
+
+The WebUI's graph view gains a paper picker beside the label search. Search by DOI,
+Zotero key, or words of the title, authors or year; only papers in the knowledge base
+are listed, with how many of their references are. A paper shows one of two graphs,
+toggled by the button beside the picker:
+
+- **Paper**: the entities and relations the paper's documents contributed.
+- **Shared with its references**: only the entities that the paper and at least one
+  library paper it cites both contributed, each listing those papers in a
+  `shared_with` property, and the relations the shown documents contributed between
+  them.
+
+A paper is its DOI, so every attachment with that DOI counts; a paper without one is
+its Zotero key. What a document contributed is read from LightRAG's per-document
+`full_entities` / `full_relations` rows, keeping only names that `entity_chunks` /
+`relation_chunks` still trace to one of its chunks (a prune or merge can leave stale
+names in those rows). Which library papers a paper cites comes from
+`zotero_references.json`, which `zotero-toolkit/corpus/build_references.py` builds from
+OpenAlex reference lists. It is read from the server's working directory, or the path
+in `ZOTERO_REFERENCES`, and reloaded when it changes; without it the shared view is
+empty and says so. The picker sets the graph label to `paper:<DOI>` or
+`paper+refs:<DOI>`, so refresh, retries and the label history work as for an entity.
+Endpoints: `GET /graph/papers/search?q=` and `GET /graphs/paper?paper=&mode=paper|shared`.
+Code: `lightrag/zotero_papers.py`, `lightrag_webui/src/components/graph/PaperFilter.tsx`.
 
 ### PostgreSQL edge removal in plain SQL
 
