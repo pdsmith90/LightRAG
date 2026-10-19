@@ -407,6 +407,24 @@
       "refreshCurrentLabelTooltip": "Refresh current page graph data",
       "refreshingTooltip": "Refreshing data..."
     },
+    "paperFilter": {
+      "selectTooltip": "Show the graph of one paper",
+      "label": "Search papers",
+      "placeholder": "Paper...",
+      "searchPlaceholder": "DOI, title, author or year...",
+      "noPapers": "No matching papers in the knowledge base",
+      "referencesInKb": "{{count}} references in the KB",
+      "modePaperTooltip": "Showing everything the paper contributed. Click to show only what it shares with the papers it cites",
+      "modeSharedTooltip": "Showing only what the paper shares with the papers it cites. Click to show everything it contributed",
+      "paperSummary": "{{citation}}: {{nodes}} nodes; {{inKb}} of its references are in the knowledge base",
+      "sharedSummary": "{{citation}}: {{nodes}} nodes shared with {{sharing}} of its {{inKb}} references in the knowledge base",
+      "reason": {
+        "not_in_kb": "This paper is not in the knowledge base",
+        "no_references_file": "The server has no reference lists (zotero_references.json)",
+        "no_reference_list": "No reference list is known for this paper (no DOI, or none in OpenAlex)",
+        "no_references_in_kb": "None of this paper's references are in the knowledge base"
+      }
+    },
     "emptyGraph": "Empty(Try Reload Again)"
   },
   "retrievePanel": {

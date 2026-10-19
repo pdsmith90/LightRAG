@@ -604,6 +604,40 @@ export const queryGraphs = async (
   return response.data
 }
 
+// A paper of the Zotero library as /graph/papers/search and /graphs/paper
+// describe it (fork). `paper` is its DOI, else its Zotero storage key.
+export type PaperSummary = {
+  paper: string
+  doi: string
+  keys: string[]
+  title: string
+  citation: string
+  year: string
+  n_refs: number | null
+  n_cited: number | null
+  n_cited_in_kb: number | null
+  mode?: 'paper' | 'shared'
+  references_available?: boolean
+  cited_sharing?: number
+  reason?: string
+}
+
+export const searchPapers = async (query: string, limit: number = 20): Promise<PaperSummary[]> => {
+  const response = await axiosInstance.get(`/graph/papers/search?q=${encodeURIComponent(query)}&limit=${limit}`)
+  return response.data
+}
+
+export const queryPaperGraph = async (
+  paper: string,
+  mode: 'paper' | 'shared',
+  maxNodes: number
+): Promise<LightragGraphType & { is_truncated?: boolean; paper: PaperSummary }> => {
+  const response = await axiosInstance.get(
+    `/graphs/paper?paper=${encodeURIComponent(paper)}&mode=${mode}&max_nodes=${maxNodes}`
+  )
+  return response.data
+}
+
 export const getGraphLabels = async (): Promise<string[]> => {
   const response = await axiosInstance.get('/graph/label/list')
   return response.data

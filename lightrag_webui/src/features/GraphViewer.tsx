@@ -22,6 +22,7 @@ import FullScreenControl from '@/components/graph/FullScreenControl'
 import Settings from '@/components/graph/Settings'
 import GraphSearch from '@/components/graph/GraphSearch'
 import GraphLabels from '@/components/graph/GraphLabels'
+import PaperFilter from '@/components/graph/PaperFilter'
 import PropertiesView from '@/components/graph/PropertiesView'
 import SettingsDisplay from '@/components/graph/SettingsDisplay'
 import Legend from '@/components/graph/Legend'
@@ -266,6 +267,7 @@ const GraphViewer = () => {
 
         <div className="absolute top-2 left-2 flex items-start gap-2">
           <GraphLabels />
+          <PaperFilter />
           {showNodeSearchBar && !isThemeSwitching && (
             <GraphSearch
               value={searchInitSelectedNode}

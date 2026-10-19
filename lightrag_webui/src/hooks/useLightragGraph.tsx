@@ -5,7 +5,8 @@ import { errorMessage } from '@/lib/utils'
 import * as Constants from '@/lib/constants'
 import { useGraphStore, RawGraph, RawNodeType, RawEdgeType } from '@/stores/graph'
 import { toast } from 'sonner'
-import { queryGraphs } from '@/api/lightrag'
+import { queryGraphs, queryPaperGraph, PaperSummary } from '@/api/lightrag'
+import { parsePaperLabel } from '@/lib/paperFilter'
 import { useBackendState } from '@/stores/state'
 import { useSettingsStore } from '@/stores/settings'
 
@@ -156,10 +157,13 @@ const fetchGraph = async (label: string, maxDepth: number, maxNodes: number) => 
 
   // If label is empty, use default label '*'
   const queryLabel = label || '*'
+  const paperFilter = parsePaperLabel(queryLabel)
 
   try {
     console.log(`Fetching graph label: ${queryLabel}, depth: ${maxDepth}, nodes: ${maxNodes}`)
-    rawData = await queryGraphs(queryLabel, maxDepth, maxNodes)
+    rawData = paperFilter
+      ? await queryPaperGraph(paperFilter.paper, paperFilter.mode, maxNodes)
+      : await queryGraphs(queryLabel, maxDepth, maxNodes)
   } catch (e) {
     // Record the backend error, then RETHROW so the caller's .catch() runs its
     // bounded-retry path. Returning null here would resolve the promise
@@ -241,7 +245,20 @@ const fetchGraph = async (label: string, maxDepth: number, maxNodes: number) => 
   }
 
   // console.debug({ data: JSON.parse(JSON.stringify(rawData)) })
-  return { rawGraph, is_truncated: rawData?.is_truncated }
+  return { rawGraph, is_truncated: rawData?.is_truncated, paper: rawData?.paper as PaperSummary | undefined }
+}
+
+// What a paper-filter load showed, or why it is empty (fork; lib/paperFilter).
+const paperSummaryMessage = (
+  t: (key: string, options?: Record<string, unknown>) => string,
+  paper: PaperSummary,
+  nodes: number
+): string => {
+  if (paper.reason) return t(`graphPanel.paperFilter.reason.${paper.reason}`)
+  const counts = { citation: paper.citation, nodes, inKb: paper.n_cited_in_kb ?? 0 }
+  return paper.mode === 'shared'
+    ? t('graphPanel.paperFilter.sharedSummary', { ...counts, sharing: paper.cited_sharing ?? 0 })
+    : t('graphPanel.paperFilter.paperSummary', counts)
 }
 
 // Create a new graph instance with the raw graph data
@@ -461,6 +478,7 @@ const useLightrangeGraph = () => {
       let dataPromise: Promise<{
         rawGraph: RawGraph | null
         is_truncated: boolean | undefined
+        paper?: PaperSummary
       } | null>
 
       // 1. If query label is not empty, use fetchGraph
@@ -480,6 +498,9 @@ const useLightrangeGraph = () => {
 
           if (result?.is_truncated) {
             toast.info(t('graphPanel.dataIsTruncated', 'Graph data is truncated to Max Nodes'))
+          }
+          if (result?.paper) {
+            toast.info(paperSummaryMessage(t, result.paper, data?.nodes.length ?? 0))
           }
 
           // Reset state
