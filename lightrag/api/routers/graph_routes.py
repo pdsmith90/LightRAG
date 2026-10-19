@@ -2,11 +2,12 @@
 This module contains all graph-related routes for the LightRAG API.
 """
 
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Literal
 import traceback
 from fastapi import APIRouter, Depends, Query, HTTPException
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from lightrag import zotero_papers
 from lightrag.base import DeletionResult
 from lightrag.exceptions import (
     AdminWriteHoldExceededError,
@@ -314,6 +315,49 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             )
         except Exception as e:
             logger.error(f"Error getting knowledge graph for label '{label}': {str(e)}")
+            logger.error(traceback.format_exc())
+            raise internal_server_error(e)
+
+    @router.get("/graph/papers/search", dependencies=[Depends(combined_auth)])
+    async def search_papers(
+        q: str = Query(
+            ..., description="DOI, Zotero key, or words of the title, authors or year"
+        ),
+        limit: int = Query(20, description="Maximum papers to return", ge=1, le=100),
+    ):
+        """Papers in the knowledge base matching ``q`` (fork; the WebUI's paper filter).
+
+        Each result carries the paper id to pass to ``/graphs/paper`` (its DOI,
+        else its Zotero key), a short citation, and how many of its references
+        are library papers and in the knowledge base.
+        """
+        try:
+            return await zotero_papers.search_papers(rag, q, limit)
+        except Exception as e:
+            logger.error(f"Error searching papers with query '{q}': {str(e)}")
+            logger.error(traceback.format_exc())
+            raise internal_server_error(e)
+
+    @router.get("/graphs/paper", dependencies=[Depends(combined_auth)])
+    async def get_paper_graph(
+        paper: str = Query(..., description="DOI or Zotero storage key of the paper"),
+        mode: Literal["paper", "shared"] = Query(
+            "paper",
+            description="paper: what the paper contributed; shared: only what it shares with the library papers it cites",
+        ),
+        max_nodes: int = Query(1000, description="Maximum nodes to return", ge=1),
+    ):
+        """The knowledge graph of one paper, or of what it shares with its references (fork).
+
+        Returns the ``/graphs`` structure plus ``paper``, a summary of the paper
+        and its references; ``paper.reason`` says why a graph is empty.
+        """
+        try:
+            return await zotero_papers.paper_graph(
+                rag, paper, mode, min(max_nodes, rag.max_graph_nodes)
+            )
+        except Exception as e:
+            logger.error(f"Error getting paper graph for '{paper}': {str(e)}")
             logger.error(traceback.format_exc())
             raise internal_server_error(e)
 
