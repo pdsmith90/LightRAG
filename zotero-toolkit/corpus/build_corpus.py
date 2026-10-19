@@ -670,6 +670,9 @@ def clean_md(md: str) -> str:
     )  # expand form-feeds before stripping C0 controls so page-split documents retain paragraph breaks (2026-10-12)
     md = _ctrl_re.sub("", md)  # C0 control codes: PostgreSQL refuses NUL in text, and a
     # glyph mapped to a control code carries no text anyway (2026-10-06)
+    md = _tables_md(
+        md
+    )  # tables of numbers out, HTML tables as pipe tables (2026-10-19)
     md = _pic_re.sub("", md)  # drop OCR'd figure-scribble noise
     md = _datauri_re.sub("", md)  # embedded data: images
     md = _b64_re.sub(
@@ -1382,8 +1385,11 @@ def ocr_too_thin(text: str, pages: int) -> str:
 # Screened 2026-10-06 on six Tesseract-OCR'd pages: correct two-column reading order (the Tesseract layer
 # interleaves the columns), display and inline LaTeX, word precision 0.84-0.98 against the Tesseract text.
 # Whole-document OCR only: image-only PDFs, majority-garbled PDFs and majority-OCR-layer scans; the partial
-# `--pages` route stays on ocrmypdf. A page failure abandons the VLM for that document (never a mixed-engine
-# document) and the ocrmypdf path runs exactly as before. `--ocr-vlm off` disables all of it, and the route is
+# `--pages` route stays on ocrmypdf. A page the model answers but cannot transcribe (a repetition loop, cut off as it
+# streams, max_tokens, or nothing) or transcribes into text Tesseract does not see on that page (an invented paper on
+# a blank page) is read by Tesseract from the same render and the VLM goes on (2026-10-19); any other page failure, or
+# too many such pages, abandons the VLM for that document and the ocrmypdf path runs exactly as before. Tables of
+# numbers are dropped from transcribed pages (2026-10-19). `--ocr-vlm off` disables all of it, and the route is
 # active only when CFG carries ocr_vlm == "auto" (main() sets it): a test that builds CFG by hand never reaches a
 # server -- on 2026-10-07 the old tests transcribed their synthetic PDFs through the live alias on :18000.
 OCR_VLM_LOCAL_URL = os.environ.get("OCR_VLM_LOCAL_URL", "http://127.0.0.1:19530")
@@ -1398,8 +1404,35 @@ OCR_VLM_LOCAL_START = os.environ.get(
 )
 OCR_VLM_DPI = int(os.environ.get("OCR_VLM_DPI", "130"))
 OCR_VLM_MAX_SIDE = 1800  # px; the screened pages were 780-1105 x 1170-1521 at 130 dpi
-OCR_VLM_MAX_TOKENS = 6000
-OCR_VLM_PAGE_TIMEOUT_S = 300
+OCR_VLM_MAX_TOKENS = 6000  # an 8k-context server: a page prompt is ~1.8k tokens
+OCR_VLM_REMOTE_MAX_TOKENS = 14000  # the remote server runs a 16k context: dense tables needed 7.9-12.9k with styles
+OCR_VLM_PAGE_TIMEOUT_S = 900  # per read of the stream: bounds a queue wait behind another document's long page
+# The model wrote style='text-align: center; word-wrap: break-word;' on every table cell (~70 % of a table page);
+# banning the token keeps the cells (-44 % tokens on a mixed table, same text; 2026-10-19), text pages unchanged.
+OCR_VLM_LOGIT_BIAS = [[" style", False], ["style", False]]
+OCR_VLM_TESSERACT_DPI = 300  # a page the model cannot transcribe: Tesseract reads MuPDF's render at this DPI
+OCR_VLM_TESSERACT_TIMEOUT_S = 120  # ~2 s for a dense book page (2026-10-19)
+OCR_VLM_MAX_UNREADABLE_SHARE = (
+    0.05  # more such pages than this share (and than 3): the VLM is abandoned as before
+)
+# 2026-10-19 probes (14 historical failures, 24 calibration pages): a degenerate loop is one unit back-to-back at the
+# tail of the stream -- (longest unit, min chars covered, min copies) per tier. Blank pages loop on ".1" or a shading
+# glyph; a table caption looped 170 chars at a time. A real table header pair x8 (1,040 chars) must not trip tier 2.
+OCR_VLM_LOOP_TIERS = ((80, 400, 8), (250, 1500, 12))
+OCR_VLM_LOOP_WINDOW = 3200  # tail chars examined, every 64 new chars
+# Grounding: on a blank or title-only page the model can invent a whole paper and stop normally. Tesseract read
+# 0.00-0.05 of such prose; every real page >= 0.41, random pages of poor scans 0.97-1.00. A page with this many prose
+# words and less support is rejected. The inventions ran 190-1059 prose words; the false alarms of a 30-word floor were
+# 32-37 (figure labels on colour maps, a skewed caption).
+OCR_VLM_GROUND_MIN_WORDS = 100
+OCR_VLM_GROUND_MIN_SUPPORT = 0.25
+OCR_VLM_BLANK_WORDS = (
+    15  # Tesseract reads fewer words: a blank page, which does not count toward the cap
+)
+# A table this much numbers is dropped, on every conversion path (2026-10-19: tables of numbers are not worth
+# importing; only pure number grids). Row labels count: 0.95 keeps a named row of up to 18 numbers and forgives a
+# footnoted or N/A cell in 20.
+NUMERIC_TABLE_SHARE = 0.95
 OCR_VLM_PROMPT = (  # the model card's instruction, verbatim; the model was tuned on it
     "You are an advanced hybrid OCR engine capable of processing multilingual text mixed with mathematical "
     "notation. Your goal is to transcribe the content with high fidelity.Strict Rules: 1. Multilingual Precision: "
@@ -1412,6 +1445,10 @@ OCR_VLM_PROMPT = (  # the model card's instruction, verbatim; the model was tune
 )
 _ocr_backend = ""  # "vlm:local" / "vlm:remote" / "ocrmypdf": what the last OCR used (convert() names the method)
 _vlm_endpoint_cache = None  # per worker process
+
+
+class VlmPageUnreadable(RuntimeError):
+    """The model answered but could not transcribe the page: it looped, ran to max_tokens or said nothing."""
 
 
 def _vlm_quiet(now=None) -> bool:
@@ -1476,18 +1513,46 @@ def _vlm_endpoint():
     return found
 
 
+def _vlm_looping(text: str) -> str:
+    """The unit repeated back-to-back at the tail of `text` when the model is looping (OCR_VLM_LOOP_TIERS), else ""."""
+    t = text[-OCR_VLM_LOOP_WINDOW:]
+    lo = 1
+    for max_unit, min_span, min_copies in OCR_VLM_LOOP_TIERS:
+        for u in range(lo, max_unit + 1):
+            unit = t[-u:]
+            k = len(t)
+            while k >= u and t[k - u : k] == unit:
+                k -= u
+            if (
+                len(t) - k >= min_span
+                and (len(t) - k) // u >= min_copies
+                and unit.strip()
+            ):
+                return unit
+        lo = max_unit + 1
+    return ""
+
+
 def _vlm_ocr_page(base: str, img_bytes: bytes) -> str:
-    """One page image -> Markdown. Raises on any non-success (the caller abandons the VLM for the document)."""
+    """One page image -> Markdown, streamed. Raises VlmPageUnreadable when the model's answer is unusable -- it
+    loops (cut off as soon as _vlm_looping sees it), runs to max_tokens or says nothing -- else on any non-success
+    (the caller abandons the VLM for the document). The timeout applies to each read, so a long page never times
+    out while it streams; it still bounds a queue wait or a stalled server."""
     import base64
     import urllib.request
 
     mime = "image/png" if img_bytes.startswith(b"\x89PNG") else "image/jpeg"
+    max_tokens = (
+        OCR_VLM_REMOTE_MAX_TOKENS if base == OCR_VLM_REMOTE_URL else OCR_VLM_MAX_TOKENS
+    )
     body = {
         "model": OCR_VLM_MODEL,
         "temperature": 0,
         "repeat_penalty": 1.15,
-        "max_tokens": OCR_VLM_MAX_TOKENS,
+        "max_tokens": max_tokens,
+        "logit_bias": OCR_VLM_LOGIT_BIAS,
         "chat_template_kwargs": {"enable_thinking": False},
+        "stream": True,
         "messages": [
             {
                 "role": "user",
@@ -1509,18 +1574,197 @@ def _vlm_ocr_page(base: str, img_bytes: bytes) -> str:
         json.dumps(body).encode(),
         {"Content-Type": "application/json"},
     )
+    text, finish, checked = "", None, 0
     with urllib.request.urlopen(req, timeout=OCR_VLM_PAGE_TIMEOUT_S) as r:
-        d = json.load(r)
-    ch = (d.get("choices") or [{}])[0]
-    text = ((ch.get("message") or {}).get("content") or "").strip()
-    if ch.get("finish_reason") != "stop" or not text:
-        raise RuntimeError(f"finish_reason={ch.get('finish_reason')} chars={len(text)}")
+        for raw in r:  # server-sent events: one "data: {json}" line per chunk
+            line = raw.strip()
+            if not line.startswith(b"data:"):
+                continue
+            data = line[5:].strip()
+            if data == b"[DONE]":
+                break
+            ch = (json.loads(data).get("choices") or [{}])[0]
+            text += (ch.get("delta") or {}).get("content") or ""
+            finish = ch.get("finish_reason") or finish
+            if len(text) - checked >= 64:
+                checked = len(text)
+                unit = _vlm_looping(text)
+                if unit:  # leaving the with-block closes the connection: llama-server cancels the task
+                    raise VlmPageUnreadable(
+                        f"loop on {unit[:24]!r} after {len(text)} chars"
+                    )
+    text = text.strip()
+    if finish != "stop" or not text:
+        raise VlmPageUnreadable(f"finish_reason={finish} chars={len(text)}")
     return text
 
 
+def _tesseract_png(png: bytes) -> str:
+    """One page image -> plain text by Tesseract. Raises when Tesseract is missing or fails."""
+    r = _run_child(
+        ["tesseract", "stdin", "stdout"],
+        input=png,
+        capture_output=True,
+        timeout=OCR_VLM_TESSERACT_TIMEOUT_S,
+        check=True,
+    )
+    return r.stdout.decode("utf-8", "replace").strip()
+
+
+_ground_word_re = re.compile(r"[a-z]{3,}")
+
+
+def _prose_words(md: str) -> list:
+    """The ordinary words of a VLM page: formulas, HTML tags and LaTeX commands removed, lower case, 3+ letters."""
+    md = re.sub(r"\$\$.*?\$\$", " ", md, flags=re.S)
+    md = re.sub(r"\$[^$\n]*\$", " ", md)
+    md = re.sub(r"<[^>]+>", " ", md)
+    md = re.sub(r"\\[a-zA-Z]+", " ", md)
+    return _ground_word_re.findall(md.lower())
+
+
+def _vlm_unsupported(md: str, tess: str) -> str:
+    """Why the VLM's page is not backed by Tesseract's reading of the same page, or "" when it is (or is mostly
+    formulas, tables of numbers or too short to judge)."""
+    words = _prose_words(md)
+    if len(words) < OCR_VLM_GROUND_MIN_WORDS:
+        return ""
+    seen = set(_ground_word_re.findall(tess.lower()))
+    support = sum(1 for w in words if w in seen) / len(words)
+    if support >= OCR_VLM_GROUND_MIN_SUPPORT:
+        return ""
+    return (
+        f"unsupported ({len(words)} prose words, {support:.0%} in tesseract's reading)"
+    )
+
+
+def _cell_is_number(cell: str) -> bool:
+    """A table cell holding a number (or a range, a signed or bracketed number, "n = 32"), not words or a formula."""
+    c = re.sub(r"<[^>]+>|&nbsp;|[${}]", " ", cell)
+    c = re.sub(r"\\[a-zA-Z]+", " ", c)  # \pm, \times, \cdot, \sigma ...
+    c = re.sub(r"^\s*[A-Za-z]{1,3}\s*=\s*", "", c)  # a row label such as "n = 32"
+    c = re.sub(r"(?<=\d)[eE](?=[-+]?\d)", "", c)  # an exponent: 1.5e-3
+    return bool(re.search(r"\d", c)) and not any(ch.isalpha() for ch in c)
+
+
+def _numeric_table(rows: list) -> bool:
+    """rows: the cells of each row, the header row first. True when the data cells are numbers -- a grid of pure
+    numbers. Row labels count, so a table that names its rows (regions, models, stations) stays. Rows with no number
+    at all (more header rows) do not count, nor do empty cells, nor a table of fewer than 4 data cells."""
+    data = []
+    for r in rows[1:]:
+        cells = [c for c in r if re.sub(r"<[^>]+>|&nbsp;|\s", "", c)]
+        if any(_cell_is_number(c) for c in cells):
+            data += cells
+    return (
+        len(data) >= 4
+        and sum(map(_cell_is_number, data)) / len(data) >= NUMERIC_TABLE_SHARE
+    )
+
+
+_html_table_re = re.compile(r"<table\b.*?</table>", re.S | re.I)
+_html_row_re = re.compile(r"<tr\b.*?</tr>", re.S | re.I)
+_html_cell_re = re.compile(r"<(t[dh])\b[^>]*>(.*?)</\1>", re.S | re.I)
+_pipe_sep_re = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?\s*$")
+
+
+def _drop_numeric_tables(md: str):
+    """(md, n): md with each table of numbers (HTML or pipe) replaced by a one-line marker that keeps its header row.
+    The caption, outside the table, stays."""
+    n = 0
+
+    def marker(rows):
+        head = " | ".join(
+            re.sub(r"\s+", " ", re.sub(r"<[^>]+>|&nbsp;", " ", c)).strip()
+            for c in rows[0]
+        )
+        return f"[Table of numbers omitted: {len(rows)} rows x {max(map(len, rows))} columns; header: {head[:200]}]"
+
+    def html(m):
+        nonlocal n
+        rows = [
+            [c for _, c in _html_cell_re.findall(r)]
+            for r in _html_row_re.findall(m.group(0))
+        ]
+        rows = [r for r in rows if r]
+        if rows and _numeric_table(rows):
+            n += 1
+            return marker(rows)
+        return m.group(0)
+
+    md = _html_table_re.sub(html, md)
+    out, block = [], []
+
+    def flush():
+        nonlocal n
+        rows = [
+            ln.strip().strip("|").split("|")
+            for ln in block
+            if not _pipe_sep_re.match(ln)
+        ]
+        if len(block) >= 3 and rows and _numeric_table(rows):
+            n += 1
+            out.append(marker(rows))
+        else:
+            out.extend(block)
+        block.clear()
+
+    for ln in md.split("\n"):
+        if ln.strip().startswith("|") and ln.strip().endswith("|"):
+            block.append(ln)
+            continue
+        if block:
+            flush()
+        out.append(ln)
+    if block:
+        flush()
+    return "\n".join(out), n
+
+
+def _html_table_as_pipes(m) -> str:
+    """One HTML table as a Markdown pipe table: cell text with its tags gone and <br> as a space, "|" escaped."""
+    rows = []
+    for r in _html_row_re.findall(m.group(0)):
+        cells = [
+            re.sub(r"\s+", " ", re.sub(r"<[^>]+>|&nbsp;", " ", c))
+            .strip()
+            .replace("|", "\\|")
+            for _, c in _html_cell_re.findall(r)
+        ]
+        if cells:
+            rows.append(cells)
+    if not rows:
+        return m.group(0)
+    lines = ["| " + " | ".join(r) + " |" for r in rows]
+    lines.insert(1, "|" + "---|" * max(map(len, rows)))
+    return "\n\n" + "\n".join(lines) + "\n\n"
+
+
+def _tables_md(md: str) -> str:
+    """Tables before clean_md's tag and <br> passes (2026-10-19). A table of numbers -- native pymupdf4llm or pandoc,
+    or VLM -- becomes _drop_numeric_tables' marker; an HTML table that stays becomes a pipe table, since the tag pass
+    ran its cells together (a row "-8.9 | 5 | -0.3" read "-8.95-0.3"); a <br> inside a pipe row becomes a space
+    instead of splitting the row."""
+    md, n = _drop_numeric_tables(md)
+    if n:
+        print(
+            f"[build_corpus] NUMERIC-TABLES {_ref_doc or '-'}: {n} table(s) of numbers dropped",
+            flush=True,
+        )
+    md = _html_table_re.sub(_html_table_as_pipes, md)
+    return "\n".join(
+        re.sub(r"<br\s*/?>", " ", ln, flags=re.I)
+        if ln.strip().startswith("|") and ln.strip().endswith("|")
+        else ln
+        for ln in md.split("\n")
+    )
+
+
 def vlm_ocr_pdf_to_md(path: str) -> str:
-    """Whole-document OCR through the VLM: every page rendered at OCR_VLM_DPI and transcribed in order.
-    "" when no server is usable or any page fails (the caller falls back to ocrmypdf)."""
+    """Whole-document OCR through the VLM: every page rendered at OCR_VLM_DPI and transcribed in order; a page the
+    model cannot transcribe, or whose prose Tesseract does not read on it, is read by Tesseract instead. "" when no
+    server is usable, a page fails otherwise, or more than OCR_VLM_MAX_UNREADABLE_SHARE of the pages with text are
+    unreadable (the caller falls back to ocrmypdf)."""
     global _ocr_backend
     kind, base = _vlm_endpoint()
     if not base:
@@ -1528,7 +1772,15 @@ def vlm_ocr_pdf_to_md(path: str) -> str:
     import pymupdf
 
     name = os.path.basename(path)
-    parts: list[str] = []
+    parts: list[str] = []  # one entry per page done ("" for a blank Tesseract page)
+    unreadable: list[
+        int
+    ] = []  # 1-based pages with text the VLM failed on: they count toward the cap
+    by_tess: list[
+        int
+    ] = []  # 1-based pages Tesseract read instead (blank ones included)
+    unchecked = False
+    numeric = 0  # tables of numbers dropped from transcribed pages
     t0 = time.time()
     try:
         with pymupdf.open(path) as doc:
@@ -1541,9 +1793,58 @@ def vlm_ocr_pdf_to_md(path: str) -> str:
                     dpi = max(60, int(dpi * OCR_VLM_MAX_SIDE / side))
                 # Lossless PNG at the full DPI: shrinking a page to fit a request-size cap costs
                 # dense pages their small print, so raise the proxy's body limit instead.
-                parts.append(
-                    _vlm_ocr_page(base, page.get_pixmap(dpi=dpi).tobytes("png"))
+                try:
+                    text, why = (
+                        _vlm_ocr_page(base, page.get_pixmap(dpi=dpi).tobytes("png")),
+                        "",
+                    )
+                except VlmPageUnreadable as e:
+                    text, why = "", str(e)
+                # 2026-10-19: one page the model looped on (a blank page with a sideways watermark; a table caption)
+                # sent each whole book to ocrmypdf, and on other blank pages it invented whole papers that ended
+                # normally. Tesseract reads every page from MuPDF's render -- not ocrmypdf, whose Ghostscript drops
+                # some scans' page images: the reading that replaces an unreadable page, and the check that a
+                # transcribed one was not invented. Without Tesseract a transcribed page is kept unchecked, as
+                # before; an unreadable one still abandons the VLM.
+                try:
+                    tess, terr = (
+                        _tesseract_png(
+                            page.get_pixmap(dpi=OCR_VLM_TESSERACT_DPI).tobytes("png")
+                        ),
+                        None,
+                    )
+                except Exception as e:
+                    tess, terr = None, e
+                if not why and tess is not None:
+                    why = _vlm_unsupported(text, tess)
+                elif not why and not unchecked:
+                    unchecked = True
+                    print(
+                        f"[build_corpus] WARN: VLM-OCR {name}: grounding skipped from page {i + 1} "
+                        f"({type(terr).__name__}: {str(terr)[:80]})",
+                        flush=True,
+                    )
+                if not why:
+                    text, k = _drop_numeric_tables(text)
+                    numeric += k
+                    parts.append(text)
+                    continue
+                if tess is None:
+                    raise terr
+                if len(re.findall(r"[A-Za-z]{3,}", tess)) >= OCR_VLM_BLANK_WORDS:
+                    # A model that keeps failing on pages with text is not reading this document: abandon, as
+                    # before. Blank pages do not count -- a one-sided scan is half blank pages.
+                    unreadable.append(i + 1)
+                    if len(unreadable) > max(3, OCR_VLM_MAX_UNREADABLE_SHARE * n):
+                        raise RuntimeError(
+                            f"{len(unreadable)} unreadable page(s), the last {why}"
+                        )
+                by_tess.append(i + 1)
+                print(
+                    f"[build_corpus] VLM-OCR {name} page {i + 1}: {why} -> tesseract ({len(tess)} chars)",
+                    flush=True,
                 )
+                parts.append(tess)
     except Exception as e:
         print(
             f"[build_corpus] WARN: VLM OCR abandoned on {name} after {len(parts)} page(s) "
@@ -1552,11 +1853,17 @@ def vlm_ocr_pdf_to_md(path: str) -> str:
         )
         return ""
     _ocr_backend = "vlm:" + kind
+    tail = (
+        f"; {len(by_tess)} page(s) by tesseract ({', '.join(map(str, by_tess))})"
+        if by_tess
+        else ""
+    )
+    tail += f"; {numeric} numeric table(s) dropped" if numeric else ""
     print(
-        f"[build_corpus] VLM-OCR {name}: {n} page(s) via {OCR_VLM_MODEL} ({kind}) in {time.time() - t0:.0f} s",
+        f"[build_corpus] VLM-OCR {name}: {n} page(s) via {OCR_VLM_MODEL} ({kind}) in {time.time() - t0:.0f} s{tail}",
         flush=True,
     )
-    return "\n\n".join(parts)
+    return "\n\n".join(p for p in parts if p)
 
 
 def _vlm_local_stop() -> None:

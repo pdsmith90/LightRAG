@@ -2,7 +2,7 @@
 """Behavioural tests for build_corpus's VLM OCR route (2026-10-07).
 Run:  .venv/bin/python test_build_corpus_vlmocr.py     (plain asserts; pytest also collects it)
 Whole-document OCR (image-only PDFs, majority-OCR-layer scans) goes to the vision model first and falls back
-to ocrmypdf when no server is usable or any page fails; the partial --pages route never touches the VLM;
+to ocrmypdf when no server is usable or a page fails (since 2026-10-19 an unreadable page is read by Tesseract); the partial --pages route never touches the VLM;
 the remote server is skipped inside its quiet window; --ocr-vlm off restores the old behaviour.
 Synthetic PDFs via pymupdf; pymupdf4llm, the HTTP calls and ocrmypdf replaced by fakes; all text is invented."""
 
@@ -92,7 +92,8 @@ def layer_font(path):
 
 @contextlib.contextmanager
 def vlm(kind="local", page_fn=None):
-    """A usable VLM endpoint whose per-page call is `page_fn(base, png)`; records the calls."""
+    """A usable VLM endpoint whose per-page call is `page_fn(base, png)`; records the calls. Tesseract's reading of
+    each page (the grounding check, 2026-10-19) is faked as VLM_PAGE, so a VLM_PAGE answer counts as backed by it."""
     calls = []
 
     def page(base, png):
@@ -103,6 +104,7 @@ def vlm(kind="local", page_fn=None):
         patched(bc, "_vlm_endpoint_cache", None),
         patched(bc, "_vlm_endpoint", lambda: (kind, "http://127.0.0.1:1")),
         patched(bc, "_vlm_ocr_page", page),
+        patched(bc, "_tesseract_png", lambda png: VLM_PAGE),
     ):
         yield calls
 
@@ -189,7 +191,9 @@ def test_image_only_scan_is_ocrd_by_the_vlm():
 
 def test_vlm_failure_falls_back_to_ocrmypdf():
     def boom(base, png):
-        raise RuntimeError("finish_reason=length chars=0")
+        raise TimeoutError(
+            "timed out"
+        )  # an unreadable page is Tesseract's since 2026-10-19 (test_build_corpus_vlmpage)
 
     with (
         tempfile.TemporaryDirectory() as td,
@@ -351,15 +355,15 @@ def test_vlm_ocr_page_payload_and_repeat_penalty():
 
     sent = []
 
-    class FakeResponse:
-        def read(self):
-            return json.dumps(
-                {
-                    "choices": [
-                        {"message": {"content": "page text"}, "finish_reason": "stop"}
-                    ]
-                }
-            ).encode()
+    class FakeResponse:  # the streamed answer (2026-10-19): one SSE chunk with the text and the finish
+        def __iter__(self):
+            chunk = {
+                "choices": [
+                    {"delta": {"content": "page text"}, "finish_reason": "stop"}
+                ]
+            }
+            yield b"data: " + json.dumps(chunk).encode() + b"\n"
+            yield b"data: [DONE]\n"
 
         def __enter__(self):
             return self
@@ -378,6 +382,7 @@ def test_vlm_ocr_page_payload_and_repeat_penalty():
         res1 = bc._vlm_ocr_page("http://127.0.0.1:18000", png_bytes)
         assert res1 == "page text"
         assert sent[0]["repeat_penalty"] == 1.15
+        assert sent[0]["stream"] is True and [" style", False] in sent[0]["logit_bias"]
         assert sent[0]["messages"][0]["content"][0]["image_url"]["url"].startswith(
             "data:image/png;base64,"
         )
@@ -429,6 +434,9 @@ def test_vlm_ocr_sends_a_dense_page_whole_as_png():
         with (
             patched(bc, "_vlm_endpoint", lambda: ("local", "http://127.0.0.1:1")),
             patched(bc, "_vlm_ocr_page", fake_page),
+            patched(
+                bc, "_tesseract_png", lambda png: ""
+            ),  # not a real Tesseract run on noise
         ):
             md = bc.vlm_ocr_pdf_to_md(path)
         assert md == "transcribed"
