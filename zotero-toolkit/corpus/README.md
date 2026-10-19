@@ -14,6 +14,7 @@ storage/<KEY>/<attachment> ─────────────────�
 |---|---|
 | `build_metadata.py` | Reads `zotero.sqlite` and writes `zotero_metadata.json`, which maps every attachment's storage key to its bibliographic metadata. A rebuild never forgets a key: entries for attachments that Zotero no longer has are carried forward and flagged `"orphan": true`. |
 | `build_corpus.py` | Converts each `storage/<KEY>/` attachment into cleaned Markdown with a metadata header. It is resumable (only missing or outdated outputs are rebuilt), runs in parallel, and records what it did in `.manifest.jsonl`. |
+| `build_references.py` | Reads the DOIs in `zotero_metadata.json`, asks OpenAlex for each one's reference list, and writes `zotero_references.json`: for each library paper, the library papers it cites. The fork's LightRAG server reads it for the WebUI's paper-and-references graph view (`ZOTERO_REFERENCES`). OpenAlex answers are cached, so a rerun only asks about new DOIs. Standard library only; `OPENALEX_MAILTO` joins OpenAlex's polite pool, and `OPENALEX_API_KEY`, if set, is sent as a header. |
 | `quarantine_junk.py` | Moves webpage-snapshot junk (a high markup/base64 ratio, or a denylist entry) and glyph-garbage files (a text layer that is mostly Private Use Area code points, U+FFFD replacement characters, control codes or letter soup — `build_corpus.garble_reason`'s rules) out of the corpus root into `<corpus>_junk_quarantine/`. It never deletes anything and always exits 0. |
 
 ## Install
@@ -46,6 +47,10 @@ python3 corpus/build_corpus.py --zotero ~/Zotero --out ~/Zotero/rag_corpus \
 
 # 3. optional: keep saved-webpage junk out of the index
 python3 corpus/quarantine_junk.py --corpus ~/Zotero/rag_corpus
+
+# 4. optional: reference lists for the fork's paper-and-references graph view
+OPENALEX_MAILTO=you@example.org python3 corpus/build_references.py \
+        --metadata ~/Zotero/zotero_metadata.json --out ~/Zotero/zotero_references.json
 ```
 
 Then point LightRAG's `INPUT_DIR` at the corpus directory. When your library changes,
