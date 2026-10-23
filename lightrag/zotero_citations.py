@@ -363,6 +363,41 @@ def citation_short(file_path: str, max_chars: int = SHORT_MAX) -> str:
         return ""
 
 
+def source_label(file_path: str) -> dict:
+    """Display fields of the Zotero item behind ``file_path`` for the WebUI.
+
+    ``label`` is "Authors · Title · Year · DOI" with missing parts omitted, or
+    None when the path has no metadata entry (non-Zotero documents,
+    ``unknown_source``, manual notes), so the UI keeps showing the filename.
+    """
+    out = {
+        "file_path": file_path,
+        "authors": None,
+        "title": None,
+        "year": None,
+        "doi": None,
+        "label": None,
+    }
+    try:
+        entry = _entry(file_path)
+        if entry is None:
+            return out
+        authors = _authors(entry)
+        title = _plain_title(entry)
+        year = (entry.get("year") or "").strip()
+        doi = (entry.get("doi") or "").strip()
+        out.update(
+            authors=authors or None,
+            title=title or None,
+            year=year or None,
+            doi=doi or None,
+            label=" · ".join(p for p in (authors, title, year, doi) if p) or None,
+        )
+    except Exception as e:  # display only; never fail the graph view over a label
+        logger.warning(f"zotero_citations: source_label({file_path!r}) failed: {e}")
+    return out
+
+
 def strip_llm_references(text: str) -> str:
     """Drop an LLM-written references heading and everything after it."""
     if not text:

@@ -7,7 +7,7 @@ import traceback
 from fastapi import APIRouter, Depends, Query, HTTPException
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from lightrag import zotero_papers
+from lightrag import zotero_citations, zotero_papers
 from lightrag.base import DeletionResult
 from lightrag.exceptions import (
     AdminWriteHoldExceededError,
@@ -212,6 +212,10 @@ class RelationCreateRequest(BaseModel):
         return _require_nonempty_entity_name(entity_name)
 
 
+class SourceLabelsRequest(BaseModel):
+    file_paths: list[str] = Field(..., max_length=500)
+
+
 def create_graph_routes(rag, api_key: Optional[str] = None):
     # Fresh router per call. A module-level instance would accumulate
     # duplicate routes when the factory is invoked more than once in the
@@ -337,6 +341,19 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             logger.error(f"Error searching papers with query '{q}': {str(e)}")
             logger.error(traceback.format_exc())
             raise internal_server_error(e)
+
+    @router.post("/graph/sources/labels", dependencies=[Depends(combined_auth)])
+    async def get_source_labels(request: SourceLabelsRequest):
+        """Bibliographic labels for corpus file paths (fork; the WebUI's source display).
+
+        Each result carries ``file_path``, ``authors``, ``title``, ``year``,
+        ``doi`` and ``label`` ("Authors · Title · Year · DOI"); all but
+        ``file_path`` are null for a path with no Zotero entry, so the client
+        keeps showing the filename.
+        """
+        return {
+            "labels": [zotero_citations.source_label(p) for p in request.file_paths]
+        }
 
     @router.get("/graphs/paper", dependencies=[Depends(combined_auth)])
     async def get_paper_graph(

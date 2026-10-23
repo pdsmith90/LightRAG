@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useSettingsStore } from '@/stores/settings'
+import { useSourceLabels } from '@/hooks/useSourceLabels'
 import Button from '@/components/ui/Button'
 import { cn } from '@/lib/utils'
 import {
@@ -581,6 +582,11 @@ export default function DocumentManager() {
       })) as DocStatusWithStatus[],
     [currentPageDocs]
   );
+
+  // Zotero label of each file, shown instead of the filename; the filename stays in the tooltip
+  const getSourceLabel = useSourceLabels(
+    filteredAndSortedDocs.map(doc => doc.file_path).filter((p): p is string => typeof p === 'string')
+  )
 
   // Calculate current page selection state (after filteredAndSortedDocs is defined)
   const currentPageDocIds = useMemo(() => {
@@ -1773,11 +1779,13 @@ export default function DocumentManager() {
                                   <Tooltip>
                                     <TooltipTrigger asChild>
                                       <div className="truncate">
-                                        {getDisplayFileName(doc, 30)}
+                                        {getSourceLabel(doc.file_path) ?? getDisplayFileName(doc, 30)}
                                       </div>
                                     </TooltipTrigger>
-                                    <TooltipContent side="top" className="max-w-[min(42rem,calc(100vw-2rem))]">
-                                      {doc.file_path}
+                                    <TooltipContent side="top" className="max-w-[min(42rem,calc(100vw-2rem))] whitespace-pre-line">
+                                      {getSourceLabel(doc.file_path)
+                                        ? `${getSourceLabel(doc.file_path)}\n${doc.file_path}`
+                                        : doc.file_path}
                                     </TooltipContent>
                                   </Tooltip>
                                   <div className="text-xs text-gray-500">{doc.id}</div>

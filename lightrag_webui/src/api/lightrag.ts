@@ -638,6 +638,21 @@ export const queryPaperGraph = async (
   return response.data
 }
 
+// Zotero label of a corpus file path (fork); `label` is null for a path with no Zotero entry.
+export type SourceLabel = {
+  file_path: string
+  authors: string | null
+  title: string | null
+  year: string | null
+  doi: string | null
+  label: string | null
+}
+
+export const getSourceLabels = async (filePaths: string[]): Promise<SourceLabel[]> => {
+  const response = await axiosInstance.post('/graph/sources/labels', { file_paths: filePaths })
+  return response.data.labels
+}
+
 export const getGraphLabels = async (): Promise<string[]> => {
   const response = await axiosInstance.get('/graph/label/list')
   return response.data

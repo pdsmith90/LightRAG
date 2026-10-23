@@ -7,6 +7,7 @@ import useLightragGraph from '@/hooks/useLightragGraph'
 import { useTranslation } from 'react-i18next'
 import { GitBranchPlus, Scissors, Lock } from 'lucide-react'
 import EditablePropertyRow from './EditablePropertyRow'
+import { useSourceLabels } from '@/hooks/useSourceLabels'
 
 /**
  * Component that view properties of elements in graph.
@@ -205,8 +206,15 @@ const PropertyRow = ({
     return typeof value === 'string' ? value : JSON.stringify(value, null, 2)
   }
 
+  // file_path shows the Zotero label of each file (the filename stays in the tooltip)
+  const sourcePaths = name === 'file_path' && typeof value === 'string' ? value.split('<SEP>') : []
+  const getSourceLabel = useSourceLabels(sourcePaths)
+
   // Format the value to convert <SEP> to newlines
-  const formattedValue = formatValueWithSeparators(value)
+  const formattedValue =
+    sourcePaths.length > 0
+      ? sourcePaths.map((p) => getSourceLabel(p) ?? p).join(';\n')
+      : formatValueWithSeparators(value)
   let formattedTooltip = tooltip || formatValueWithSeparators(value)
 
   // If this is source_id field and truncate info exists, append it to the tooltip
@@ -243,7 +251,7 @@ const PropertyRow = ({
         {name === 'source_id' && truncate && <sup className="text-red-500">†</sup>}
       </span>:
       <Text
-        className="hover:bg-primary/20 rounded p-1 overflow-hidden text-ellipsis"
+        className={`hover:bg-primary/20 rounded p-1 overflow-hidden text-ellipsis${name === 'file_path' ? ' whitespace-pre-line' : ''}`}
         tooltipClassName="max-w-[min(24rem,calc(100vw-2rem))] -translate-x-13"
         text={formattedValue}
         tooltip={formattedTooltip}

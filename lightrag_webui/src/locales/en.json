@@ -379,7 +379,7 @@
           "entity_type": "Type",
           "source_id": "C-ID",
           "Neighbour": "Neigh",
-          "file_path": "File",
+          "file_path": "Source",
           "keywords": "Keys",
           "weight": "Weight"
         }
