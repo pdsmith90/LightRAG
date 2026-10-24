@@ -53,6 +53,33 @@ def test_cite_resolves_key_from_metadata(load_server):
     assert srv._cite("BBBB0002__whatever.md") == HE
 
 
+def test_cite_renders_creators_as_family_comma_given(load_server, metadata_file):
+    data = json.loads(metadata_file.read_text(encoding="utf-8"))
+    data["AAAA0001"]["creators"] = [
+        ["Vaswani", "Ashish"],
+        ["Shazeer", "Noam"],
+        ["WHO", ""],
+    ]
+    metadata_file.write_text(json.dumps(data), encoding="utf-8")
+    srv = load_server()
+    assert srv._cite("AAAA0001__x.md") == VASWANI.replace(
+        "Ashish Vaswani, Noam Shazeer, Niki Parmar.",
+        "Vaswani, Ashish; Shazeer, Noam; WHO.",
+    )
+    assert srv._cite("BBBB0002__x.md") == HE  # no creators: authors verbatim
+
+
+def test_get_sources_uses_creators_when_present(
+    fake_lightrag, load_server, metadata_file
+):
+    data = json.loads(metadata_file.read_text(encoding="utf-8"))
+    data["BBBB0002"]["creators"] = [["He", "Kaiming"], ["Sun", "Jian"]]
+    metadata_file.write_text(json.dumps(data), encoding="utf-8")
+    fake_lightrag.routes[("POST", "/query")] = _answer_route("CTX", REFERENCES[:1])
+    out = load_server().get_sources("q")
+    assert "- [1] He, Kaiming; Sun, Jian. (2016). Deep Residual" in out
+
+
 def test_cite_unknown_key_falls_back_to_deslugged_title(load_server):
     srv = load_server()
     assert (

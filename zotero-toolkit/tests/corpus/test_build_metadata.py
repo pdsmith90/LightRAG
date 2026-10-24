@@ -70,6 +70,7 @@ def test_build_maps_every_attachment_with_parent_or_own_metadata(tmp_path):
         "filename": "LeCun 2015 deep learning.pdf",
         "title": "Deep learning",
         "authors": ["LeCun Yann", "Bengio Yoshua", "Hinton Geoffrey"],
+        "creators": [["LeCun", "Yann"], ["Bengio", "Yoshua"], ["Hinton", "Geoffrey"]],
         "year": "2015",
         "doi": "10.1038/nature14539",
         "publication": "Nature",
@@ -81,6 +82,7 @@ def test_build_maps_every_attachment_with_parent_or_own_metadata(tmp_path):
     assert (
         epub["publication"] == "Handbook of Statistics"
     )  # bookTitle outranks conferenceName
+    assert epub["creators"] == [["WHO", ""]]  # missing part is ""
     assert (
         epub["authors"] == ["WHO"]
         and epub["year"] == "2003"
@@ -94,6 +96,7 @@ def test_build_maps_every_attachment_with_parent_or_own_metadata(tmp_path):
         idx["TEST0104"]["title"] == "untitled notes" and idx["TEST0104"]["year"] == ""
     )
     assert idx["TEST0105"]["filename"] == "" and idx["TEST0105"]["authors"] == []
+    assert idx["TEST0105"]["creators"] == []
 
 
 def test_missing_database_raises_and_creates_nothing(tmp_path):

@@ -33,6 +33,22 @@ META = {
         "year": "2004",
     },
     "CCCC0003": {"title": "Untitled-year report", "authors": []},
+    "DDDD0004": {
+        "title": "Structured names",
+        "authors": ["Efron Bradley", "Tibshirani Robert"],
+        "creators": [["Efron", "Bradley"], ["Tibshirani", "Robert"]],
+        "year": "1993",
+    },
+    "EEEE0005": {
+        "title": "Four creators",
+        "authors": ["A One", "B Two", "C Three", "D Four"],
+        "creators": [["One", "A."], ["Two", "B."], ["Three", "C."], ["Four", "D."]],
+    },
+    "FFFF0006": {
+        "title": "Family only",
+        "authors": ["WHO", "van der Berg A. B."],
+        "creators": [["WHO", ""], ["van der Berg", "A. B."], ["", "Prince"]],
+    },
 }
 
 _HEADERS = {"X-API-Key": "test-key"}
@@ -100,3 +116,25 @@ def test_endpoint_requires_auth_and_caps_list_size(client):
     too_many = {"file_paths": ["x"] * 501}
     r = client.post("/graph/sources/labels", json=too_many, headers=_HEADERS)
     assert r.status_code == 422
+
+
+def test_creators_render_family_comma_given_joined_by_semicolons(library):
+    got = zc.source_label("DDDD0004__x.md")["label"]
+    assert got == "Efron, Bradley; Tibshirani, Robert · Structured names · 1993"
+
+
+def test_four_creators_keep_three_and_et_al(library):
+    got = zc.source_label("EEEE0005__x.md")["label"]
+    assert got == "One, A.; Two, B.; Three, C. et al. · Four creators"
+
+
+def test_family_only_and_given_only_creators_and_initial_ending(library):
+    assert zc._authors(META["FFFF0006"]) == "WHO; van der Berg, A. B.; Prince"
+    assert zc.source_label("FFFF0006__x.md")["label"] == (
+        "WHO; van der Berg, A. B.; Prince · Family only"
+    )
+    assert zc._authors({"authors": ["Doe J."], "creators": [["", ""]]}) == "Doe J."
+
+
+def test_entry_without_creators_keeps_comma_joined_authors(library):
+    assert zc._authors(META["AAAA0001"]) == "Okafor Chidi, Lindqvist Maja"

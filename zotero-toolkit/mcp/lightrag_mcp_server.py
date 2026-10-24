@@ -144,6 +144,21 @@ def _strip_llm_refs(text: str) -> str:
     return "\n".join(out).rstrip()
 
 
+def _authors(m: dict) -> str | None:
+    """Authors as 'Family, Given; ...' from structured creators, else the 'authors' strings."""
+    names = []
+    for p in m.get("creators") or []:
+        if isinstance(p, (list, tuple)) and len(p) == 2:
+            name = ", ".join(
+                x for x in (str(p[0] or "").strip(), str(p[1] or "").strip()) if x
+            )
+            if name:
+                names.append(name)
+    if names:
+        return "; ".join(names)
+    return ", ".join(m.get("authors") or []) or None
+
+
 def _cite(file_path: str, server_citation: str = "") -> str:
     name = os.path.basename(file_path or "")
     if not re.match(r"^[A-Z0-9]{8}__", name):
@@ -152,7 +167,7 @@ def _cite(file_path: str, server_citation: str = "") -> str:
     if server_citation:
         cite = server_citation
     elif m := _metadata().get(key):
-        authors = ", ".join(m.get("authors") or []) or None
+        authors = _authors(m)
         parts = [
             p
             for p in (

@@ -55,6 +55,7 @@ SCHEMA_KEYS = {
     "filename",
     "title",
     "authors",
+    "creators",
     "year",
     "doi",
     "publication",

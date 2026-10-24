@@ -125,12 +125,23 @@ def _deslug(file_path: str) -> str:
 
 
 def _authors(entry: dict) -> str:
-    """Author names verbatim.
+    """Author names for a citation.
 
-    Zotero stores these as "Family Given" with no comma and sometimes multi-word
-    families ("van der Berg A. B.", "De Luca Maria"), so they cannot be reliably
-    split into an initialised form. Print them as-is.
+    With structured ``creators`` ([family, given] pairs) each name reads
+    "Family, Given" and names are joined with "; ". Without them, fall back to
+    ``authors``: Zotero's "Family Given" strings with no comma and sometimes
+    multi-word families ("van der Berg A. B."), which cannot be reliably split,
+    so they print verbatim, joined with ", ".
     """
+    pairs = [
+        (str(p[0] or "").strip(), str(p[1] or "").strip())
+        for p in (entry.get("creators") or [])
+        if isinstance(p, (list, tuple)) and len(p) == 2
+    ]
+    pairs = [p for p in pairs if p[0] or p[1]]
+    if pairs:
+        names = [", ".join(x for x in p if x) for p in pairs]
+        return "; ".join(names[:3]) + (" et al." if len(names) > 3 else "")
     names = [a for a in (entry.get("authors") or []) if a]
     if not names:
         return ""

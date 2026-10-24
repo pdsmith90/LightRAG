@@ -35,14 +35,24 @@ def _fields(con, iid):
     return {k: v for k, v in rows}
 
 
-def _creators(con, iid):
-    rows = con.execute(
+def _creator_rows(con, iid):
+    return con.execute(
         """SELECT cr.lastName, cr.firstName FROM itemCreators ic
            JOIN creators cr ON cr.creatorID=ic.creatorID
            WHERE ic.itemID=? ORDER BY ic.orderIndex""",
         (iid,),
     ).fetchall()
-    return [(" ".join(x for x in [a, b] if x)).strip() for a, b in rows]
+
+
+def _creators(con, iid):
+    return [
+        (" ".join(x for x in [a, b] if x)).strip() for a, b in _creator_rows(con, iid)
+    ]
+
+
+def _creator_pairs(con, iid):
+    """[lastName, firstName] per creator: the boundary "authors" loses."""
+    return [[a or "", b or ""] for a, b in _creator_rows(con, iid)]
 
 
 def _tags(con, iid):
@@ -95,6 +105,7 @@ def build(zotero_dir: str) -> dict:
             "filename": fn,
             "title": fl.get("title") or os.path.splitext(fn)[0],
             "authors": _creators(con, src),
+            "creators": _creator_pairs(con, src),
             "year": ym.group(1) if ym else "",
             "doi": fl.get("DOI", ""),
             "publication": pub,
