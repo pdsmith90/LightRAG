@@ -15,7 +15,7 @@ import {
 } from '@/components/ui/Select'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/Tooltip'
 import { useSettingsStore } from '@/stores/settings'
-import { useQuerySettingsStore } from '@/stores/querySettings'
+import { defaultQuerySettings, useQuerySettingsStore } from '@/stores/querySettings'
 import { useTranslation } from 'react-i18next'
 import { CircleHelp, RotateCcw } from 'lucide-react'
 import { cn } from '@/lib/utils'
@@ -68,11 +68,11 @@ export default function QuerySettings() {
   // Default values for reset functionality
   const defaultValues = useMemo(() => ({
     mode: 'mix' as QueryMode,
-    top_k: 40,
-    chunk_top_k: 20,
-    max_entity_tokens: 6000,
-    max_relation_tokens: 8000,
-    max_total_tokens: 30000
+    top_k: defaultQuerySettings.top_k,
+    chunk_top_k: defaultQuerySettings.chunk_top_k,
+    max_entity_tokens: defaultQuerySettings.max_entity_tokens,
+    max_relation_tokens: defaultQuerySettings.max_relation_tokens,
+    max_total_tokens: defaultQuerySettings.max_total_tokens
   }), [])
 
   const handleReset = useCallback((key: keyof typeof defaultValues) => {
@@ -422,7 +422,7 @@ export default function QuerySettings() {
                   onBlur={(e) => {
                     const value = e.target.value
                     if (value === '' || isNaN(parseInt(value))) {
-                      handleChange('max_total_tokens', 30000)
+                      handleChange('max_total_tokens', defaultQuerySettings.max_total_tokens)
                     }
                   }}
                   min={1}

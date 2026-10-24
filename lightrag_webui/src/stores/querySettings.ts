@@ -30,11 +30,11 @@ interface QuerySettingsState {
 
 export const defaultQuerySettings: QuerySettings = {
   mode: 'mix',
-  top_k: 40,
-  chunk_top_k: 20,
-  max_entity_tokens: 6000,
-  max_relation_tokens: 8000,
-  max_total_tokens: 30000,
+  top_k: 10,
+  chunk_top_k: 12,
+  max_entity_tokens: 1500,
+  max_relation_tokens: 1500,
+  max_total_tokens: 7000,
   only_need_context: false,
   only_need_prompt: false,
   stream: true,
