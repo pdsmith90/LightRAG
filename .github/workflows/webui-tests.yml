@@ -2,12 +2,12 @@ name: WebUI Unit Tests
 
 on:
   push:
-    branches: [ main, dev, 'dev-*' ]
+    branches: [ main, dev, 'dev-*', zlightrag ]
     paths:
       - 'lightrag_webui/**'
       - '.github/workflows/webui-tests.yml'
   pull_request:
-    branches: [ main, dev, 'dev-*' ]
+    branches: [ main, dev, 'dev-*', zlightrag ]
     types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - 'lightrag_webui/**'
