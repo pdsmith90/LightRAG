@@ -1565,9 +1565,11 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         )
     )
     """Map every extracted entity name to the spelling the graph already uses for
-    the same name up to case, spacing and punctuation, so "Kalman filter" and
-    "Kalman Filter" share one node (``lightrag.entity_name_fold``; Postgres graph
-    storage only). Env ``ENTITY_NAME_FOLD``.
+    the same name up to case, spacing, punctuation and the plural of its last word,
+    so "Kalman filter" and "Kalman Filters" share one node
+    (``lightrag.entity_name_fold``; Postgres graph storage only). Env
+    ``ENTITY_NAME_FOLD``; a deployment's exception lists and alias table are read
+    from ``ENTITY_NAME_FOLD_LISTS`` and ``ENTITY_NAME_ALIASES`` when the map is built.
     """
 
     def _mark_addon_params_dirty(self) -> None:

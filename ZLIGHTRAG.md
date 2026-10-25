@@ -198,6 +198,47 @@ whatever the prompt says, and on a paper corpus the one-letter hubs collect
 thousands of unrelated edges. Applies to new extractions; existing symbol entities
 stay until deleted. Off by default.
 
+### Entity name fold
+
+With `ENTITY_NAME_FOLD=true`, every entity name an extraction produces is mapped to the
+spelling the graph already uses for the same fold key, or becomes that spelling when
+the key is new (`lightrag/entity_name_fold.py`). The extraction LLM spells one entity
+several ways across papers, and the merge keys on the exact string, so without it a
+concept's relations scatter over several nodes. The map is read from the Postgres/AGE
+graph in the background after the storages initialise; names pass unchanged until
+`ENTITY_NAME_FOLD armed: N name keys, A aliases, lists <source>` is logged, and with
+other graph storages. Off by default.
+
+The key folds case, spacing and punctuation (NFKC, casefold, letters and digits of every
+script) and the plural of the last word: regular `-s`/`-es`/`-ies` plurals, acronym
+plurals (`DEMs`), a `(s)` suffix, Latin/Greek and English irregulars (`spectra`,
+`matrices`, `axes`, `leaves`), and `-ics` only after another word. Kept apart: keys
+under four characters, an all-capitals acronym and a word up to five characters
+(`TIDE`/`tide`), all-capitals words inside a mixed-case name (`GPS`), words ending
+`-ss`/`-ous` or `-is`/`-us`/`-as`/`-os` unless listed, and anything with different
+digits. A name holding an operator, comparison or prime (`=`, `+`, `^`, `<`, `>`, `|`,
+`′`, `<sup>`, an apostrophe used as a prime) gets a separate symbolic key that keeps
+those symbols, so `x + y` and `x - y`, or `k2` and `k2′`, stay apart; such names are
+never plural-folded. Each key's spelling is the member with the smallest
+`canonical_rank`: apparatus names (see `DROP_JUNK_ENTITIES`) never, then spellings
+without markup, stray whitespace or CamelCase glue, then the best-connected, a singular
+before a plural, and code-point order last, so the choice does not depend on scan order.
+
+The code carries generic word lists only. `ENTITY_NAME_FOLD_LISTS` names a JSON file of
+a deployment's own exceptions (surnames and place names that look like plurals, words
+that do not fold when they are the whole name, `-is`/`-us`/`-as`/`-os` plurals,
+irregulars of its field), merged into the built-in lists; the schema is in the module
+docstring. `ENTITY_NAME_ALIASES` names a CSV of `variant,canonical` rows, keyed by the
+variant's fold key and consulted before the map, for spellings joined by rules the key
+does not know, such as a bulk merge's; rows whose two names share a key are skipped.
+Both are read when the map is built. A missing or malformed file leaves folding off
+with an error in the log.
+
+Applied where results leave `extract_entities`, so the write-ahead anchors and the merge
+name the same nodes, and as an alias in the knowledge rebuild, which files each cached
+record under its original and its canonical name. Changing the key rules or the lists
+changes keys: existing variant nodes are not merged by the switch itself.
+
 ### Sidecar relations
 
 `SIDECAR_RELATIONS=none` keeps a table/equation/drawing sidecar entity but no longer

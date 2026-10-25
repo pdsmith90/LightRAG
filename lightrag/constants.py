@@ -106,6 +106,10 @@ DEFAULT_DROP_JUNK_ENTITIES = False
 # Fork: fold extracted entity names that differ only in case/spacing/punctuation
 # onto the spelling the graph already uses.
 DEFAULT_ENTITY_NAME_FOLD = False
+# Fork: a deployment's extra fold exception lists (JSON) and its alias table
+# (CSV variant,canonical); empty = none.
+DEFAULT_ENTITY_NAME_FOLD_LISTS = ""
+DEFAULT_ENTITY_NAME_ALIASES = ""
 
 # Rerank configuration defaults
 DEFAULT_MIN_RERANK_SCORE = 0.0
