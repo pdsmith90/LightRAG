@@ -616,9 +616,14 @@ export type PaperSummary = {
   n_refs: number | null
   n_cited: number | null
   n_cited_in_kb: number | null
-  mode?: 'paper' | 'shared'
+  mode?: 'paper' | 'shared' | 'common'
+  context?: 'own' | 'kb' | 'linked'
   references_available?: boolean
   cited_sharing?: number
+  n_linking?: number
+  n_context_edges?: number
+  // One per requested paper; `paper` itself also carries the first one's fields when only one was asked for.
+  papers?: PaperSummary[]
   reason?: string
 }
 
@@ -628,12 +633,14 @@ export const searchPapers = async (query: string, limit: number = 20): Promise<P
 }
 
 export const queryPaperGraph = async (
-  paper: string,
-  mode: 'paper' | 'shared',
+  papers: string[],
+  mode: 'paper' | 'shared' | 'common',
+  context: 'own' | 'kb' | 'linked',
   maxNodes: number
 ): Promise<LightragGraphType & { is_truncated?: boolean; paper: PaperSummary }> => {
+  const ids = papers.map((paper) => `paper=${encodeURIComponent(paper)}`).join('&')
   const response = await axiosInstance.get(
-    `/graphs/paper?paper=${encodeURIComponent(paper)}&mode=${mode}&max_nodes=${maxNodes}`
+    `/graphs/paper?${ids}&mode=${mode}&context=${context}&max_nodes=${maxNodes}`
   )
   return response.data
 }

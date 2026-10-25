@@ -6,7 +6,15 @@ import * as Constants from '@/lib/constants'
 import { useGraphStore, RawGraph, RawNodeType, RawEdgeType } from '@/stores/graph'
 import { toast } from 'sonner'
 import { queryGraphs, queryPaperGraph, PaperSummary } from '@/api/lightrag'
-import { parsePaperLabel } from '@/lib/paperFilter'
+import {
+  parsePaperLabel,
+  readPaperContext,
+  paperSummaryMessage,
+  paperNodeAttrs,
+  paperEdgeAttrs,
+  isStalePaperResult,
+  clearsLabelOnEmpty
+} from '@/lib/paperFilter'
 import { useBackendState } from '@/stores/state'
 import { useSettingsStore } from '@/stores/settings'
 
@@ -162,7 +170,7 @@ const fetchGraph = async (label: string, maxDepth: number, maxNodes: number) => 
   try {
     console.log(`Fetching graph label: ${queryLabel}, depth: ${maxDepth}, nodes: ${maxNodes}`)
     rawData = paperFilter
-      ? await queryPaperGraph(paperFilter.paper, paperFilter.mode, maxNodes)
+      ? await queryPaperGraph(paperFilter.papers, paperFilter.mode, readPaperContext(), maxNodes)
       : await queryGraphs(queryLabel, maxDepth, maxNodes)
   } catch (e) {
     // Record the backend error, then RETHROW so the caller's .catch() runs its
@@ -248,19 +256,6 @@ const fetchGraph = async (label: string, maxDepth: number, maxNodes: number) => 
   return { rawGraph, is_truncated: rawData?.is_truncated, paper: rawData?.paper as PaperSummary | undefined }
 }
 
-// What a paper-filter load showed, or why it is empty (fork; lib/paperFilter).
-const paperSummaryMessage = (
-  t: (key: string, options?: Record<string, unknown>) => string,
-  paper: PaperSummary,
-  nodes: number
-): string => {
-  if (paper.reason) return t(`graphPanel.paperFilter.reason.${paper.reason}`)
-  const counts = { citation: paper.citation, nodes, inKb: paper.n_cited_in_kb ?? 0 }
-  return paper.mode === 'shared'
-    ? t('graphPanel.paperFilter.sharedSummary', { ...counts, sharing: paper.cited_sharing ?? 0 })
-    : t('graphPanel.paperFilter.paperSummary', counts)
-}
-
 // Create a new graph instance with the raw graph data
 const createSigmaGraph = async (rawGraph: RawGraph | null): Promise<UndirectedGraph | null> => {
   if (!rawGraph || !rawGraph.nodes.length) return null
@@ -290,7 +285,8 @@ const createSigmaGraph = async (rawGraph: RawGraph | null): Promise<UndirectedGr
       x,
       y,
       size: rawNode.size,
-      borderColor: NODE_BORDER_COLOR
+      borderColor: NODE_BORDER_COLOR,
+      ...paperNodeAttrs(rawNode)
     })
   }
 
@@ -324,7 +320,8 @@ const createSigmaGraph = async (rawGraph: RawGraph | null): Promise<UndirectedGr
     // originalWeight feeds GraphControl's thickness scaling.
     const attributes = {
       label: (rawEdge.properties?.keywords as string | undefined) || undefined,
-      originalWeight: parseEdgeWeight(rawEdge.properties)
+      originalWeight: parseEdgeWeight(rawEdge.properties),
+      ...paperEdgeAttrs(rawEdge)
     }
     const dynamicId = addUndirectedEdgeSafe(graph, rawEdge.source, rawEdge.target, attributes)
     if (dynamicId === null) {
@@ -496,6 +493,14 @@ const useLightrangeGraph = () => {
           const state = useGraphStore.getState()
           const data = result?.rawGraph
 
+          // Fork: a paper result for a selection that changed while it loaded is dropped;
+          // show() already reset graphDataFetchAttempted, so the effect fetches the new one.
+          if (isStalePaperResult(currentQueryLabel, useSettingsStore.getState().queryLabel)) {
+            fetchInProgressRef.current = false
+            state.setIsFetching(false)
+            return
+          }
+
           if (result?.is_truncated) {
             toast.info(t('graphPanel.dataIsTruncated', 'Graph data is truncated to Max Nodes'))
           }
@@ -537,7 +542,12 @@ const useLightrangeGraph = () => {
             const isAuthError = errorMessage && errorMessage.includes('Authentication required')
 
             // Only clear queryLabel if it's not an auth error and current label is not empty
-            if (!isAuthError && currentQueryLabel) {
+            // Fork: an empty paper result keeps its label (the selection stays editable), and a
+            // stale result must not wipe a label set while it was loading.
+            if (
+              !isAuthError &&
+              clearsLabelOnEmpty(currentQueryLabel, useSettingsStore.getState().queryLabel)
+            ) {
               useSettingsStore.getState().setQueryLabel('')
             }
 

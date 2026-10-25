@@ -381,7 +381,10 @@
           "Neighbour": "Neigh",
           "file_path": "Source",
           "keywords": "Keys",
-          "weight": "Weight"
+          "weight": "Weight",
+          "shared_with": "Shared with",
+          "contributed_by": "From selected papers",
+          "paper_context": "Context"
         }
       },
       "edge": {
@@ -408,21 +411,40 @@
       "refreshingTooltip": "Refreshing data..."
     },
     "paperFilter": {
-      "selectTooltip": "Show the graph of one paper",
+      "selectTooltip": "Add a paper (pick again to remove)",
       "label": "Search papers",
-      "placeholder": "Paper...",
+      "placeholder": "Add paper...",
       "searchPlaceholder": "DOI, title, author or year...",
       "noPapers": "No matching papers in the knowledge base",
       "referencesInKb": "{{count}} references in the KB",
-      "modePaperTooltip": "Showing everything the paper contributed. Click to show only what it shares with the papers it cites",
-      "modeSharedTooltip": "Showing only what the paper shares with the papers it cites. Click to show everything it contributed",
+      "removePaper": "Remove {{citation}}",
+      "clearPapers": "Clear",
+      "maxPapers": "At most 10 papers",
+      "modePaperTooltip": "Showing everything the papers contributed. Click to show only what they share with the papers they cite",
+      "modeSharedTooltip": "Showing only what the papers share with the papers they cite. Click for what at least two of the selected papers contributed (one paper: back to everything)",
+      "modeCommonTooltip": "Showing what at least two of the selected papers contributed. Click to show everything the papers contributed",
+      "contextOwnTooltip": "Showing only relations from the selected papers. Click to add the knowledge base's other relations between these entities (blue)",
+      "contextKbTooltip": "Showing other relations between these entities in blue (not from the selected papers). Click to also add linking entities from the wider graph (faded)",
+      "contextLinkedTooltip": "Showing blue relations and faded linking entities that are not from the selected papers. Click to show only relations from the selected papers",
       "paperSummary": "{{citation}}: {{nodes}} nodes; {{inKb}} of its references are in the knowledge base",
       "sharedSummary": "{{citation}}: {{nodes}} nodes shared with {{sharing}} of its {{inKb}} references in the knowledge base",
+      "papersSummary": "{{count}} papers: {{nodes}} nodes",
+      "commonSummary": "{{count}} papers: {{nodes}} nodes at least two of them contributed",
+      "sharedSummaryMany": "{{count}} papers: {{nodes}} nodes shared with {{sharing}} cited works in the knowledge base",
+      "contextSuffix": " (+{{edges}} relations from the wider graph)",
+      "contextLinkingSuffix": " (+{{edges}} relations and {{linking}} linking entities from the wider graph)",
+      "someNotInKb": "{{count}} of the selected papers are not in the knowledge base",
       "reason": {
         "not_in_kb": "This paper is not in the knowledge base",
         "no_references_file": "The server has no reference lists (zotero_references.json)",
         "no_reference_list": "No reference list is known for this paper (no DOI, or none in OpenAlex)",
-        "no_references_in_kb": "None of this paper's references are in the knowledge base"
+        "no_references_in_kb": "None of this paper's references are in the knowledge base",
+        "not_in_kb_many": "None of the selected papers is in the knowledge base",
+        "no_reference_list_many": "No reference list is known for the selected papers (no DOI, or none in OpenAlex)",
+        "no_references_in_kb_many": "None of the selected papers' references are in the knowledge base",
+        "need_two_papers": "Pick at least two papers that are in the knowledge base",
+        "nothing_in_common": "No entity was contributed by two of the selected papers",
+        "too_many_papers": "Too many papers selected (at most 10)"
       }
     },
     "emptyGraph": "Empty(Try Reload Again)"

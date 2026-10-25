@@ -366,3 +366,25 @@ describe('ai content notice flag', () => {
     expect(useAiContentNoticeStore.getState().enabled).toBe(true)
   })
 })
+
+describe('queryPaperGraph', () => {
+  test('repeats paper= for every id, encoded, and sends mode, context and max_nodes', async () => {
+    let url: string | undefined
+    apiModule.__setAxiosAdapterForTests(async (config: any) => {
+      url = config.url
+      return { data: { nodes: [], edges: [] }, status: 200, statusText: 'OK', headers: {}, config }
+    })
+
+    try {
+      await apiModule.queryPaperGraph(['10.1002/2013JB010900', 'ABCD1234'], 'common', 'linked', 500)
+      expect(url).toBe(
+        '/graphs/paper?paper=10.1002%2F2013JB010900&paper=ABCD1234&mode=common&context=linked&max_nodes=500'
+      )
+
+      await apiModule.queryPaperGraph(['ABCD1234'], 'paper', 'own', 100)
+      expect(url).toBe('/graphs/paper?paper=ABCD1234&mode=paper&context=own&max_nodes=100')
+    } finally {
+      apiModule.__setAxiosAdapterForTests(undefined)
+    }
+  })
+})

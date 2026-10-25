@@ -457,7 +457,7 @@ const GraphControl = ({ disableHoverEffect }: { disableHoverEffect?: boolean }) 
       },
 
       edgeReducer: (edge, data) => {
-        const newData = { ...data, hidden: false, labelColor, color: edgeColor }
+        const newData = { ...data, hidden: false, labelColor, color: data.color ?? edgeColor }
 
         if (focusedNodeValid) {
           // No graph.extremities() here: it allocates an array per edge.

@@ -67,6 +67,8 @@ export interface AsyncSelectProps<T> {
   triggerTooltip?: string
   /** Allow clearing the selection */
   clearable?: boolean
+  /** Close the dropdown after a pick; false keeps it open to pick several */
+  closeOnSelect?: boolean
   /** Debounce time in milliseconds */
   debounceTime?: number
 }
@@ -93,6 +95,7 @@ export function AsyncSelect<T>({
   noResultsMessage,
   triggerTooltip,
   clearable = true,
+  closeOnSelect = true,
   debounceTime = 150
 }: AsyncSelectProps<T>) {
   const [open, setOpen] = useState(false)
@@ -152,9 +155,9 @@ export function AsyncSelect<T>({
     (currentValue: string) => {
       const newValue = clearable && currentValue === value ? '' : currentValue
       onChange(newValue)
-      setOpen(false)
+      if (closeOnSelect) setOpen(false)
     },
-    [value, onChange, clearable]
+    [value, onChange, clearable, closeOnSelect]
   )
 
   const handleOpenChange = useCallback(
