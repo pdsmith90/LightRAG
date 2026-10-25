@@ -209,14 +209,37 @@ of the graph, every one generic.
 
 The WebUI's graph view gains a paper picker beside the label search. Search by DOI,
 Zotero key, or words of the title, authors or year; only papers in the knowledge base
-are listed, with how many of their references are. A paper shows one of two graphs,
-toggled by the button beside the picker:
+are listed, with how many of their references are. Up to ten papers can be picked at
+once (picking one again removes it; each shows as a chip under the picker), and the
+button beside the picker cycles through three graphs:
 
-- **Paper**: the entities and relations the paper's documents contributed.
-- **Shared with its references**: only the entities that the paper and at least one
-  library paper it cites both contributed, each listing those papers in a
+- **Papers**: the entities and relations the papers' documents contributed. With
+  several papers, each entity names the ones that contributed it in a
+  `contributed_by` property.
+- **Shared with their references**: only the entities that a picked paper and at
+  least one library paper it cites both contributed, each listing those papers in a
   `shared_with` property, and the relations the shown documents contributed between
-  them.
+  them. A picked paper that another picked paper cites counts as a reference.
+- **In common** (two or more papers): only the entities at least two of the picked
+  papers contributed.
+
+A paper's own relations leave many of its entities unconnected: on one corpus, 0.68
+relations per entity, with a third of the entities isolated. A second button sets how
+much context the view takes from the rest of the graph (remembered per browser):
+
+- only the papers' own relations;
+- also every other relation the graph holds between the shown entities (the default;
+  on that corpus a quarter of a paper's entities stay isolated, and a tenth of the
+  shared view's);
+- also linking entities: entities outside the view that touch at least two shown
+  ones, most connections first, at most a quarter as many as are shown, with their
+  relations to the shown entities.
+
+What the papers did not contribute carries a `paper_context` property and is drawn
+apart (blue relations, faded entities). On the Postgres/AGE graph storage both lookups
+run as plain SQL on the label tables (about 0.1 s for a 400-entity view; the Cypher
+edge lookup they replace took about 11 ms per pair); other storages use the generic
+graph calls.
 
 A paper is its DOI, so every attachment with that DOI counts; a paper without one is
 its Zotero key. What a document contributed is read from LightRAG's per-document
@@ -226,10 +249,13 @@ names in those rows). Which library papers a paper cites comes from
 `zotero_references.json`, which `zotero-toolkit/corpus/build_references.py` builds from
 OpenAlex reference lists. It is read from the server's working directory, or the path
 in `ZOTERO_REFERENCES`, and reloaded when it changes; without it the shared view is
-empty and says so. The picker sets the graph label to `paper:<DOI>` or
-`paper+refs:<DOI>`, so refresh, retries and the label history work as for an entity.
-Endpoints: `GET /graph/papers/search?q=` and `GET /graphs/paper?paper=&mode=paper|shared`.
-Code: `lightrag/zotero_papers.py`, `lightrag_webui/src/components/graph/PaperFilter.tsx`.
+empty and says so. The picker sets the graph label to `paper:<DOIs>`,
+`paper+refs:<DOIs>` or `paper+common:<DOIs>` (the papers separated by spaces), so
+refresh, retries and the label history work as for an entity. Endpoints:
+`GET /graph/papers/search?q=` and
+`GET /graphs/paper?paper=<id>[&paper=<id>...]&mode=paper|shared|common&context=own|kb|linked`
+(`context` defaults to `own`). Code: `lightrag/zotero_papers.py`,
+`lightrag_webui/src/components/graph/PaperFilter.tsx`, `lightrag_webui/src/lib/paperFilter.ts`.
 
 ### PostgreSQL edge removal in plain SQL
 

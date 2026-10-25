@@ -357,21 +357,28 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
 
     @router.get("/graphs/paper", dependencies=[Depends(combined_auth)])
     async def get_paper_graph(
-        paper: str = Query(..., description="DOI or Zotero storage key of the paper"),
-        mode: Literal["paper", "shared"] = Query(
+        paper: list[str] = Query(
+            ...,
+            description="DOI or Zotero storage key of a paper; repeat for several papers",
+        ),
+        mode: Literal["paper", "shared", "common"] = Query(
             "paper",
-            description="paper: what the paper contributed; shared: only what it shares with the library papers it cites",
+            description="paper: what the papers contributed; shared: only what each shares with the library papers it cites; common: only what at least two of them contributed",
+        ),
+        context: Literal["own", "kb", "linked"] = Query(
+            "own",
+            description="own: only the papers' own relations; kb: also every other relation between the shown entities; linked: also entities that link several shown ones",
         ),
         max_nodes: int = Query(1000, description="Maximum nodes to return", ge=1),
     ):
-        """The knowledge graph of one paper, or of what it shares with its references (fork).
+        """The knowledge graph of a few papers, of what each shares with its references, or of what they share (fork).
 
-        Returns the ``/graphs`` structure plus ``paper``, a summary of the paper
-        and its references; ``paper.reason`` says why a graph is empty.
+        Returns the ``/graphs`` structure plus ``paper``, a summary of the
+        papers and their references; ``paper.reason`` says why a graph is empty.
         """
         try:
             return await zotero_papers.paper_graph(
-                rag, paper, mode, min(max_nodes, rag.max_graph_nodes)
+                rag, paper, mode, min(max_nodes, rag.max_graph_nodes), context
             )
         except Exception as e:
             logger.error(f"Error getting paper graph for '{paper}': {str(e)}")
