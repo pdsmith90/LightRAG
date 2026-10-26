@@ -476,10 +476,11 @@ def make_kg_purge_operation_id(doc_key: str, chunk_ids: list[str]) -> str:
 def doc_status_kg_write_state(status_doc: Any) -> str | None:
     """Return how far this document's KG write progressed, if recorded.
 
-    ``None`` means UNKNOWN — a document predating the marker, which is monotonic
-    and never cleared: a PROCESSED document keeps ``graph_mutation_started``
-    (its anchors serve as the proof from then on). A fail-closed purge
-    treats UNKNOWN as "may have touched the graph".
+    ``None`` means UNKNOWN — a document predating the marker, which is never
+    cleared (only a completed resume purge sets it back to ``pre_graph``): a
+    PROCESSED document keeps ``graph_mutation_started`` (its anchors serve as
+    the proof from then on). A fail-closed purge treats UNKNOWN as "may have
+    touched the graph".
     """
     if status_doc is None:
         return None

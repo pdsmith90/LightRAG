@@ -884,6 +884,172 @@ async def test_resume_purge_does_not_falsely_mark_a_pre_graph_document(tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_completed_resume_purge_keeps_a_pre_merge_failure_retryable(tmp_path):
+    """A completed resume purge returns the document to ``pre_graph``.
+
+    The purge has removed every graph contribution, the chunks and the anchors,
+    so the document owns nothing in the graph again, exactly as at enqueue. If
+    the marker kept saying ``graph_mutation_started``, a failure before the new
+    run's Phase 0 (here the Stage-1 chunk embed, as when an embedding worker
+    times out) left a document with no anchors that "may have touched the
+    graph": every retry refused to purge it, so it could be neither
+    reprocessed nor deleted.
+    """
+    rag = await _build_rag(tmp_path, f"dfc-{uuid4().hex[:8]}")
+    try:
+        doc_id = await _ingest(rag)
+        row = await rag.doc_status.get_by_id(doc_id)
+        assert row["metadata"][KG_WRITE_STATE_METADATA_KEY] == (
+            KG_WRITE_STATE_GRAPH_MUTATION_STARTED
+        )
+
+        async def embed_timeout(data):
+            raise RuntimeError("Embedding func: Worker execution timeout after 360s")
+
+        original_upsert = rag.chunks_vdb.upsert
+        rag.chunks_vdb.upsert = embed_timeout
+        await rag.doc_status.update_doc_status_fields(
+            doc_id, {"status": DocStatus.PENDING}
+        )
+        await rag.doc_status.index_done_callback()
+        try:
+            await rag.apipeline_process_enqueue_documents()
+        finally:
+            rag.chunks_vdb.upsert = original_upsert
+
+        row = await rag.doc_status.get_by_id(doc_id)
+        assert str(getattr(row["status"], "value", row["status"])) == (
+            DocStatus.FAILED.value
+        )
+        # The resume purge completed: anchors and graph objects are gone, and
+        # Stage 1 stamped the new chunk ids before the embed failed.
+        assert row["chunks_list"]
+        assert await rag.full_entities.get_by_id(doc_id) is None
+        assert await rag.chunk_entity_relation_graph.get_node("ALICE") is None
+        assert row["metadata"][KG_WRITE_STATE_METADATA_KEY] == KG_WRITE_STATE_PRE_GRAPH
+
+        await request_failed_retry(rag)
+        await rag.apipeline_process_enqueue_documents()
+
+        row = await rag.doc_status.get_by_id(doc_id)
+        assert str(getattr(row["status"], "value", row["status"])) == (
+            DocStatus.PROCESSED.value
+        ), row.get("error_msg")
+        assert await rag.chunk_entity_relation_graph.get_node("ALICE") is not None
+        assert await rag.full_entities.get_by_id(doc_id) is not None
+        assert row["metadata"][KG_WRITE_STATE_METADATA_KEY] == (
+            KG_WRITE_STATE_GRAPH_MUTATION_STARTED
+        )
+    finally:
+        await rag.finalize_storages()
+
+
+async def _reprocess_with_failure(rag: LightRAG, doc_id: str, obj, name: str) -> dict:
+    """Reprocess ``doc_id`` with ``obj.name`` raising once; return the FAILED row."""
+
+    async def down(*args, **kwargs):
+        raise RuntimeError(f"{name} unavailable")
+
+    original = getattr(obj, name)
+    setattr(obj, name, down)
+    await rag.doc_status.update_doc_status_fields(doc_id, {"status": DocStatus.PENDING})
+    await rag.doc_status.index_done_callback()
+    try:
+        await rag.apipeline_process_enqueue_documents()
+    finally:
+        setattr(obj, name, original)
+    row = await rag.doc_status.get_by_id(doc_id)
+    assert str(getattr(row["status"], "value", row["status"])) == (
+        DocStatus.FAILED.value
+    )
+    return row
+
+
+async def _retry_reaches_processed(rag: LightRAG, doc_id: str) -> None:
+    await request_failed_retry(rag)
+    await rag.apipeline_process_enqueue_documents()
+    row = await rag.doc_status.get_by_id(doc_id)
+    assert str(getattr(row["status"], "value", row["status"])) == (
+        DocStatus.PROCESSED.value
+    ), row.get("error_msg")
+    assert await rag.chunk_entity_relation_graph.get_node("ALICE") is not None
+
+
+@pytest.mark.asyncio
+async def test_resume_purge_failing_after_an_anchor_delete_keeps_its_journal(
+    tmp_path,
+):
+    """The FAILED transition must not erase the journal the purge persisted.
+
+    ``_write_kg_purge_phase`` writes to storage only, while every transition
+    rebuilds ``metadata`` from the in-memory status object. A resume purge that
+    failed after deleting one anchor row therefore lost its ``anchors_pending``
+    journal at FAILED, and with one anchor gone every retry refused to purge.
+    """
+    rag = await _build_rag(tmp_path, f"dfc-{uuid4().hex[:8]}")
+    try:
+        doc_id = await _ingest(rag)
+        row = await _reprocess_with_failure(rag, doc_id, rag.full_relations, "delete")
+
+        assert await rag.full_entities.get_by_id(doc_id) is None
+        assert row["metadata"][KG_PURGE_METADATA_KEY]["phase"] == "anchors_pending"
+        await _retry_reaches_processed(rag, doc_id)
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_resume_purge_failing_to_retire_its_journal_stays_retryable(tmp_path):
+    """A failed journal-retire write leaves the ``completed`` journal in force.
+
+    The purge already deleted both anchor rows, so the journal is the only proof
+    left; the retry must short-circuit on it instead of refusing.
+    """
+    rag = await _build_rag(tmp_path, f"dfc-{uuid4().hex[:8]}")
+    try:
+        doc_id = await _ingest(rag)
+        row = await _reprocess_with_failure(rag, doc_id, rag, "_clear_kg_purge_journal")
+
+        assert await rag.full_entities.get_by_id(doc_id) is None
+        assert await rag.full_relations.get_by_id(doc_id) is None
+        assert row["metadata"][KG_PURGE_METADATA_KEY]["phase"] == (
+            KG_PURGE_PHASE_COMPLETED
+        )
+        await _retry_reaches_processed(rag, doc_id)
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_skip_kg_reprocess_of_a_merged_document_stays_deletable(tmp_path):
+    """Reprocessing a merged document with ``process_options='!'`` purges it and
+    writes no anchors, so it must come out ``pre_graph``, not a document that
+    "may have touched the graph" with no proof, which every delete refused."""
+    rag = await _build_rag(tmp_path, f"dfc-{uuid4().hex[:8]}")
+    try:
+        doc_id = await _ingest(rag)
+        full = dict(await rag.full_docs.get_by_id(doc_id))
+        full["process_options"] = "!"
+        await rag.full_docs.upsert({doc_id: full})
+        await rag.full_docs.index_done_callback()
+        await rag.doc_status.update_doc_status_fields(
+            doc_id, {"status": DocStatus.PENDING}
+        )
+        await rag.doc_status.index_done_callback()
+        await rag.apipeline_process_enqueue_documents()
+
+        row = await rag.doc_status.get_by_id(doc_id)
+        assert str(getattr(row["status"], "value", row["status"])) == (
+            DocStatus.PROCESSED.value
+        )
+        assert await rag.full_entities.get_by_id(doc_id) is None
+        assert row["metadata"][KG_WRITE_STATE_METADATA_KEY] == KG_WRITE_STATE_PRE_GRAPH
+        assert (await rag.adelete_by_doc_id(doc_id)).status == "success"
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
 async def test_reprocess_clears_stale_chunk_list_after_purge(tmp_path):
     """A successful resume purge must persist the emptied chunk list.
 

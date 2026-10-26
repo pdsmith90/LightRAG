@@ -108,6 +108,7 @@ from lightrag.constants import (
     KG_PURGE_PHASE_DERIVED_COMMITTED,
     KG_PURGE_PHASE_PREPARED,
     KG_PURGE_SCHEMA_VERSION,
+    KG_WRITE_STATE_METADATA_KEY,
     KG_WRITE_STATE_PRE_GRAPH,
 )
 from lightrag.utils import get_env_value
@@ -6247,6 +6248,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         doc_id: str,
         *,
         extra_fields: dict[str, Any] | None = None,
+        reset_write_state: bool = False,
     ) -> None:
         """Retire a completed purge journal.
 
@@ -6261,13 +6263,19 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         atomically — a crash between them would leave the document pointing at
         chunks this purge already deleted.
 
-        Deliberately does NOT touch ``kg_write_state``. That marker is
-        monotonic, and ``_mark_graph_mutation_started`` is its only writer, so
-        neither direction is safe to guess here: forcing
-        ``graph_mutation_started`` would make a document that provably never
-        merged start demanding anchors it will never have (a false refusal that
-        leaves it neither reprocessable nor deletable), while clearing it would
-        discard the proof a still-pre-graph document depends on.
+        Does NOT guess ``kg_write_state``: forcing ``graph_mutation_started``
+        would make a document that provably never merged start demanding
+        anchors it will never have (a false refusal that leaves it neither
+        reprocessable nor deletable), while clearing it would discard the proof
+        a still-pre-graph document depends on.
+
+        ``reset_write_state=True`` sets it back to ``pre_graph``, in the same
+        write. Only for a caller whose purge has just COMPLETED and that keeps
+        the row: every graph contribution, the chunks and the anchors are gone,
+        so the document owns nothing in the graph, exactly as at enqueue.
+        Keeping ``graph_mutation_started`` there is the trap: a failure before
+        the next run's Phase 0 (a chunk-embed timeout, the whole extraction)
+        leaves no anchors and no journal, and every retry refuses to purge.
 
         Raises when the row cannot be read or has vanished, same as
         :py:meth:`_write_kg_purge_phase`: the one caller runs mid-pipeline
@@ -6280,6 +6288,8 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         metadata = doc_status_field(status_doc, "metadata", {})
         metadata = dict(metadata) if isinstance(metadata, dict) else {}
         metadata.pop(KG_PURGE_METADATA_KEY, None)
+        if reset_write_state:
+            metadata[KG_WRITE_STATE_METADATA_KEY] = KG_WRITE_STATE_PRE_GRAPH
         fields: dict[str, Any] = {"metadata": metadata}
         if extra_fields:
             fields.update(extra_fields)

@@ -21,6 +21,7 @@ starting with [README.md](./README.md), applies as written.
 | [Per-work chunk cap](#per-work-chunk-cap) | `MAX_CHUNKS_PER_DOC` | `0` (off) |
 | [Lexical retrieval leg](#lexical-retrieval-leg) | `LEXICAL_CHUNK_TOP_K` | `0` (off) |
 | [PostgreSQL edge removal in plain SQL](#postgresql-edge-removal-in-plain-sql) | none | always active |
+| [Resume purge keeps a failed document retryable](#resume-purge-keeps-a-failed-document-retryable) | none | always active |
 | [Named-work pin and notice](#named-work-pin-and-notice) | `NAMED_WORK_PIN`, `NAMED_WORK_NOTICE` | `false`, `false` |
 | [Paper filter in the graph view](#paper-filter-in-the-graph-view) | none; reference lists via `ZOTERO_REFERENCES` | always active |
 | WebUI query defaults for new browser profiles: `top_k` 10, `chunk_top_k` 12, entity/relation tokens 1500, total tokens 7000 (`lightrag_webui/src/stores/querySettings.ts`) | none | always active |
@@ -324,6 +325,19 @@ the graph's edge tables, endpoints bound as arrays, instead of one Cypher `DELET
 edge. Below Apache AGE 1.8.0 every Cypher `DELETE` scans each edge label table, so
 the old path slowed as the graph grew. What is removed is unchanged: every edge
 between each pair, of any label and in either direction, with the vertices kept.
+
+### Resume purge keeps a failed document retryable
+
+Two gaps in upstream's fail-closed purge could leave a reprocessed document that every
+retry and every delete refused (`RecoveryAnchorMissingError`), with nothing in the
+graph to protect. After the resume purge in `_purge_stale_extraction_if_resuming` has
+completed, the same write that retires its journal sets `kg_write_state` back to
+`pre_graph` (the document owns nothing in the graph again); upstream kept
+`graph_mutation_started`, so a failure before the new run's Phase 0, such as a
+chunk-embed timeout, left no anchors, no journal and no proof. And when the resume
+purge itself raises, the stored `kg_purge` journal is copied back into the in-memory
+status before the FAILED write, which upstream let erase it. See
+[docs/design/PurgeRecoveryContract.md](./docs/design/PurgeRecoveryContract.md).
 
 ### Tests
 

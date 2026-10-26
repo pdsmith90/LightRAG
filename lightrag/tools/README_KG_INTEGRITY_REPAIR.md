@@ -71,7 +71,7 @@ one of these must hold:
 | Proof | Meaning |
 | --- | --- |
 | Both anchor rows present | The normal case. Presence is the test, **not** whether the lists are non-empty: a row holding an empty list is a document that extracted no entities, and is a perfectly good proof. |
-| `doc_status.metadata.kg_write_state == pre_graph` | Stamped at enqueue and advanced only once the anchors are durable, so it proves the document never reached its first graph mutation. Staged chunks are cleaned up with no graph access at all. |
+| `doc_status.metadata.kg_write_state == pre_graph` | Stamped at enqueue and advanced only once the anchors are durable (and set back only by a resume purge that has completed, which leaves the document owning nothing), so it proves the document has no graph mutation to clean up. Staged chunks are cleaned up with no graph access at all. |
 | `doc_status.metadata.kg_purge` past `prepared` | A previous purge attempt got far enough to have deleted the anchors itself. Without this, purge's own last step would make every retry refuse forever. |
 | No chunks and no populated anchor row | Nothing that carries attribution would be deleted. This is what lets a document that was queued before the `kg_write_state` marker existed, and never processed, be deleted directly — no scan, no audit. |
 

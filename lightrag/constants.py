@@ -433,9 +433,11 @@ CUSTOM_CHUNK_PATCH_METADATA_KEY = "custom_chunk_patch"
 # "could this document have touched the graph?" without reading the graph.
 # ``pre_graph`` is therefore a valid RECOVERY PROOF on its own: a purge may
 # clean up staged chunks even with no anchor rows, because no graph mutation
-# can have happened yet. MONOTONIC and never cleared: a PROCESSED document
-# keeps ``graph_mutation_started`` (its anchors serve as the proof from then
-# on). Absent means UNKNOWN — a document predating it, which fails closed.
+# can have happened yet. Never cleared, and set back to ``pre_graph`` only by
+# a resume purge that has COMPLETED (the document then owns nothing in the
+# graph again): a PROCESSED document keeps ``graph_mutation_started`` (its
+# anchors serve as the proof from then on). Absent means UNKNOWN — a document
+# predating it, which fails closed.
 KG_WRITE_STATE_METADATA_KEY = "kg_write_state"
 KG_WRITE_STATE_PRE_GRAPH = "pre_graph"
 KG_WRITE_STATE_GRAPH_MUTATION_STARTED = "graph_mutation_started"

@@ -1192,11 +1192,12 @@ class _PipelineMixin:
             # parse-stage failure that never got as far as writing recovery
             # anchors, instead of refusing it for lack of proof.
             #
-            # The marker is MONOTONIC: only ``on_anchors_durable`` advances it
-            # to ``graph_mutation_started``, and nothing ever writes it back.
-            # Re-stamping ``pre_graph`` at the start of a reprocess would be a
-            # lie about the PREVIOUS run's contributions — the resume purge
-            # would then skip the graph and orphan them.
+            # Only ``on_anchors_durable`` advances the marker to
+            # ``graph_mutation_started``. Re-stamping ``pre_graph`` at the
+            # start of a reprocess would be a lie about the PREVIOUS run's
+            # contributions — the resume purge would then skip the graph and
+            # orphan them. Only that purge, once it has COMPLETED, writes
+            # ``pre_graph`` back (``_purge_stale_extraction_if_resuming``).
             metadata: dict[str, Any] = {
                 KG_WRITE_STATE_METADATA_KEY: KG_WRITE_STATE_PRE_GRAPH,
             }
@@ -5882,9 +5883,9 @@ class _PipelineMixin:
                         # _clear_kg_purge_journal: a surviving ``completed``
                         # journal would name a stale operation id and collide
                         # with the next purge of this document.
-                        # kg_write_state is deliberately NOT dropped — it is
-                        # monotonic history, and the anchors written during this
-                        # run are the proof from here on.
+                        # kg_write_state is deliberately NOT dropped — it says
+                        # this run reached the graph, and the anchors written
+                        # during it are the proof from here on.
                         metadata_drop=(KG_PURGE_METADATA_KEY,),
                     )
 
@@ -6019,31 +6020,86 @@ class _PipelineMixin:
         async with pipeline_status_lock:
             pipeline_status["latest_message"] = log_message
             append_pipeline_history(pipeline_status, log_message)
-        await self._purge_doc_chunks_and_kg(
-            doc_id,
-            stored_chunk_ids,
-            pipeline_status=pipeline_status,
-            pipeline_status_lock=pipeline_status_lock,
-        )
-        # The status_doc carries chunks_list / chunks_count from the prior
-        # run; clear them so subsequent state-machine upserts don't write
-        # back stale IDs.
-        #
-        # Persist that reset together with retiring the purge journal, in one
-        # targeted write. In-memory-only was not enough: the
-        # stored chunks_list kept pointing at chunks this purge just deleted,
-        # so a crash here left the row advertising them. Retiring the journal
-        # in the SAME write is what keeps the two consistent — a surviving
-        # ``completed`` journal would later collide with the next purge's
-        # operation id. kg_write_state is deliberately left untouched: it is
-        # monotonic, and this run's own merge will advance it if it gets that
-        # far.
-        await self._clear_kg_purge_journal(
-            doc_id,
-            extra_fields={"chunks_list": [], "chunks_count": 0},
-        )
+        try:
+            await self._purge_doc_chunks_and_kg(
+                doc_id,
+                stored_chunk_ids,
+                pipeline_status=pipeline_status,
+                pipeline_status_lock=pipeline_status_lock,
+            )
+            # The status_doc carries chunks_list / chunks_count from the prior
+            # run; clear them so subsequent state-machine upserts don't write
+            # back stale IDs.
+            #
+            # Persist that reset together with retiring the purge journal, in
+            # one targeted write. In-memory-only was not enough: the
+            # stored chunks_list kept pointing at chunks this purge just deleted,
+            # so a crash here left the row advertising them. Retiring the journal
+            # in the SAME write is what keeps the two consistent — a surviving
+            # ``completed`` journal would later collide with the next purge's
+            # operation id. The same write sets kg_write_state back to
+            # ``pre_graph``: the purge completed, so the document owns nothing
+            # in the graph until this run's Phase 0 advances the marker again.
+            # Left at ``graph_mutation_started``, a failure before Phase 0
+            # (chunk embed, extraction) trapped the document with no anchors
+            # and no journal.
+            await self._clear_kg_purge_journal(
+                doc_id,
+                extra_fields={"chunks_list": [], "chunks_count": 0},
+                reset_write_state=True,
+            )
+        except Exception:
+            await self._reload_purge_recovery_state(doc_id, status_doc)
+            raise
         status_doc.chunks_list = []
         status_doc.chunks_count = 0
+        # Every later transition rebuilds ``metadata`` from this object, so it
+        # must say what was just persisted, or Stage 1 writes the old marker
+        # (and any journal it was loaded with) straight back.
+        in_memory = getattr(status_doc, "metadata", None)
+        if isinstance(in_memory, dict):
+            in_memory.pop(KG_PURGE_METADATA_KEY, None)
+            in_memory[KG_WRITE_STATE_METADATA_KEY] = KG_WRITE_STATE_PRE_GRAPH
+        else:
+            status_doc.metadata = {
+                KG_WRITE_STATE_METADATA_KEY: KG_WRITE_STATE_PRE_GRAPH
+            }
+
+    async def _reload_purge_recovery_state(
+        self, doc_id: str, status_doc: DocProcessingStatus
+    ) -> None:
+        """Copy the stored ``kg_purge`` / ``kg_write_state`` into ``status_doc``.
+
+        For a resume purge that raised. The purge journals its phases to
+        storage only, and the FAILED transition rebuilds ``metadata`` from
+        ``status_doc``, so without this the FAILED write erased the stored
+        journal: a purge that had already deleted an anchor row then left no
+        proof at all, and every retry refused to purge.
+
+        Never raises — the purge's own exception is the one to report. If the
+        row cannot be read, ``status_doc`` is left as it was.
+        """
+        try:
+            stored = await self.doc_status.get_by_id(doc_id)
+        except Exception as e:
+            logger.warning(
+                f"[resume] {doc_id}: could not re-read the purge journal after a "
+                f"failed purge ({e}); the FAILED write may drop it"
+            )
+            return
+        if stored is None:
+            return
+        raw_metadata = doc_status_field(stored, "metadata", {})
+        stored_metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
+        in_memory = getattr(status_doc, "metadata", None)
+        if not isinstance(in_memory, dict):
+            in_memory = {}
+            status_doc.metadata = in_memory
+        for key in (KG_PURGE_METADATA_KEY, KG_WRITE_STATE_METADATA_KEY):
+            if key in stored_metadata:
+                in_memory[key] = stored_metadata[key]
+            else:
+                in_memory.pop(key, None)
 
     async def _mark_graph_mutation_started(
         self, doc_id: str, status_doc: DocProcessingStatus | None = None
@@ -6056,10 +6112,10 @@ class _PipelineMixin:
         purge may no longer assume there is nothing in the graph to find, so it
         demands the anchors (or a purge journal) as proof.
 
-        Monotonic by construction — this is the only writer that sets
-        ``graph_mutation_started``, and no path writes ``pre_graph`` back.
-        Raising aborts the merge before any mutation, which is the safe
-        direction: the anchors are already durable.
+        This is the only writer that sets ``graph_mutation_started``. Only a
+        COMPLETED resume purge writes ``pre_graph`` back, after removing every
+        contribution this marker guarded. Raising aborts the merge before any
+        mutation, which is the safe direction: the anchors are already durable.
 
         ``status_doc`` is the caller's in-memory snapshot, and updating it is
         NOT optional bookkeeping: every later transition upsert rebuilds
