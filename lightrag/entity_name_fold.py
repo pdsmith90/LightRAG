@@ -66,14 +66,25 @@ whose variant has no key, are skipped (the map already covers them).
 Names the apparatus guard (``entity_name_guard``) would drop never become the
 canonical spelling.
 
+Legacy fallback. Spellings the earlier key folded together (an all-capitals
+plural next to its Titlecase form) may now get different keys; the map also
+keeps each legacy key's canonical, consulted for a name that is not symbolic
+when its own key misses the aliases and the map. Symbolic names never use it.
+
 The map is built from the graph once the storages are up (Postgres graph
-storage only) and is armed when complete; until then names pass unchanged.
+storage only) and is armed when complete; until then names pass unchanged, so
+the pipeline waits for it (``ARM_WAIT_S``) before folding or rebuilding. A
+missing or malformed lists file arms the map with the default lists, an
+unreadable alias file arms it without aliases (both logged as errors); the
+outcome is kept for /health (``fold_state``).
 """
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import json
+import os
 import re
 import sys
 import time
@@ -90,10 +101,18 @@ from lightrag.utils import get_env_value, logger
 MIN_KEY = 4
 SHORT_KEY = 5
 
+# How long the pipeline waits for the startup map build before it folds names
+# or rebuilds from cached records, counted from the build's start.
+ARM_WAIT_S = 300.0
+# Seconds before each retry of the startup graph query.
+_QUERY_RETRY_DELAYS = (10.0, 30.0, 90.0)
+
 _ARMED = False
 _MAP: dict[str, str] = {}
 _ALIASES: dict[str, str] = {}
+_LEGACY: dict[str, str] = {}  # legacy_fold_key -> canonical (non-symbolic names)
 _LISTS_SOURCE = "defaults"
+_STATE: dict = {"state": "off"}
 
 
 def _case_class(name: str) -> str:
@@ -656,18 +675,22 @@ def canonical_rank(name: str, raw_type, degree, siblings=None) -> tuple:
 
 
 def load_aliases(path_or_rows) -> int:
-    """Install the alias table from a ``variant,canonical`` CSV path or from
-    ``(variant, canonical)`` rows; ``None`` empties it. Keyed by
-    ``fold_key(variant)`` under the active lists, so load the lists first. Rows
-    whose variant has no key or shares its canonical's key are skipped; of rows
-    with the same key the first wins. Returns the number of aliases installed."""
+    """Install the alias table from a ``variant,canonical`` CSV path (UTF-8, an
+    optional BOM) or from ``(variant, canonical)`` rows; ``None`` empties it.
+    Keyed by ``fold_key(variant)`` under the active lists, so load the lists
+    first. Rows with fewer than two fields or an empty field are skipped and
+    counted; rows whose variant has no key or shares its canonical's key are
+    skipped; of rows with the same key the first wins. A canonical whose own key
+    is aliased is followed to the end of that chain, and rows whose chain loops
+    are dropped. Returns the number of aliases installed; raises when the file
+    cannot be read."""
     global _ALIASES
     if path_or_rows is None:
         _ALIASES = {}
         return 0
     if isinstance(path_or_rows, (str, bytes)) or hasattr(path_or_rows, "__fspath__"):
         csv.field_size_limit(sys.maxsize)
-        with open(path_or_rows, encoding="utf-8", newline="") as fh:
+        with open(path_or_rows, encoding="utf-8-sig", newline="") as fh:
             rows = list(csv.reader(fh))
         if rows and [c.strip().lower() for c in rows[0][:2]] == [
             "variant",
@@ -676,28 +699,58 @@ def load_aliases(path_or_rows) -> int:
             rows = rows[1:]
     else:
         rows = list(path_or_rows)
-    new: dict[str, str] = {}
-    skipped = conflicts = 0
+    found: dict[str, tuple[str, str | None]] = {}  # key -> (canonical, its key)
+    bad = skipped = conflicts = 0
     for row in rows:
         if not row:
             continue
+        if len(row) < 2 or not row[0] or not row[1]:
+            bad += 1
+            continue
         variant, canon = row[0], row[1]
-        if not variant or not canon:
-            skipped += 1
-            continue
         key = fold_key(variant)
-        if key is None or key == fold_key(canon):
+        canon_key = fold_key(canon)
+        if key is None or key == canon_key:
             skipped += 1
             continue
-        if key in new:
-            if new[key] != canon:
+        if key in found:
+            if found[key][0] != canon:
                 conflicts += 1
             continue
+        found[key] = (canon, canon_key)
+    new: dict[str, str] = {}
+    chained = cycles = 0
+    for key, (canon, canon_key) in found.items():
+        seen = {key}
+        while canon_key in found:
+            if canon_key in seen:
+                break
+            seen.add(canon_key)
+            canon, canon_key = found[canon_key]
+        if canon_key in found:  # the chain came back to a key it passed
+            cycles += 1
+            continue
+        chained += len(seen) > 1
         new[key] = canon
+    if bad:
+        logger.warning(
+            f"ENTITY_NAME_FOLD aliases: skipped {bad} rows with fewer than two "
+            "fields or an empty field"
+        )
     if conflicts:
         logger.warning(
             f"ENTITY_NAME_FOLD aliases: {conflicts} rows name a second canonical "
             "for a key already aliased; the first row wins"
+        )
+    if chained:
+        logger.warning(
+            f"ENTITY_NAME_FOLD aliases: {chained} aliases name a canonical that is "
+            "itself aliased; each follows the chain to its end"
+        )
+    if cycles:
+        logger.warning(
+            f"ENTITY_NAME_FOLD aliases: dropped {cycles} aliases whose chain of "
+            "canonicals loops"
         )
     if skipped:
         logger.debug(f"ENTITY_NAME_FOLD aliases: skipped {skipped} rows")
@@ -708,10 +761,21 @@ def load_aliases(path_or_rows) -> int:
 # ------------------------------------------------------------------------- map
 
 
+def _legacy_canonical(name: str) -> str | None:
+    """The canonical the graph uses for ``name``'s legacy key (None for a
+    symbolic name or a key the graph does not hold)."""
+    if not _LEGACY or is_symbolic(name):
+        return None
+    lk = legacy_fold_key(name)
+    return _LEGACY.get(lk) if lk is not None else None
+
+
 def canonical_name(name: str, register: bool = True) -> str:
-    """The spelling the graph uses for ``name``'s key -- the alias table first,
-    then the map; with ``register``, a name whose key is new becomes that
-    spelling."""
+    """The spelling the graph uses for ``name``'s key: the alias table first (its
+    canonical as the map spells that canonical's key), then the map, then, for a
+    name that is not symbolic, the canonical of its legacy key. With
+    ``register``, a key new to the map takes the result: the legacy canonical
+    when there is one, else ``name`` itself."""
     if not _ARMED:
         return name
     key = fold_key(name)
@@ -719,22 +783,35 @@ def canonical_name(name: str, register: bool = True) -> str:
         return name
     alias = _ALIASES.get(key)
     if alias is not None:
-        return alias
+        alias_key = fold_key(alias)
+        if alias_key is None:
+            return alias
+        canon = _MAP.get(alias_key)
+        if canon is None:
+            if register:
+                _MAP[alias_key] = alias
+            return alias
+        return canon
     canon = _MAP.get(key)
-    if canon is None:
-        if register:
-            _MAP[key] = name
-        return name
-    return canon
+    if canon is not None:
+        return canon
+    canon = _legacy_canonical(name)
+    if register:
+        if canon is None:
+            canon = name
+            if key[0] != "§":  # keep the legacy key's canonical for later spellings
+                _LEGACY.setdefault(legacy_fold_key(name), name)
+        _MAP[key] = canon
+    return name if canon is None else canon
 
 
-def load_fold_map(rows) -> int:
-    """Fill the map from ``(name, stored type, degree)`` rows; arm it. Returns the
-    number of keys. Each key's spelling is the member with the smallest
-    ``canonical_rank`` among the names sharing it; apparatus names are
-    skipped."""
-    global _ARMED
+def _compute_fold_map(rows) -> tuple[dict[str, str], dict[str, str]]:
+    """The map (key -> canonical) and the legacy map (legacy key -> canonical)
+    from ``(name, stored type, degree)`` rows. Pure: touches no module state, so
+    ``build_fold_map`` runs it in a worker thread."""
     groups: dict[str, list] = defaultdict(list)
+    # legacy key -> the key of its names, or the set of keys when they differ
+    legacy_keys: dict[str, str | set] = {}
     for name, typ, degree in rows:
         if not name:
             continue
@@ -742,6 +819,18 @@ def load_fold_map(rows) -> int:
         if key is None:
             continue
         groups[key].append((name, typ, degree))
+        if key[0] == "§":  # symbolic: never a legacy fallback
+            continue
+        lk = legacy_fold_key(name)
+        if lk == key:
+            lk = key  # share the string
+        seen = legacy_keys.get(lk)
+        if seen is None:
+            legacy_keys[lk] = key
+        elif isinstance(seen, set):
+            seen.add(key)
+        elif seen != key:
+            legacy_keys[lk] = {seen, key}
     new: dict[str, str] = {}
     for key, members in groups.items():
         if len(members) == 1:
@@ -753,43 +842,145 @@ def load_fold_map(rows) -> int:
         best = min(canonical_rank(n, t, d, names) for n, t, d in members)
         if not best[0]:  # the best is junk only when every member is
             new[key] = best[-1]
+    legacy: dict[str, str] = {}
+    for lk, keys in legacy_keys.items():
+        if not isinstance(keys, set):
+            canon = new.get(keys)
+            if canon is not None:
+                legacy[lk] = canon
+            continue
+        # names of one legacy key under several keys: the best-ranked member
+        # whose key has a canonical decides
+        members = [
+            (m, key) for key in keys for m in groups[key] if legacy_fold_key(m[0]) == lk
+        ]
+        names = [m[0] for m, _key in members]
+        for _rank, key in sorted(
+            (canonical_rank(n, t, d, names), key) for (n, t, d), key in members
+        ):
+            canon = new.get(key)
+            if canon is not None:
+                legacy[lk] = canon
+                break
+    return new, legacy
+
+
+def _install_map(new: dict[str, str], legacy: dict[str, str]) -> int:
+    global _ARMED, _LEGACY
     _MAP.clear()
     _MAP.update(new)
+    _LEGACY = legacy
     _ARMED = True
+    _STATE.update(state="armed", keys=len(_MAP))
     return len(_MAP)
 
 
+def load_fold_map(rows) -> int:
+    """Fill the map from ``(name, stored type, degree)`` rows; arm it. Returns the
+    number of keys. Each key's spelling is the member with the smallest
+    ``canonical_rank`` among the names sharing it; apparatus names are
+    skipped. Each legacy key (non-symbolic names) maps to the canonical of its
+    best-ranked member that has one."""
+    return _install_map(*_compute_fold_map(rows))
+
+
 def disarm() -> None:
-    global _ARMED, _ALIASES
+    global _ARMED, _ALIASES, _LEGACY, _STATE
     _ARMED = False
     _MAP.clear()
     _ALIASES = {}
+    _LEGACY = {}
+    _STATE = {"state": "off"}
 
 
 def is_armed() -> bool:
     return _ARMED
 
 
+def fold_state() -> dict:
+    """The map's state for /health: ``state`` (off | pending | armed |
+    failed:<why>), and once read the ``lists`` source, the ``aliases`` installed
+    and the ``keys`` armed."""
+    return dict(_STATE)
+
+
+def _why(exc: BaseException) -> str:
+    text = exc.strerror if isinstance(exc, OSError) and exc.strerror else exc
+    return " ".join(f"{type(exc).__name__}: {text}".split())[:200]
+
+
+def _env_path(name: str, default: str) -> str:
+    """An env file path, absolute (a relative one is read against the server's
+    working directory, with a warning)."""
+    path = get_env_value(name, default, str).strip()
+    if path and not os.path.isabs(path):
+        absolute = os.path.abspath(path)
+        logger.warning(f"ENTITY_NAME_FOLD: {name}={path} is relative; using {absolute}")
+        path = absolute
+    return path
+
+
+async def _query_with_retries(graph, sql: str):
+    attempts = len(_QUERY_RETRY_DELAYS) + 1
+    for attempt in range(1, attempts + 1):
+        try:
+            return await graph._query(sql)
+        except Exception as e:
+            if attempt == attempts:
+                raise
+            delay = _QUERY_RETRY_DELAYS[attempt - 1]
+            logger.warning(
+                f"ENTITY_NAME_FOLD graph query failed (attempt {attempt}/{attempts}: "
+                f"{_why(e)}); retrying in {delay:g}s"
+            )
+            await asyncio.sleep(delay)
+
+
 async def build_fold_map(graph) -> int | None:
     """Load the exception lists (env ``ENTITY_NAME_FOLD_LISTS``) and the alias
     table (env ``ENTITY_NAME_ALIASES``), read every node's name, type and degree
     from a Postgres/AGE graph storage and arm the map. Returns the key count, or
-    None when the storage is not supported (folding then stays off)."""
+    None when the storage is not supported (folding then stays off).
+
+    A missing or malformed lists file arms the map with the DEFAULT lists (an
+    ERROR; the armed line names the fallback), an unreadable alias file arms it
+    with no aliases (an ERROR); neither keeps the map off. The graph query is
+    retried three times with backoff before the build fails. The map itself is
+    computed in a worker thread, so the event loop keeps serving. The outcome is
+    kept in ``fold_state``."""
+    global _STATE
+    _STATE = {"state": "pending"}
     graph_name = getattr(graph, "graph_name", None)
     if graph_name is None or not hasattr(graph, "_query"):
         logger.warning(
             "ENTITY_NAME_FOLD ignored: it needs the Postgres (AGE) graph storage"
         )
+        _STATE["state"] = "failed:it needs the Postgres (AGE) graph storage"
         return None
     started = time.monotonic()
-    lists_path = get_env_value(
-        "ENTITY_NAME_FOLD_LISTS", DEFAULT_ENTITY_NAME_FOLD_LISTS, str
-    ).strip()
-    aliases_path = get_env_value(
-        "ENTITY_NAME_ALIASES", DEFAULT_ENTITY_NAME_ALIASES, str
-    ).strip()
-    lists = load_fold_lists(lists_path or None)
-    n_aliases = load_aliases(aliases_path or None)
+    lists_path = _env_path("ENTITY_NAME_FOLD_LISTS", DEFAULT_ENTITY_NAME_FOLD_LISTS)
+    aliases_path = _env_path("ENTITY_NAME_ALIASES", DEFAULT_ENTITY_NAME_ALIASES)
+    try:
+        source = load_fold_lists(lists_path or None)["source"]
+    except Exception as e:
+        why = _why(e)
+        logger.error(
+            f"ENTITY_NAME_FOLD lists file {lists_path} unusable ({why}); folding "
+            "with the DEFAULT lists, so new names may get keys the graph's own "
+            "lists would not give them"
+        )
+        load_fold_lists(None)
+        source = f"defaults (FALLBACK: {why})"
+    try:
+        n_aliases = load_aliases(aliases_path or None)
+    except Exception as e:
+        logger.error(
+            f"ENTITY_NAME_FOLD alias file {aliases_path} unusable ({_why(e)}); "
+            "folding without aliases"
+        )
+        load_aliases(None)
+        n_aliases = 0
+    _STATE.update(lists=source, aliases=n_aliases)
     sql = f"""SELECT (b.properties::text)::jsonb->>'entity_id' AS name,
                      coalesce((b.properties::text)::jsonb->>'entity_type', '') AS type,
                      coalesce(d.n, 0) AS degree
@@ -798,26 +989,58 @@ async def build_fold_map(graph) -> int | None:
                            SELECT start_id AS id FROM "{graph_name}"."DIRECTED"
                            UNION ALL SELECT end_id FROM "{graph_name}"."DIRECTED") x
                          GROUP BY id) d ON d.id = b.id"""
-    rows = await graph._query(sql)
-    keys = load_fold_map(
-        (r.get("name"), r.get("type"), r.get("degree")) for r in rows or []
-    )
+    try:
+        rows = await _query_with_retries(graph, sql) or []
+        new, legacy = await asyncio.to_thread(
+            lambda: _compute_fold_map(
+                (r.get("name"), r.get("type"), r.get("degree")) for r in rows
+            )
+        )
+    except Exception as e:
+        _STATE["state"] = f"failed:{_why(e)}"
+        raise
+    keys = _install_map(new, legacy)
     logger.info(
         f"ENTITY_NAME_FOLD armed: {keys} name keys, {n_aliases} aliases, "
-        f"lists {lists['source']}, from {len(rows or [])} nodes "
+        f"lists {source}, from {len(rows)} nodes "
         f"in {time.monotonic() - started:.1f}s"
     )
     return keys
+
+
+def _register_best(maybe_nodes: dict, maybe_edges: dict) -> None:
+    """For each key new to the map that several of a chunk's names share,
+    register the best-ranked of them (``canonical_rank``), not the first seen."""
+    types: dict = {}
+    for name, records in maybe_nodes.items():
+        types[name] = next(
+            (r.get("entity_type") for r in records if r.get("entity_type")), None
+        )
+    for src, tgt in maybe_edges:
+        types.setdefault(src, None)
+        types.setdefault(tgt, None)
+    by_key: dict[str, list] = defaultdict(list)
+    for name in types:
+        key = fold_key(name)
+        if key is not None and key not in _ALIASES and key not in _MAP:
+            by_key[key].append(name)
+    for names in by_key.values():
+        if len(names) > 1:
+            canonical_name(
+                min(names, key=lambda n: canonical_rank(n, types[n], 0, names))
+            )
 
 
 def fold_chunk_result(maybe_nodes: dict, maybe_edges: dict) -> tuple[dict, dict]:
     """Rename one chunk's entities and relation endpoints to canonical spellings.
 
     Records of names that fold together are merged under one name; a relation
-    whose endpoints fold together is dropped (it would be a self-loop).
+    whose endpoints fold together is dropped (it would be a self-loop). A key new
+    to the map takes the chunk's best-ranked spelling of it.
     """
     if not _ARMED:
         return maybe_nodes, maybe_edges
+    _register_best(maybe_nodes, maybe_edges)
     nodes: dict = defaultdict(list)
     for name, records in maybe_nodes.items():
         canon = canonical_name(name)
@@ -837,7 +1060,8 @@ def fold_chunk_result(maybe_nodes: dict, maybe_edges: dict) -> tuple[dict, dict]
 
 def alias_chunk_result(maybe_nodes: dict, maybe_edges: dict) -> tuple[dict, dict]:
     """For the knowledge rebuild: keep every record under its original name and
-    add a copy under the canonical name.
+    add a copy under the canonical name, and one under the legacy key's canonical
+    when that is a third spelling.
 
     Nodes merged before the fold keep their old spelling until their documents
     are rebuilt, while new merges write the canonical one; a rebuild looks
@@ -852,6 +1076,9 @@ def alias_chunk_result(maybe_nodes: dict, maybe_edges: dict) -> tuple[dict, dict
         canon = canonical_name(name, register=False)
         if canon != name:
             nodes[canon].extend({**r, "entity_name": canon} for r in records)
+        legacy = _legacy_canonical(name)
+        if legacy is not None and legacy not in (name, canon):
+            nodes[legacy].extend({**r, "entity_name": legacy} for r in records)
     edges: dict = defaultdict(list)
     for (src, tgt), records in maybe_edges.items():
         edges[(src, tgt)].extend(records)
@@ -860,5 +1087,11 @@ def alias_chunk_result(maybe_nodes: dict, maybe_edges: dict) -> tuple[dict, dict
         if (csrc, ctgt) != (src, tgt) and csrc != ctgt:
             edges[(csrc, ctgt)].extend(
                 {**r, "src_id": csrc, "tgt_id": ctgt} for r in records
+            )
+        lsrc = _legacy_canonical(src) or csrc
+        ltgt = _legacy_canonical(tgt) or ctgt
+        if (lsrc, ltgt) not in ((src, tgt), (csrc, ctgt)) and lsrc != ltgt:
+            edges[(lsrc, ltgt)].extend(
+                {**r, "src_id": lsrc, "tgt_id": ltgt} for r in records
             )
     return dict(nodes), dict(edges)

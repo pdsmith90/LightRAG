@@ -2262,12 +2262,14 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             logger.debug("All storage types initialized")
 
             # Fork (ENTITY_NAME_FOLD): read the graph's spellings in the
-            # background; folding arms when the map is complete, names pass
-            # unchanged until then.
+            # background; folding arms when the map is complete, and extraction
+            # and the deletion rebuild wait for it (_await_fold_map).
             from lightrag import entity_name_fold
 
             entity_name_fold.disarm()
             if self.entity_name_fold:
+                self._fold_map_deadline = time.monotonic() + entity_name_fold.ARM_WAIT_S
+                self._fold_map_wait_logged = False
                 self._fold_map_task = asyncio.create_task(
                     self._build_entity_name_fold_map()
                 )
@@ -2279,6 +2281,33 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             await entity_name_fold.build_fold_map(self.chunk_entity_relation_graph)
         except Exception as e:  # folding stays off; extraction is unaffected
             logger.error(f"ENTITY_NAME_FOLD map build failed, folding stays off: {e}")
+
+    async def _await_fold_map(self) -> None:
+        """Fork (ENTITY_NAME_FOLD): wait for the startup map build, so names are
+        not left unfolded, and a rebuild does not miss the records cached under
+        a variant's spelling, while the map is still being read. Bounded: until
+        ARM_WAIT_S after the build started; then an ERROR (once) and the caller
+        goes on unfolded."""
+        task = getattr(self, "_fold_map_task", None)
+        if task is None or task.done():
+            return
+        remaining = getattr(self, "_fold_map_deadline", 0.0) - time.monotonic()
+        if remaining > 0:
+            try:
+                await asyncio.wait_for(asyncio.shield(task), remaining)
+                return
+            except asyncio.TimeoutError:
+                pass
+            except asyncio.CancelledError:
+                if not task.cancelled():
+                    raise
+                return
+        if not getattr(self, "_fold_map_wait_logged", False):
+            self._fold_map_wait_logged = True
+            logger.error(
+                "ENTITY_NAME_FOLD map still not armed after the startup wait; "
+                "extraction and rebuilds go on unfolded until it arms"
+            )
 
     def _get_parse_native_executor(self) -> ThreadPoolExecutor:
         """Lazily build the per-instance native-parser thread pool.
@@ -4011,6 +4040,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         truncation_tally: TokenLimitTruncationTally | None = None,
     ) -> list:
         try:
+            await self._await_fold_map()
             chunk_results = await extract_entities(
                 chunk,
                 global_config=self._build_global_config(),
@@ -6933,6 +6963,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
 
         # ---- 6. Rebuild entities/relations that still have remaining sources ----
         if entities_to_rebuild or relationships_to_rebuild:
+            await self._await_fold_map()
             try:
                 rebuild_report = await rebuild_knowledge_from_chunks(
                     entities_to_rebuild=entities_to_rebuild,
@@ -7064,6 +7095,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                 if row and len(row.get("chunk_ids") or ()) > cap
             )
             if entities or relations:
+                await self._await_fold_map()
                 await rebuild_knowledge_from_chunks(
                     entities_to_rebuild=entities,
                     relationships_to_rebuild=relations,

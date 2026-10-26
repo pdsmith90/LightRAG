@@ -205,9 +205,12 @@ spelling the graph already uses for the same fold key, or becomes that spelling 
 the key is new (`lightrag/entity_name_fold.py`). The extraction LLM spells one entity
 several ways across papers, and the merge keys on the exact string, so without it a
 concept's relations scatter over several nodes. The map is read from the Postgres/AGE
-graph in the background after the storages initialise; names pass unchanged until
-`ENTITY_NAME_FOLD armed: N name keys, A aliases, lists <source>` is logged, and with
-other graph storages. Off by default.
+graph in the background after the storages initialise (computed in a worker thread, so
+the server keeps answering) until `ENTITY_NAME_FOLD armed: N name keys, A aliases, lists
+<source>, from M nodes in Xs` is logged. Extraction and the deletion and kept-summary
+rebuilds wait for it, for at most 300 s after startup; past that an error is logged and
+they go on unfolded until the map arms. With other graph storages names pass unchanged.
+Off by default.
 
 The key folds case, spacing and punctuation (NFKC, casefold, letters and digits of every
 script) and the plural of the last word: regular `-s`/`-es`/`-ies` plurals, acronym
@@ -231,12 +234,28 @@ irregulars of its field), merged into the built-in lists; the schema is in the m
 docstring. `ENTITY_NAME_ALIASES` names a CSV of `variant,canonical` rows, keyed by the
 variant's fold key and consulted before the map, for spellings joined by rules the key
 does not know, such as a bulk merge's; rows whose two names share a key are skipped.
-Both are read when the map is built. A missing or malformed file leaves folding off
-with an error in the log.
+An alias whose canonical's own key is aliased follows that chain to its end, and rows
+on a loop are dropped with a warning; an alias returns the spelling the map uses for its
+canonical's key. Both files are read when the map is built, relative paths against the
+server's working directory. A missing or malformed lists file arms the map with the
+built-in lists (an error, and the armed line reads `lists defaults (FALLBACK: <why>)`,
+so a deploy check that expects the file's path fails); an unreadable alias file arms it
+without aliases (an error); alias rows with fewer than two fields or an empty field are
+skipped and counted. The startup graph query is retried three times. `/health` shows
+both paths (absolute) and `entity_name_fold_state`: `pending`, `armed` or
+`failed:<why>`, with the lists source, alias and key counts.
+
+Legacy fallback: names the key before the plural and symbol rules (`legacy_fold_key`)
+joined may get different keys now (an all-capitals plural next to its Titlecase form).
+The map also keeps, for every non-symbolic name, its legacy key's canonical (that of the
+best-ranked member), used when a name's own key is in neither the aliases nor the map;
+the key is then registered to that canonical. A key new to the map takes the
+best-ranked of the chunk's spellings of it, not the first one seen.
 
 Applied where results leave `extract_entities`, so the write-ahead anchors and the merge
 name the same nodes, and as an alias in the knowledge rebuild, which files each cached
-record under its original and its canonical name. Changing the key rules or the lists
+record under its original and its canonical name (and its legacy key's canonical when
+that is a third name). Changing the key rules or the lists
 changes keys: existing variant nodes are not merged by the switch itself.
 
 ### Sidecar relations

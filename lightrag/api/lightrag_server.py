@@ -90,7 +90,7 @@ from lightrag.kg.shared_storage import (
     finalize_share_data,
     get_pipeline_ingress,
 )
-from lightrag import pipeline_metrics
+from lightrag import entity_name_fold, pipeline_metrics
 from lightrag.utils_pipeline import describe_doc_status_capabilities
 from fastapi.security import OAuth2PasswordRequestForm
 from lightrag.api.auth import auth_handler
@@ -3067,6 +3067,9 @@ def create_app(args):
                         "drop_symbol_entities": args.drop_symbol_entities,
                         "drop_junk_entities": args.drop_junk_entities,
                         "entity_name_fold": args.entity_name_fold,
+                        "entity_name_fold_lists": args.entity_name_fold_lists,
+                        "entity_name_aliases": args.entity_name_aliases,
+                        "entity_name_fold_state": entity_name_fold.fold_state(),
                         "max_async": args.max_async,
                         "llm_timeout": args.llm_timeout,
                         "embedding_func_max_async": args.embedding_func_max_async,

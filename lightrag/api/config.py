@@ -44,6 +44,8 @@ from lightrag.constants import (
     DEFAULT_DROP_SYMBOL_ENTITIES,
     DEFAULT_DROP_JUNK_ENTITIES,
     DEFAULT_ENTITY_NAME_FOLD,
+    DEFAULT_ENTITY_NAME_FOLD_LISTS,
+    DEFAULT_ENTITY_NAME_ALIASES,
     DEFAULT_MIN_RERANK_SCORE,
     DEFAULT_FORCE_LLM_SUMMARY_ON_MERGE,
     DEFAULT_MAX_ASYNC,
@@ -993,6 +995,17 @@ def parse_args() -> argparse.Namespace:
     args.entity_name_fold = get_env_value(
         "ENTITY_NAME_FOLD", DEFAULT_ENTITY_NAME_FOLD, bool
     )
+    # Fork: the fold's lists and alias files, absolute as the map build reads them.
+    for attr, env, default in (
+        (
+            "entity_name_fold_lists",
+            "ENTITY_NAME_FOLD_LISTS",
+            DEFAULT_ENTITY_NAME_FOLD_LISTS,
+        ),
+        ("entity_name_aliases", "ENTITY_NAME_ALIASES", DEFAULT_ENTITY_NAME_ALIASES),
+    ):
+        path = get_env_value(env, default, str).strip()
+        setattr(args, attr, os.path.abspath(path) if path else "")
 
     # Add missing environment variables for health endpoint
     args.force_llm_summary_on_merge = get_env_value(

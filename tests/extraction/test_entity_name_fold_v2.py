@@ -527,10 +527,3 @@ async def test_build_fold_map_without_env_uses_the_defaults(caplog, monkeypatch)
         assert await fold_mod.build_fold_map(_Graph(NODES)) == 3
     assert "3 name keys, 0 aliases, lists defaults" in caplog.text
     assert canonical_name("zak toolkit") == "zak toolkit"
-
-
-async def test_build_fold_map_fails_on_a_missing_lists_file(tmp_path, monkeypatch):
-    monkeypatch.setenv("ENTITY_NAME_FOLD_LISTS", str(tmp_path / "missing.json"))
-    with pytest.raises(FileNotFoundError):
-        await fold_mod.build_fold_map(_Graph(NODES))
-    assert not fold_mod.is_armed()
