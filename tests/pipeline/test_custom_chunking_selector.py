@@ -742,6 +742,67 @@ def test_c_combines_with_multimodal_flags_without_enabling_backfill(
 
 
 @pytest.mark.offline
+def test_degraded_multimodal_count_reaches_the_document_metadata(tmp_path, monkeypatch):
+    """Fork: the analyze stage hands the number of degraded items over as
+    parsed_data["mm_degraded"]; the process stage stamps it beside
+    mm_chunks, and a document without degraded items carries no key."""
+    import lightrag.pipeline as pipeline_mod
+    import lightrag.sidecar as sidecar_mod
+
+    def _custom(tokenizer, content, split_by, split_only, overlap, size):
+        return [{"tokens": len(content), "content": content, "chunk_order_index": 0}]
+
+    def _mm_builder(self, **kwargs):
+        return [
+            {"tokens": 1, "content": "modality", "chunk_order_index": 1},
+        ]
+
+    original = pipeline_mod._PipelineMixin.process_single_document
+
+    async def _patched(self, *, doc_id, status_doc, parsed_data, ctx):
+        parsed_data["blocks_path"] = str(tmp_path / "multimodal.blocks.jsonl")
+        if doc_id == "doc-degraded":
+            parsed_data["mm_degraded"] = 2
+        return await original(
+            self,
+            doc_id=doc_id,
+            status_doc=status_doc,
+            parsed_data=parsed_data,
+            ctx=ctx,
+        )
+
+    monkeypatch.setattr(
+        pipeline_mod._PipelineMixin, "_build_mm_chunks_from_sidecars", _mm_builder
+    )
+    monkeypatch.setattr(
+        sidecar_mod, "backfill_chunk_sidecars", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        pipeline_mod._PipelineMixin, "process_single_document", _patched
+    )
+
+    async def _run():
+        rag = _new_rag(tmp_path, chunking_func=_custom)
+        await rag.initialize_storages()
+        try:
+            degraded = await _ingest(
+                rag, doc_id="doc-degraded", process_options="Cite!"
+            )
+            clean = await _ingest(
+                rag, doc_id="doc-clean", process_options="Cite!", body="Other body."
+            )
+        finally:
+            await rag.finalize_storages()
+
+        assert DocStatus(degraded["status"]) is DocStatus.PROCESSED
+        assert _metadata(degraded)["mm_degraded"] == 2
+        assert DocStatus(clean["status"]) is DocStatus.PROCESSED
+        assert "mm_degraded" not in _metadata(clean)
+
+    asyncio.run(_run())
+
+
+@pytest.mark.offline
 def test_reprocess_persisted_c_after_callback_removal_uses_observable_fallback(
     tmp_path,
 ):

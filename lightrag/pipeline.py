@@ -5622,6 +5622,8 @@ class _PipelineMixin:
                     if mm_chunks:
                         chunking_result = list(chunking_result) + mm_chunks
                         extraction_meta["mm_chunks"] = len(mm_chunks)
+                        if parsed_data.get("mm_degraded"):
+                            extraction_meta["mm_degraded"] = parsed_data["mm_degraded"]
 
                 # Final hard guard before embedding: split any oversize
                 # chunk while preserving heading hierarchy metadata.
@@ -6922,6 +6924,13 @@ class _PipelineMixin:
         configuration or prompt limits and retry without manually clearing
         prior failure markers from the sidecar.
 
+        Fork: an item whose response is still invalid after its one retry is
+        degraded rather than failing the document -- a ``status="success"``
+        result with ``degraded: True`` that keeps the item's source content
+        under a deterministic name (see ``_degraded_result``); the count goes
+        out as ``parsed_data["mm_degraded"]``. Every other item error still
+        raises :class:`MultimodalAnalysisError`.
+
         Args:
             process_options: Optional override that bypasses the
                 ``full_docs.process_options`` lookup; primarily used by unit
@@ -7107,6 +7116,17 @@ class _PipelineMixin:
             class _MMJSONConformanceError(Exception):
                 """Raised only when an LLM/VLM response violates MM JSON schema."""
 
+            class _MMConformanceExhausted(MultimodalAnalysisError):
+                """The response was still invalid after the one retry.
+
+                Fork: the item callers catch it and degrade that one item
+                (``_degraded_result``). Subclassing MultimodalAnalysisError
+                keeps an uncaught one failing the document as before.
+                """
+
+            # Prefixes ("drawings/<id>", "equation/<id>") degraded this run.
+            mm_degraded_items: list[str] = []
+
             def _required_json_string(
                 parsed: dict[str, Any], prefix: str, field: str
             ) -> str:
@@ -7214,7 +7234,22 @@ class _PipelineMixin:
                     # and drop the TruncatedResponse marker the cache guards
                     # below need to observe.
                     text = raw if isinstance(raw, str) else str(raw)
-                    return validate_result(_json_extract(text)), text, fresh
+                    parsed = _json_extract(text)
+                    try:
+                        if not parsed:
+                            # Nothing recovered: naming a missing field
+                            # (the first one checked) would misstate it.
+                            raise _MMJSONConformanceError(f"{prefix}: unparseable JSON")
+                        return validate_result(parsed), text, fresh
+                    except _MMJSONConformanceError as exc:
+                        cut = (
+                            "finish_reason=length, "
+                            if is_truncated_response(text)
+                            else ""
+                        )
+                        raise _MMJSONConformanceError(
+                            f"{exc} ({cut}{len(text)} chars)"
+                        ) from None
 
                 use_cached_response = cached is not None
                 first_text = (
@@ -7233,7 +7268,31 @@ class _PipelineMixin:
                 try:
                     return _attempt(await call_model_once(), fresh=True)
                 except _MMJSONConformanceError as exc:
-                    raise MultimodalAnalysisError(str(exc)) from exc
+                    raise _MMConformanceExhausted(str(exc)) from exc
+
+            def _degraded_result(
+                prefix: str, exc: Exception, fields: dict[str, str]
+            ) -> dict[str, Any]:
+                """Result for an item still invalid after its retry.
+
+                Fork: one such item used to fail the whole document, and a
+                deterministic model fails it again on every reprocess. The
+                item keeps its source content under a deterministic name
+                instead, and is never cached, so a later run asks again.
+                """
+                logger.warning(
+                    f"[analyze_multimodal] {prefix}: analysis still invalid "
+                    f"after retry; degraded to its source content "
+                    f"({file_path}): {exc}"
+                )
+                mm_degraded_items.append(prefix)
+                return {
+                    **fields,
+                    "analyze_time": int(time.time()),
+                    "status": "success",
+                    "degraded": True,
+                    "message": f"degraded: {exc}",
+                }
 
             def _normalize_text(value: Any) -> str:
                 if value is None:
@@ -7417,12 +7476,35 @@ class _PipelineMixin:
                             f"drawings/{item_id}: VLM call failed: {exc}"
                         ) from exc
 
-                analysis_fields, result_text, fresh = await _run_json_conformance_retry(
-                    f"drawings/{item_id}",
-                    cached,
-                    _call_vlm_once,
-                    lambda parsed: _validate_drawing_analysis(item_id, parsed),
-                )
+                try:
+                    (
+                        analysis_fields,
+                        result_text,
+                        fresh,
+                    ) = await _run_json_conformance_retry(
+                        f"drawings/{item_id}",
+                        cached,
+                        _call_vlm_once,
+                        lambda parsed: _validate_drawing_analysis(item_id, parsed),
+                    )
+                except _MMConformanceExhausted as exc:
+                    caption = _captions_value(item)
+                    return (
+                        _degraded_result(
+                            f"drawings/{item_id}",
+                            exc,
+                            {
+                                "name": f"drawing {item_id}",
+                                "type": IMAGE_TYPE_FALLBACK,
+                                "description": (
+                                    caption
+                                    if caption != "n/a"
+                                    else "(image not analyzed)"
+                                ),
+                            },
+                        ),
+                        None,
+                    )
                 cache_id_to_attach: str | None = None
                 # A token-limit-truncated VLM response that still parsed is
                 # recorded for the document's metadata and must not be
@@ -7696,17 +7778,40 @@ class _PipelineMixin:
                             f"{kind}/{item_id}: EXTRACT call failed: {exc}"
                         ) from exc
 
-                analysis_fields, result_text, fresh = await _run_json_conformance_retry(
-                    f"{kind}/{item_id}",
-                    cached,
-                    _call_extract_once,
-                    lambda parsed: _validate_text_analysis(
-                        kind,
-                        item_id,
-                        parsed,
-                        equation_fallback=content_text if kind == "equation" else None,
-                    ),
-                )
+                try:
+                    (
+                        analysis_fields,
+                        result_text,
+                        fresh,
+                    ) = await _run_json_conformance_retry(
+                        f"{kind}/{item_id}",
+                        cached,
+                        _call_extract_once,
+                        lambda parsed: _validate_text_analysis(
+                            kind,
+                            item_id,
+                            parsed,
+                            equation_fallback=(
+                                content_text if kind == "equation" else None
+                            ),
+                        ),
+                    )
+                except _MMConformanceExhausted as exc:
+                    # The source table is the description; an equation's
+                    # LaTeX goes in its own field, ahead of the name.
+                    fields = {
+                        "name": f"{kind} {item_id}",
+                        "description": content_text,
+                    }
+                    if kind == "equation":
+                        fields["equation"] = content_text
+                        fields["description"] = (
+                            "(equation not analyzed; source LaTeX only)"
+                        )
+                    return (
+                        _degraded_result(f"{kind}/{item_id}", exc, fields),
+                        None,
+                    )
                 result_obj: dict[str, Any] = {
                     "name": analysis_fields["name"],
                     "description": analysis_fields["description"],
@@ -7780,7 +7885,8 @@ class _PipelineMixin:
                     and result_obj.get("status") == "success"
                 )
                 if is_success:
-                    log_message = f"Analyzing  {kind}/{item_id}: ok"
+                    outcome = "degraded" if result_obj.get("degraded") else "ok"
+                    log_message = f"Analyzing  {kind}/{item_id}: {outcome}"
                     logger.info(log_message)
                     if pipeline_status is not None and pipeline_status_lock is not None:
                         async with pipeline_status_lock:
@@ -7988,6 +8094,19 @@ class _PipelineMixin:
                     async with pipeline_status_lock:
                         pipeline_status["latest_message"] = truncation_message
                         append_pipeline_history(pipeline_status, truncation_message)
+            if mm_degraded_items:
+                # Process stage stamps it as metadata.mm_degraded.
+                parsed_data["mm_degraded"] = len(mm_degraded_items)
+                degraded_message = (
+                    f"Warning: {len(mm_degraded_items)} multimodal analyses for "
+                    f"{file_path} stayed invalid after their retry and were "
+                    f"degraded to their source content"
+                )
+                logger.warning(degraded_message)
+                if pipeline_status is not None and pipeline_status_lock is not None:
+                    async with pipeline_status_lock:
+                        pipeline_status["latest_message"] = degraded_message
+                        append_pipeline_history(pipeline_status, degraded_message)
             parsed_data["multimodal_processed"] = True
             logger.info(f"[analyze_multimodal] completed for d-id: {doc_id}")
         except PipelineCancelledException:

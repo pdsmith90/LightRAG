@@ -22,6 +22,7 @@ starting with [README.md](./README.md), applies as written.
 | [Lexical retrieval leg](#lexical-retrieval-leg) | `LEXICAL_CHUNK_TOP_K` | `0` (off) |
 | [PostgreSQL edge removal in plain SQL](#postgresql-edge-removal-in-plain-sql) | none | always active |
 | [Resume purge keeps a failed document retryable](#resume-purge-keeps-a-failed-document-retryable) | none | always active |
+| [One unusable multimodal analysis degrades its item](#one-unusable-multimodal-analysis-degrades-its-item) | none | always active |
 | [Named-work pin and notice](#named-work-pin-and-notice) | `NAMED_WORK_PIN`, `NAMED_WORK_NOTICE` | `false`, `false` |
 | [Paper filter in the graph view](#paper-filter-in-the-graph-view) | none; reference lists via `ZOTERO_REFERENCES` | always active |
 | WebUI query defaults for new browser profiles: `top_k` 10, `chunk_top_k` 12, entity/relation tokens 1500, total tokens 7000 (`lightrag_webui/src/stores/querySettings.ts`) | none | always active |
@@ -338,6 +339,22 @@ chunk-embed timeout, left no anchors, no journal and no proof. And when the resu
 purge itself raises, the stored `kg_purge` journal is copied back into the in-memory
 status before the FAILED write, which upstream let erase it. See
 [docs/design/PurgeRecoveryContract.md](./docs/design/PurgeRecoveryContract.md).
+
+### One unusable multimodal analysis degrades its item
+
+Upstream fails the whole document when one drawing, table or equation analysis is
+still invalid JSON after its one retry, so a single bad formula sinks a book of
+hundreds, and a model run with a fixed seed fails it again on every retry. On
+this branch that item is degraded instead: its `llm_analyze_result` is a success
+with `degraded: true`, a deterministic name (`equation <item id>`), and its source
+content (the LaTeX, the table body, or the image caption), so it still becomes an
+ordinary multimodal chunk and entity. A degraded result is never cached, so the next
+run of the document asks the model again. Each degraded item is logged as a WARNING,
+and the document's `metadata.mm_degraded` counts them. Any other analysis error (a
+model call that fails, a configuration limit, cancellation) still fails the document.
+The error message says `unparseable JSON` when nothing could be parsed, rather than
+naming the first required field, and every such message ends with the response
+length and `finish_reason=length` when the output budget cut the response off.
 
 ### Tests
 

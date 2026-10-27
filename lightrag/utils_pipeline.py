@@ -646,6 +646,7 @@ _DOC_STATUS_METADATA_ATTEMPT_KEYS: frozenset[str] = frozenset(
         "chunk_method",
         "skip_kg",
         "mm_chunks",
+        "mm_degraded",
         "hard_fallback_split",
         "error_type",
         "error_stage",

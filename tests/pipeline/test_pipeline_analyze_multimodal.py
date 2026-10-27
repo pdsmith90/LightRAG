@@ -16,8 +16,10 @@ Covers the contract introduced by the LR2 multimodal rewrite:
 5. Images smaller than ``VLM_MIN_IMAGE_PIXEL`` (32 px) and unsupported
    formats are pre-emptively flagged ``status="skipped"`` without an LLM
    call.
-6. Invalid model JSON is a hard failure — the sidecar carries
-   ``status="failure"`` and :class:`MultimodalAnalysisError` propagates.
+6. Invalid model JSON is retried once; still invalid, that one item is
+   degraded to its source content (fork) instead of failing the document.
+   Other errors (call failures, configuration) carry ``status="failure"``
+   and :class:`MultimodalAnalysisError` propagates.
 """
 
 from __future__ import annotations
@@ -595,10 +597,10 @@ async def test_malformed_cached_analysis_bypassed_and_overwritten(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_invalid_vlm_response_hard_fails(tmp_path):
-    """Invalid model JSON propagates MultimodalAnalysisError and lands a
-    status=failure marker after one retry so re-runs don't silently
-    consume the failure."""
+async def test_invalid_vlm_response_degrades_the_item(tmp_path):
+    """Model JSON still invalid after one retry degrades that one item
+    (fork): it keeps its caption under a deterministic name, is never
+    cached, and the document carries on."""
     call_log: list[dict] = []
 
     async def vlm_func(prompt, **kwargs):
@@ -609,14 +611,14 @@ async def test_invalid_vlm_response_hard_fails(tmp_path):
     await rag.initialize_storages()
     try:
         doc_id, parsed_data, sidecar_path = _write_sidecar_fixtures(tmp_path)
-        with pytest.raises(MultimodalAnalysisError):
-            await rag.analyze_multimodal(
-                doc_id=doc_id,
-                file_path="fixture.pdf",
-                parsed_data=parsed_data,
-                process_options="i",
-            )
+        await rag.analyze_multimodal(
+            doc_id=doc_id,
+            file_path="fixture.pdf",
+            parsed_data=parsed_data,
+            process_options="i",
+        )
         assert len(call_log) == 2
+        assert parsed_data["mm_degraded"] == 1
         await rag.llm_response_cache.index_done_callback()
         cache_file = (
             Path(rag.working_dir) / rag.workspace / "kv_store_llm_response_cache.json"
@@ -630,8 +632,12 @@ async def test_invalid_vlm_response_hard_fails(tmp_path):
                 f"invalid VLM response was cached: {analysis_keys}"
             )
         payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
-        item = payload["drawings"]["im-001"]
-        assert item["llm_analyze_result"]["status"] == "failure"
+        result = payload["drawings"]["im-001"]["llm_analyze_result"]
+        assert result["status"] == "success" and result["degraded"] is True
+        assert result["name"] == "drawing im-001"
+        assert result["type"] == "Other"
+        assert result["description"] == "Figure 1"
+        assert "unparseable JSON" in result["message"]
     finally:
         await rag.finalize_storages()
 
@@ -2070,5 +2076,223 @@ async def test_analyze_worker_stamps_truncation_on_the_failed_row(tmp_path, rais
             "record handed over by analyze_multimodal"
         )
         assert ctx.q_process.empty()
+    finally:
+        await rag.finalize_storages()
+
+
+# --- per-item degrade: one unusable analysis must not fail a whole document ---
+
+_GOOD_LATEX = r"E[X] = \int x \, dP"
+_BAD_LATEX = r"Q^{\mathcal{G}}\Omega = 1 \text{ a.e.}"
+# What a runaway generation looks like when the output budget cuts it off:
+# the object opens, names itself, and never closes.
+_CUT_OFF_RESPONSE = (
+    '{\n  "name": "quux_measure_identity",\n'
+    '  "equation": "Q^{\\\\mathcal{G}}\\\\Omega = 1'
+)
+
+
+def _write_two_equation_fixture(tmp_path: Path) -> tuple[str, dict, Path]:
+    doc_id, parsed_data, equations_path = _write_equation_fixture(tmp_path, _GOOD_LATEX)
+    payload = json.loads(equations_path.read_text(encoding="utf-8"))
+    bad = dict(payload["equations"]["eq-001"], id="eq-002", content=_BAD_LATEX)
+    payload["equations"]["eq-002"] = bad
+    equations_path.write_text(json.dumps(payload), encoding="utf-8")
+    return doc_id, parsed_data, equations_path
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("bad_response", "expected_cause"),
+    [
+        # The tolerant parser closes a cut-off object, so the cause is the
+        # field it lacks; the suffix says the output budget cut it off.
+        ("cut-off", "missing or invalid field 'description' (finish_reason=length,"),
+        ("cut-off-prose", "unparseable JSON (finish_reason=length,"),
+        ("prose", "unparseable JSON ("),
+        ("no-name", "missing or invalid field 'name' ("),
+    ],
+)
+async def test_equation_still_invalid_after_retry_degrades_the_item_not_the_doc(
+    tmp_path, caplog, _propagate_lightrag_logger, bad_response, expected_cause
+):
+    """One equation whose analysis is still unusable after its retry keeps
+    its source LaTeX under a deterministic name and the document carries on;
+    a cut-off response is reported as unparseable JSON, not as a missing
+    field, and the degraded result is never cached."""
+    from lightrag.utils import TruncatedResponse
+
+    bad_calls = {"n": 0}
+
+    async def extract_func(prompt, **kwargs):
+        if r"\mathcal{G}" in prompt:
+            bad_calls["n"] += 1
+            if bad_response == "cut-off":
+                return TruncatedResponse(_CUT_OFF_RESPONSE)
+            if bad_response == "cut-off-prose":
+                return TruncatedResponse("Let me work through this equation")
+            if bad_response == "prose":
+                return "I cannot analyze this equation."
+            return json.dumps({"description": "no name given"})
+        return json.dumps(
+            {
+                "name": "expectation",
+                "equation": _GOOD_LATEX,
+                "description": "Defines the expectation.",
+            }
+        )
+
+    rag = _build_rag(
+        tmp_path,
+        vlm_process_enable=True,
+        vlm_func=_make_vlm_mock([]),
+        extract_func=extract_func,
+    )
+    await rag.initialize_storages()
+    try:
+        doc_id, parsed_data, equations_path = _write_two_equation_fixture(tmp_path)
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="lightrag"):
+            await rag.analyze_multimodal(
+                doc_id=doc_id,
+                file_path="fixture.pdf",
+                parsed_data=parsed_data,
+                process_options="e",
+            )
+
+        assert bad_calls["n"] == 2  # first attempt + the one retry
+        assert parsed_data["multimodal_processed"] is True
+        assert parsed_data["mm_degraded"] == 1
+
+        items = json.loads(equations_path.read_text(encoding="utf-8"))["equations"]
+        good = items["eq-001"]["llm_analyze_result"]
+        assert good["status"] == "success" and not good.get("degraded")
+        bad = items["eq-002"]["llm_analyze_result"]
+        assert bad["status"] == "success"
+        assert bad["degraded"] is True
+        assert bad["name"] == "equation eq-002"
+        assert bad["equation"] == _BAD_LATEX
+        assert bad["description"]
+        assert expected_cause in bad["message"]
+        # Never cached: a later run asks the model again.
+        assert "llm_cache_list" not in items["eq-002"]
+
+        messages = [r.getMessage() for r in caplog.records]
+        retry_lines = [m for m in messages if "eq-002" in m and "retrying once" in m]
+        assert retry_lines and expected_cause in retry_lines[0]
+        if "prose" in bad_response:
+            assert "missing or invalid field" not in retry_lines[0]
+        if bad_response == "prose":
+            assert "finish_reason" not in retry_lines[0]
+        assert [
+            m
+            for m in messages
+            if "equation/eq-002" in m and "degraded to its source content" in m
+        ]
+
+        # The degraded item becomes an ordinary equation chunk: its LaTeX,
+        # then the [Equation Name] label operate._parse_mm_display_name reads.
+        chunks = rag._build_mm_chunks_from_sidecars(
+            doc_id=doc_id,
+            file_path="fixture.pdf",
+            blocks_path=parsed_data["blocks_path"],
+            base_order_index=0,
+            process_options="e",
+        )
+        assert [c["sidecar"]["id"] for c in chunks] == ["eq-001", "eq-002"]
+        assert chunks[1]["content"].startswith(_BAD_LATEX + "\n[Equation Name]")
+        assert "[Equation Name]equation eq-002" in chunks[1]["content"]
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_table_still_invalid_after_retry_keeps_its_source_table(tmp_path):
+    table_html = "<table><tr><td>A</td><td>B</td></tr></table>"
+
+    async def extract_func(prompt, **kwargs):
+        return "not-json"
+
+    rag = _build_rag(
+        tmp_path,
+        vlm_process_enable=True,
+        vlm_func=_make_vlm_mock([]),
+        extract_func=extract_func,
+    )
+    await rag.initialize_storages()
+    try:
+        parsed_dir = tmp_path / "parsed"
+        parsed_dir.mkdir()
+        blocks_path = parsed_dir / "doc.blocks.jsonl"
+        blocks_path.write_text(
+            json.dumps({"type": "meta", "doc_id": "doc-1"}) + "\n", encoding="utf-8"
+        )
+        tables_path = parsed_dir / "doc.tables.json"
+        tables_path.write_text(
+            json.dumps(
+                {
+                    "tables": {
+                        "tb-001": {
+                            "caption": "Table 1",
+                            "format": "html",
+                            "content": table_html,
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        parsed_data = {"blocks_path": str(blocks_path)}
+        await rag.analyze_multimodal(
+            doc_id="doc-1",
+            file_path="fixture.pdf",
+            parsed_data=parsed_data,
+            process_options="t",
+        )
+        assert parsed_data["mm_degraded"] == 1
+        result = json.loads(tables_path.read_text(encoding="utf-8"))["tables"][
+            "tb-001"
+        ]["llm_analyze_result"]
+        assert result["status"] == "success" and result["degraded"] is True
+        assert result["name"] == "table tb-001"
+        assert result["description"] == table_html
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_extract_call_error_still_fails_the_document(tmp_path):
+    """Only a response that stays invalid after its retry degrades; an
+    EXTRACT call that errors (endpoint down, timeout) still fails the
+    document, so the hourly retry runs it again rather than keeping a
+    placeholder."""
+
+    async def extract_func(prompt, **kwargs):
+        raise ConnectionError("extract endpoint unreachable")
+
+    rag = _build_rag(
+        tmp_path,
+        vlm_process_enable=True,
+        vlm_func=_make_vlm_mock([]),
+        extract_func=extract_func,
+    )
+    await rag.initialize_storages()
+    try:
+        doc_id, parsed_data, equations_path = _write_equation_fixture(
+            tmp_path, _GOOD_LATEX
+        )
+        with pytest.raises(MultimodalAnalysisError, match="EXTRACT call failed"):
+            await rag.analyze_multimodal(
+                doc_id=doc_id,
+                file_path="fixture.pdf",
+                parsed_data=parsed_data,
+                process_options="e",
+            )
+        assert "mm_degraded" not in parsed_data
+        result = json.loads(equations_path.read_text(encoding="utf-8"))["equations"][
+            "eq-001"
+        ]["llm_analyze_result"]
+        assert result["status"] == "failure"
+        assert "degraded" not in result
     finally:
         await rag.finalize_storages()

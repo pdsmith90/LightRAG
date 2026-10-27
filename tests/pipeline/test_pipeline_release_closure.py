@@ -2740,10 +2740,10 @@ def test_three_phase_status_flow(tmp_path, monkeypatch):
 
 
 @pytest.mark.offline
-def test_analyze_multimodal_invalid_json_hard_fails(tmp_path):
-    """An invalid VLM response is a hard failure under the new contract:
-    the sidecar item gets status='failure' and MultimodalAnalysisError
-    bubbles up so the document fails (no silent conservative fallback)."""
+def test_analyze_multimodal_invalid_json_degrades_the_item(tmp_path):
+    """A VLM response still invalid after its retry degrades that item
+    (fork): the sidecar records a degraded success naming the cause, and
+    the document is not failed."""
 
     async def _run():
         calls = {"n": 0}
@@ -2813,21 +2813,15 @@ def test_analyze_multimodal_invalid_json_hard_fails(tmp_path):
             "blocks_path": str(blocks),
             "content": "body",
         }
-        from lightrag.exceptions import MultimodalAnalysisError
-
-        with pytest.raises(MultimodalAnalysisError):
-            await rag.analyze_multimodal(
-                "doc-1", "demo.pdf", parsed, process_options="i"
-            )
+        await rag.analyze_multimodal("doc-1", "demo.pdf", parsed, process_options="i")
 
         drawings_payload = json.loads(drawings.read_text(encoding="utf-8"))
         result = drawings_payload["drawings"]["id1"]["llm_analyze_result"]
-        # One JSON conformance retry, then the hard failure surfaces.
+        # One JSON conformance retry, then the item degrades.
         assert calls["n"] == 2
-        # Sidecar carries a failure marker so a re-run sees the prior failure
-        # and does not silently consume it.
-        assert result["status"] == "failure"
-        assert "missing or invalid field" in result["message"]
+        assert result["status"] == "success" and result["degraded"] is True
+        assert "unparseable JSON" in result["message"]
+        assert parsed["mm_degraded"] == 1
 
     asyncio.run(_run())
 

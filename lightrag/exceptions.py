@@ -696,6 +696,9 @@ class MultimodalAnalysisError(RuntimeError):
     exception so the pipeline marks the document failed instead of writing
     an unusable analyze result. Callers persist a ``status="failure"``
     sidecar entry alongside the raise so a re-run sees the failure.
+
+    Fork: a response still invalid after its one retry no longer fails the
+    document; ``analyze_multimodal`` degrades that item instead.
     """
 
 
