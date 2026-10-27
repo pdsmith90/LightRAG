@@ -2296,3 +2296,69 @@ async def test_extract_call_error_still_fails_the_document(tmp_path):
         assert "degraded" not in result
     finally:
         await rag.finalize_storages()
+
+
+def _write_n_equation_fixture(
+    tmp_path: Path, n_good: int, n_bad: int
+) -> tuple[str, dict, Path]:
+    doc_id, parsed_data, equations_path = _write_equation_fixture(tmp_path, _GOOD_LATEX)
+    payload = json.loads(equations_path.read_text(encoding="utf-8"))
+    template = payload["equations"].pop("eq-001")
+    for i in range(n_good + n_bad):
+        item_id = f"eq-{i + 1:03d}"
+        latex = (_BAD_LATEX if i >= n_good else _GOOD_LATEX) + f" \\quad ({i})"
+        payload["equations"][item_id] = dict(template, id=item_id, content=latex)
+    equations_path.write_text(json.dumps(payload), encoding="utf-8")
+    return doc_id, parsed_data, equations_path
+
+
+def _prose_for_bad_equations():
+    async def extract_func(prompt, **kwargs):
+        if r"\mathcal{G}" in prompt:
+            return "I cannot analyze this equation."
+        return json.dumps(
+            {
+                "name": "expectation",
+                "equation": _GOOD_LATEX,
+                "description": "Defines the expectation.",
+            }
+        )
+
+    return extract_func
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("n_good", "n_bad", "fails"), [(1, 3, False), (0, 4, True)])
+async def test_degrade_ceiling_fails_the_document_on_a_systemic_failure(
+    tmp_path, n_good, n_bad, fails
+):
+    """Up to max(3, 2 %) degraded items the document carries on; past that the
+    cause is systemic (every item junk), so the document fails as it used to."""
+    rag = _build_rag(
+        tmp_path,
+        vlm_process_enable=True,
+        vlm_func=_make_vlm_mock([]),
+        extract_func=_prose_for_bad_equations(),
+    )
+    await rag.initialize_storages()
+    try:
+        doc_id, parsed_data, _ = _write_n_equation_fixture(tmp_path, n_good, n_bad)
+        run = rag.analyze_multimodal(
+            doc_id=doc_id,
+            file_path="fixture.pdf",
+            parsed_data=parsed_data,
+            process_options="e",
+        )
+        if fails:
+            with pytest.raises(
+                MultimodalAnalysisError,
+                match=r"4 of 4 multimodal analyses still invalid",
+            ):
+                await run
+            assert "mm_degraded" not in parsed_data
+        else:
+            await run
+            assert parsed_data["mm_degraded"] == 3
+            assert parsed_data["multimodal_processed"] is True
+    finally:
+        await rag.finalize_storages()

@@ -7126,6 +7126,9 @@ class _PipelineMixin:
 
             # Prefixes ("drawings/<id>", "equation/<id>") degraded this run.
             mm_degraded_items: list[str] = []
+            # Items handed to an analysis task this run, across all sidecars (the
+            # degrade ceiling below is a share of this).
+            mm_analyzed_items = 0
 
             def _required_json_string(
                 parsed: dict[str, Any], prefix: str, field: str
@@ -7976,6 +7979,7 @@ class _PipelineMixin:
                     # No valid items in this sidecar — asyncio.wait([]) would
                     # ValueError, so skip the wait loop entirely.
                     continue
+                mm_analyzed_items += len(task_meta)
 
                 # Fail-fast polling loop. Three trigger paths:
                 #   1. an item task raises (e.g. MultimodalAnalysisError) →
@@ -8095,6 +8099,18 @@ class _PipelineMixin:
                         pipeline_status["latest_message"] = truncation_message
                         append_pipeline_history(pipeline_status, truncation_message)
             if mm_degraded_items:
+                # Fork: past a small share the cause is systemic (a broken model,
+                # prompt or server answering junk for every item), not one bad
+                # formula: fail the document as before, so it shows up as a failed
+                # doc instead of a book of source-only stubs. Degraded items are
+                # never cached, so every reprocess counts them again.
+                degrade_ceiling = max(3, mm_analyzed_items // 50)
+                if len(mm_degraded_items) > degrade_ceiling:
+                    raise MultimodalAnalysisError(
+                        f"{len(mm_degraded_items)} of {mm_analyzed_items} multimodal "
+                        f"analyses still invalid after their retry (ceiling "
+                        f"{degrade_ceiling}; first {mm_degraded_items[0]})"
+                    )
                 # Process stage stamps it as metadata.mm_degraded.
                 parsed_data["mm_degraded"] = len(mm_degraded_items)
                 degraded_message = (

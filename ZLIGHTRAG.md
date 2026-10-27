@@ -350,8 +350,12 @@ with `degraded: true`, a deterministic name (`equation <item id>`), and its sour
 content (the LaTeX, the table body, or the image caption), so it still becomes an
 ordinary multimodal chunk and entity. A degraded result is never cached, so the next
 run of the document asks the model again. Each degraded item is logged as a WARNING,
-and the document's `metadata.mm_degraded` counts them. Any other analysis error (a
-model call that fails, a configuration limit, cancellation) still fails the document.
+and the document's `metadata.mm_degraded` counts them. Past a ceiling of
+max(3, 2 % of the document's analyzed items) the cause is systemic, not one bad
+formula, so the document fails as upstream would (`N of M multimodal analyses still
+invalid after their retry`) instead of becoming a book of source-only stubs. Any other
+analysis error (a model call that fails, a configuration limit, cancellation) still
+fails the document.
 The error message says `unparseable JSON` when nothing could be parsed, rather than
 naming the first required field, and every such message ends with the response
 length and `finish_reason=length` when the output budget cut the response off.
