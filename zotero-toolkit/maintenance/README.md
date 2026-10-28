@@ -240,6 +240,35 @@ yet ingested, remove it and run `build_corpus.py` again; for one already in the 
 delete it through LightRAG's own delete path first, then remove the parsed copy, so the
 rebuild is ingested under the same id.
 
+## Finding thin documents: `thin_doc_audit.py`
+
+A processed document can hold a sliver of what its source PDF carries: a header-only stub
+ingested before the real PDF reached the storage folder, or a thin conversion by an older
+converter (header, abstract, one watermark line per page). `thin_doc_audit.py` lists them.
+Read-only: the query runs in a read-only session, and the tool writes only a report and,
+with `--out`, a targets TSV.
+
+```bash
+python maintenance/thin_doc_audit.py --env-file /path/to/lightrag/.env \
+    --dry-convert /path/to/zotero-toolkit/corpus --out thin_targets.tsv
+```
+
+Needs pymupdf; asyncpg for the query (connection settings as for `clean_dangling_refs.py`).
+For every processed document of the workspace with under `--kb-max-chars` (4000) of stored
+chunk text it measures the largest PDF in `<zotero>/storage/<KEY>/` (first 40 pages scaled
+by page count, 20 s cap) and keeps the document when the PDF text exceeds
+max(`--min-gain` (10) x stored chars, 20000), or when the stored body (text after the
+metadata header) is under 200 characters and the PDF holds at least 2000. Candidates are
+classed "arrived after ingest" when the PDF's ctime date is later than the document's
+creation date, else "thin first conversion".
+
+`--dry-convert DIR` runs `build_corpus.convert()` from `DIR` on each candidate with OCR off
+and every OCR server address pointed at a dead port, into a temp directory that is always
+removed, and keeps candidates whose body reaches `--min-dry-gain` (5) x the stored chars.
+Without it candidates are reported as unconfirmed. `--out` writes `key<TAB>reason<TAB>chunks<TAB>file_path`
+lines under `#` comments; `--exclude KEY,KEY` drops keys. Exit 0 = done, 1 = database
+unreachable, 2 = bad input.
+
 ## Tests
 
 From the `zotero-toolkit/` directory, in a virtualenv with `maintenance/requirements.txt` and `pytest`:
