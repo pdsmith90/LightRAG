@@ -225,43 +225,52 @@ def test_metadata_then_corpus_then_resume(tmp_path, library):
         and not (out / "TEST0102__field_notes.md").exists()
     )
 
-    # a changed source is rebuilt at the corpus root, even when the old output was ingested,
-    # and the log says so; a file in __parsed__/ with some other suffix is not a copy of it
+    # a changed source of an ingested document never goes back to the corpus root, where a
+    # scan would file it in __parsed__/ unread. With the same text the ingested copy is
+    # marked current and the log says so; a file with some other suffix is not a copy of it
     now = time.time()
-    os.utime(out / "__parsed__" / "TEST0102__field_notes.md", (now - 3600, now - 3600))
-    os.utime(zdir / "storage" / "TEST0102" / "field notes.txt", (now - 60, now - 60))
+    notes = zdir / "storage" / "TEST0102" / "field notes.txt"
+    ingested = out / "__parsed__" / "TEST0102__field_notes.md"
+    os.utime(ingested, (now - 3600, now - 3600))
+    os.utime(notes, (now - 60, now - 60))
     (out / "__parsed__" / "TEST0102__field_notes_recovered.md").write_text(
         "x", encoding="utf-8"
     )
-    r = run_script(
-        "build_corpus.py",
-        "--zotero",
-        zdir,
-        "--out",
-        out,
-        "--meta",
-        meta,
-        "--jobs",
-        "1",
-        "--ocr",
-        "off",
-        "--denylist",
-        deny,
-    )
+    build_args = ["--zotero", zdir, "--out", out, "--meta", meta, "--jobs", "1"]
+    build_args += ["--ocr", "off", "--denylist", deny]
+    r = run_script("build_corpus.py", *build_args)
     assert r.returncode == 0, r.stdout + r.stderr
     m = _manifest(out)
-    assert (
-        m["TEST0102"]["method"] == "txt" and (out / "TEST0102__field_notes.md").exists()
-    )
-    assert "REBUILT TEST0102__field_notes.md" in r.stdout
+    assert m["TEST0102"]["method"] == "skip"
+    assert not (out / "TEST0102__field_notes.md").exists()
+    assert "SOURCE-TOUCHED TEST0102__field_notes.md" in r.stdout
+    assert os.path.getmtime(ingested) >= os.path.getmtime(notes)
+    recovered = out / "__parsed__" / "TEST0102__field_notes_recovered.md"
+    assert recovered.read_text(encoding="utf-8") == "x"
+    assert _build(zdir, out, meta, "--denylist", deny)["TEST0102"]["method"] == "skip"
 
-    # a scan does not index a name LightRAG has already processed: it archives the file as
-    # __parsed__/<stem>_001.md. That copy is as new as the source, so it counts as built
-    # and the next run does not rebuild it (and hand LightRAG another copy) again.
-    shutil.move(
-        out / "TEST0102__field_notes.md",
-        out / "__parsed__" / "TEST0102__field_notes_001.md",
+    # the source gains its full text: the rebuild is parked in __changed__/ for the step
+    # that replaces the document, and the parked copy counts as built on the next run
+    _write(notes, "Field notes, full edition.\n" + PROSE * 3)
+    later = time.time() + 60
+    os.utime(notes, (later, later))
+    r = run_script("build_corpus.py", *build_args)
+    assert r.returncode == 0, r.stdout + r.stderr
+    parked = out / "__changed__" / "TEST0102__field_notes.md"
+    assert _manifest(out)["TEST0102"]["method"] == "source_update"
+    assert "SOURCE-UPDATE TEST0102__field_notes.md" in r.stdout
+    assert "full edition" in parked.read_text(encoding="utf-8")
+    assert not (out / "TEST0102__field_notes.md").exists()
+    os.utime(parked, (later + 1, later + 1))
+    m = _build(zdir, out, meta, "--denylist", deny)
+    assert (
+        m["TEST0102"]["method"] == "skip"
+        and not (out / "TEST0102__field_notes.md").exists()
     )
+
+    # a scan that skipped a rebuild filed it as __parsed__/<stem>_001.md; a copy as new as
+    # the source counts as built, so the same rebuild does not come back on every run
+    shutil.move(parked, out / "__parsed__" / "TEST0102__field_notes_001.md")
     m = _build(zdir, out, meta, "--denylist", deny)
     assert (
         m["TEST0102"]["method"] == "skip"
@@ -287,6 +296,12 @@ def test_metadata_then_corpus_then_resume(tmp_path, library):
     # without the denylist the blocked attachment is built
     m = _build(zdir, out, meta)
     assert m["TEST0104"]["method"] == "txt" and (out / "TEST0104__blocked.md").exists()
+
+    # --force rebuilds an ingested document at the corpus root, with a warning
+    r = run_script("build_corpus.py", *build_args, "--force")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "REBUILT TEST0102__field_notes.md" in r.stdout
+    assert (out / "TEST0102__field_notes.md").exists()
 
 
 def test_pdf_text_layer_and_image_only_fallbacks(tmp_path):

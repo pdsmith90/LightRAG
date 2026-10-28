@@ -2248,6 +2248,87 @@ def pick_primary(folder: str, want_name: str | None):
     return os.path.join(folder, fn), kind
 
 
+# ---------- a changed source of an ingested document ----------
+# LightRAG identifies a document by its file name, so a rebuild of a name it has
+# already processed is never indexed: a scan files it in __parsed__/ unread. A
+# source that gains its full text after ingest (a 0-byte placeholder PDF that
+# became a header-only document, then the real PDF arrived) was lost that way on
+# every scan. Such a rebuild now goes to __changed__/ instead of the corpus root,
+# where a replace step deletes the old document before the new copy is ingested;
+# a LightRAG server with SCAN_DIVERT_CHANGED_PROCESSED files a changed copy that
+# reached a scan there too.
+CHANGED_DIR = "__changed__"
+UPDATE_MIN_RATIO = (
+    2  # the rebuild's body must be at least this many times the ingested one...
+)
+UPDATE_MIN_GAIN = 2000  # ...and longer by at least this many characters
+HEADER_ONLY_MAX = 200  # an ingested body shorter than this was a header-only stub
+_COPY_SUFFIX = re.compile(r"_(?:\d{3}|\d{10,})")
+
+
+def numbered_copies(dirpath: str, out_base: str) -> list:
+    """<dirpath>/<out_base> if present, plus the <stem>_001.md, _002.md, ... (<stem>_<unix
+    time>.md after 999) copies LightRAG files beside it when the name is taken."""
+    stem = out_base[: -len(".md")]
+    found = [
+        p
+        for p in glob.glob(
+            os.path.join(glob.escape(dirpath), glob.escape(stem) + "_*.md")
+        )
+        if _COPY_SUFFIX.fullmatch(os.path.basename(p)[len(stem) : -len(".md")])
+    ]
+    plain = os.path.join(dirpath, out_base)
+    return ([plain] if os.path.exists(plain) else []) + found
+
+
+def body_chars(doc: str) -> int:
+    """Characters after the metadata header (header() ends with a '---' line)."""
+    head, sep, body = doc.partition("\n---\n")
+    return len(body.strip()) if sep and "**Zotero:**" in head else len(doc.strip())
+
+
+def is_upgrade(old_body: int, new_body: int) -> bool:
+    """Is a rebuild worth replacing the ingested document for? Only a gain counts: a
+    shorter rebuild may be a worse copy of the same work."""
+    if old_body < HEADER_ONLY_MAX:
+        return new_body >= UPDATE_MIN_GAIN
+    return (
+        new_body >= UPDATE_MIN_RATIO * old_body
+        and new_body - old_body >= UPDATE_MIN_GAIN
+    )
+
+
+def park_or_keep(key, method, out_base, parsed, changed, newest, doc):
+    """A rebuild of an ingested document: park it in __changed__/ when it gains enough
+    text, else mark the newest existing copy as current so the next run skips it."""
+    try:
+        with open(parsed, encoding="utf-8", errors="replace") as f:
+            old = body_chars(f.read())
+    except OSError:
+        old = 0
+    new = body_chars(doc)
+    if is_upgrade(old, new):
+        os.makedirs(os.path.dirname(changed), exist_ok=True)
+        tmp = changed + ".tmp"
+        with open(tmp, "w", encoding="utf-8", errors="replace") as f:
+            f.write(doc)
+        os.replace(tmp, changed)
+        print(
+            f"[build_corpus] SOURCE-UPDATE {out_base}: {old} -> {new} body chars; "
+            f"parked in {CHANGED_DIR}/ until its document is replaced",
+            flush=True,
+        )
+        return (key, "source_update", changed, len(doc))
+    os.utime(newest)
+    shrank = UPDATE_MIN_RATIO * new <= old and old - new >= UPDATE_MIN_GAIN
+    print(
+        f"[build_corpus] {'SOURCE-SHRANK' if shrank else 'SOURCE-TOUCHED'} {out_base}: "
+        f"{old} -> {new} body chars; kept the ingested copy",
+        flush=True,
+    )
+    return (key, "skip", newest, os.path.getsize(newest))
+
+
 def convert(key: str):
     global _pdf_garbled_pages, _pdf_page_count
     meta = CFG["meta"]
@@ -2303,27 +2384,19 @@ def convert(key: str):
         if (held and os.path.exists(held))
         else None
     )
+    changed = os.path.join(outdir, CHANGED_DIR, out_base)
     if done == parsed and os.path.getmtime(parsed) < os.path.getmtime(src):
         # When <name> is taken in __parsed__/, LightRAG files the next copy there as
         # <stem>_001.md, _002.md, ... (<stem>_<unix time>.md after 999). It does so
         # after indexing a rebuild whose old document was deleted, and also when a
         # scan skips a rebuild because a processed document still has that name.
         # Either way the build went through a scan, so count the newest copy, or the
-        # same rebuild comes back to the corpus root on every run.
-        out_stem = out_base[: -len(".md")]
-        copies = [
-            p
-            for p in glob.glob(
-                os.path.join(
-                    glob.escape(os.path.dirname(parsed)),
-                    glob.escape(out_stem) + "_*.md",
-                )
-            )
-            if re.fullmatch(
-                r"_(?:\d{3}|\d{10,})", os.path.basename(p)[len(out_stem) : -len(".md")]
-            )
-        ]
-        done = max([parsed] + copies, key=os.path.getmtime)
+        # same rebuild comes back on every run; a copy parked in __changed__/ counts too.
+        done = max(
+            numbered_copies(os.path.dirname(parsed), out_base)
+            + numbered_copies(os.path.dirname(changed), out_base),
+            key=os.path.getmtime,
+        )
     if (not CFG["force"]) and done and os.path.getmtime(done) >= os.path.getmtime(src):
         return (key, "skip", done, os.path.getsize(done))
     if key in CFG.get("oom_skip", ()):
@@ -2426,6 +2499,9 @@ def convert(key: str):
     if looks_empty(body, CFG["min_chars"]) and method not in ("pdf_needs_ocr",):
         method += "_empty"
     doc = header(meta, key) + body + "\n"
+    if os.path.exists(parsed) and not CFG["force"]:
+        # LightRAG would file this rebuild in __parsed__/ unread (see park_or_keep)
+        return park_or_keep(key, method, out_base, parsed, changed, done or parsed, doc)
     tmp = out + ".tmp"
     # errors="replace": an OCR text layer can carry a lone surrogate, and this write sits
     # outside convert()'s try, so a strict encode stopped the whole build (2026-10-14).
