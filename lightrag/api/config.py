@@ -946,6 +946,12 @@ def parse_args() -> argparse.Namespace:
     args.enable_query_budget_ceiling = get_env_value(
         "ENABLE_QUERY_BUDGET_CEILING", False, bool
     )
+    # Opt-in: a scanned text file whose length differs materially from the
+    # already-processed document it maps to is moved to __changed__/ with a
+    # warning instead of being archived unread
+    args.scan_divert_changed_processed = get_env_value(
+        "SCAN_DIVERT_CHANGED_PROCESSED", False, bool
+    )
     # Opt-in: append every /query and /query/stream request (prompt, applied
     # settings, delivered answer, sources) to this JSONL file for later review
     args.query_journal_file = get_env_value("QUERY_JOURNAL_FILE", None)

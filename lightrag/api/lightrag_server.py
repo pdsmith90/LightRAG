@@ -3053,6 +3053,9 @@ def create_app(args):
                         "related_chunk_number": args.related_chunk_number,
                         "enable_query_budget_ceiling": query_budget_ceiling_enabled,
                         "query_journal_file": query_journal_file,
+                        "scan_divert_changed_processed": bool(
+                            getattr(args, "scan_divert_changed_processed", False)
+                        ),
                         "drop_bibliography_chunks": args.drop_bibliography_chunks,
                         "max_chunks_per_doc": args.max_chunks_per_doc,
                         "lexical_chunk_top_k": args.lexical_chunk_top_k,

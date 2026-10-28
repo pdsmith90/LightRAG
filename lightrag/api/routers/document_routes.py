@@ -117,6 +117,7 @@ from lightrag.parser.routing import (
 )
 from lightrag.utils import (
     generate_track_id,
+    get_unique_filename_in_parsed,
     move_file_to_parsed_dir,
     validate_file_path_security,
 )
@@ -3099,6 +3100,58 @@ class _ScanFileDecision:
     """Operator-facing reason, recorded as a bounded job sample when set."""
 
 
+CHANGED_DIR_NAME = "__changed__"
+"""Sibling of ``__parsed__`` that receives a processed-source file whose text no
+longer matches the stored document (SCAN_DIVERT_CHANGED_PROCESSED)."""
+
+CHANGE_RATIO = 2
+"""A rewritten file counts as changed only past this size ratio (either way)."""
+
+CHANGE_MIN_DELTA_CHARS = 2000
+"""...and only when the length also moved by at least this many characters."""
+
+CHANGE_TEXT_SUFFIXES = frozenset({".md", ".txt", ".markdown"})
+"""Plain-text inputs whose length can be compared without running a parser."""
+
+
+def _content_materially_changed(old_len: int, new_len: int) -> bool:
+    """True when a text grew or shrank by both CHANGE_RATIO and CHANGE_MIN_DELTA_CHARS."""
+    if (
+        new_len >= CHANGE_RATIO * old_len
+        and new_len - old_len >= CHANGE_MIN_DELTA_CHARS
+    ):
+        return True
+    return (
+        CHANGE_RATIO * new_len <= old_len
+        and old_len - new_len >= CHANGE_MIN_DELTA_CHARS
+    )
+
+
+async def _stored_content_length(rag: LightRAG, doc_id: str) -> int | None:
+    """The processed row's ``content_length``, or None when not comparable.
+
+    ``DocSchedulingRecord`` (what source resolution returns) carries no length,
+    so the one row is hydrated; any failure, a missing field, a non-int or a
+    zero all mean "cannot compare" and the caller archives as before.
+    """
+    try:
+        rows = await rag.doc_status.get_full_docs_by_ids([doc_id], strict=True)
+    except Exception as read_error:
+        logger.warning(f"Could not read content_length of {doc_id}: {read_error}")
+        return None
+    row = rows.get(doc_id)
+    if row is None:
+        return None
+    length = (
+        row.get("content_length")
+        if isinstance(row, dict)
+        else getattr(row, "content_length", None)
+    )
+    if isinstance(length, bool) or not isinstance(length, int) or length <= 0:
+        return None
+    return length
+
+
 async def _confirm_full_docs_absent(rag: LightRAG, doc_id: str) -> bool | None:
     """Is the document's ``full_docs`` content CONFIRMED absent? (LR2 §8.3.D)
 
@@ -3947,6 +4000,59 @@ async def run_scanning_process(
                     continue
 
                 if decision.kind is _ScanFileClass.PROCESSED:
+                    # Fork rule, opt-in (SCAN_DIVERT_CHANGED_PROCESSED): a stub
+                    # ingested before its full text arrived would otherwise be
+                    # archived unread on every scan. A text file whose length
+                    # differs materially from the stored document is moved to
+                    # __changed__/ with a warning instead. The KB row is never
+                    # touched; an operator or external tooling replaces the
+                    # document. Flag off: no extra I/O at all.
+                    if (
+                        getattr(global_args, "scan_divert_changed_processed", False)
+                        and file_path.suffix.lower() in CHANGE_TEXT_SUFFIXES
+                    ):
+                        old_len = await _stored_content_length(rag, decision.doc_id)
+                        if old_len is not None:
+                            new_len = len(
+                                (await asyncio.to_thread(file_path.read_bytes))
+                                .decode("utf-8", errors="replace")
+                                .strip()
+                            )
+                            if _content_materially_changed(old_len, new_len):
+                                try:
+                                    changed_dir = file_path.parent / CHANGED_DIR_NAME
+                                    await asyncio.to_thread(
+                                        changed_dir.mkdir, parents=True, exist_ok=True
+                                    )
+                                    target = (
+                                        changed_dir
+                                        / get_unique_filename_in_parsed(
+                                            changed_dir, file_path.name
+                                        )
+                                    )
+                                    await asyncio.to_thread(file_path.rename, target)
+                                except Exception as move_error:
+                                    divert_error = (
+                                        f"Failed to move scan file {filename} "
+                                        f"to {CHANGED_DIR_NAME}: {move_error}"
+                                    )
+                                    logger.error(divert_error)
+                                    reporter.count("errors")
+                                    reporter.sample("error", divert_error)
+                                    continue
+                                changed_detail = (
+                                    f"File {filename} matches processed document "
+                                    f"{decision.doc_id} but its text changed "
+                                    f"(stored content_length {old_len}, file now "
+                                    f"{new_len} characters); moved to "
+                                    f"{CHANGED_DIR_NAME}/. To replace the document, "
+                                    f"delete document {decision.doc_id} and move the "
+                                    "file back into the input directory"
+                                )
+                                await record_scan_warning(rag, changed_detail)
+                                reporter.count("processed_changed")
+                                reporter.sample("warning", changed_detail)
+                                continue
                     processed_count += 1
                     await _archive(
                         file_path,
