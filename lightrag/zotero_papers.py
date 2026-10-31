@@ -26,22 +26,37 @@ to library DOIs), read from the server's working directory or the path in
 ZOTERO_REFERENCES and reloaded when it changes. Without it the shared view is
 empty and says why.
 
+Paper search folds typography on both sides (:func:`fold`) and reads a BibTeX
+key as its words; :func:`paper_passages` answers a question from one paper's
+own chunks, reranked against the bare question.
+
 Fork-local (no upstream counterpart).
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import re
 import threading
 import time
+import unicodedata
+
+import numpy as np
 
 from lightrag import zotero_citations
 from lightrag.base import DocStatus
+from lightrag.chunk_schema import format_parent_headings
+from lightrag.constants import DEFAULT_QUERY_PRIORITY
 from lightrag.types import KnowledgeGraph, KnowledgeGraphEdge, KnowledgeGraphNode
-from lightrag.utils import make_relation_chunk_key, parse_relation_chunk_key
+from lightrag.utils import (
+    apply_rerank_if_enabled,
+    filter_bibliography_chunks,
+    make_relation_chunk_key,
+    parse_relation_chunk_key,
+)
 
 logger = logging.getLogger("lightrag")
 
@@ -107,9 +122,140 @@ _refs_mtime: float | None = None
 _refs_next_stat = 0.0
 _refs_warned = False
 
-_docs_cache: dict = {"at": 0.0, "owner": None, "by_key": {}}
+# pending: (doc_status, task) of the one refresh in flight
+_docs_cache: dict = {"at": 0.0, "owner": None, "by_key": {}, "pending": None}
 
 _KEY_RE = re.compile(r"^[A-Z0-9]{8}$")
+
+# A keys= search takes at most this many storage keys.
+MAX_SEARCH_KEYS = 50
+# paper_passages: a work of at most _PASSAGE_ALL chunks offers every chunk to the
+# reranker; a longer one the _PASSAGE_LEG best by vector similarity and the
+# _PASSAGE_LEG best by full-text rank (at most _PASSAGE_MAX together).
+MAX_PASSAGE_KEYS = 10
+_PASSAGE_ALL = 60
+_PASSAGE_LEG = 40
+_PASSAGE_MAX = 80
+
+# fold(): letters NFKD leaves whole, dashes, and apostrophes / primes (deleted).
+_FOLD_TABLE = str.maketrans(
+    {
+        "\u0131": "i",
+        "\u0142": "l",
+        "\u0141": "L",
+        "\u00f8": "o",
+        "\u00d8": "O",
+        "\u0111": "d",
+        "\u0110": "D",
+        "\u00f0": "d",
+        "\u00d0": "D",
+        "\u00df": "ss",
+        "\u1e9e": "SS",
+        "\u00e6": "ae",
+        "\u00c6": "AE",
+        "\u0153": "oe",
+        "\u0152": "OE",
+        "\u00fe": "th",
+        "\u00de": "TH",
+        **{chr(c): "-" for c in range(0x2010, 0x2016)},
+        "\u2212": "-",
+        "\u00ad": "-",
+        **{c: None for c in "'\u2019\u2018\u02bc\u2032`"},
+    }
+)
+# stripped from both ends of a query token: brackets, sentence punctuation, '*'
+# (emphasis) and typographic double quotes and guillemets
+_EDGE_PUNCT = '()[]{},.;:"!?*\u201c\u201d\u201e\u201f\u00ab\u00bb\u2039\u203a'
+_BIBKEY_RE = re.compile(r"^([a-z][a-z]*)((?:[A-Z][A-Za-z0-9]*)+)(\d{4})[a-z]?$")
+# camel-case words, acronym runs ("ABCFollow" -> ABC, Follow) and digit runs
+_CAMEL_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|[0-9]+")
+_NON_ALNUM_RE = re.compile(r"[\W_]+")
+_PART_SPLIT_RE = re.compile(r"[-/]")
+
+
+def fold(text: str) -> str:
+    """``text`` for matching: NFKD without combining marks, the letters NFKD
+    keeps whole spelled in ASCII (ı ł ø đ ð ß æ œ þ), every dash and the soft
+    hyphen as '-', apostrophes and primes deleted, lowercased."""
+    text = unicodedata.normalize("NFKD", text or "")
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    return text.translate(_FOLD_TABLE).lower()
+
+
+def _query_tokens(query: str) -> list[str]:
+    """The whitespace-separated tokens of a paper search, each without its edge
+    punctuation, and without the "et al" that follows a name in a citation
+    ("Doe et al. 2011"). The MCP proxy carries the same rule (``_tokens``)."""
+    raw = [t for t in (tok.strip(_EDGE_PUNCT) for tok in (query or "").split()) if t]
+    tokens: list[str] = []
+    i = 0
+    while i < len(raw):
+        if (
+            tokens
+            and i + 1 < len(raw)
+            and fold(raw[i]) == "et"
+            and fold(raw[i + 1]) == "al"
+        ):
+            i += 2
+            continue
+        tokens.append(raw[i])
+        i += 1
+    return tokens
+
+
+def query_words(query: str) -> list[tuple[str, bool]]:
+    """The words of a paper search, folded, as ``(word, is_title_word)``.
+
+    Each token loses its leading and trailing punctuation (brackets, ``*``,
+    straight and curly quotes, guillemets) and an "et al" after a name is
+    dropped; a token with no letter or digit left (the " - " of "Author - Year -
+    Title", an "&") is no word. A token shaped like a BibTeX key
+    (``doePruningOrchardsAppleTrees2001``) becomes its family name, each
+    camel-case title word and its year; the title words match the haystack with
+    everything but letters and digits removed (``is_title_word``). A word
+    matches as it is, without its hyphens, or by all its '-' and '/' parts
+    (:func:`_word_in`) -- except in a DOI-shaped query, matched whole. The proxy
+    carries the same rule; ``zotero-toolkit/tests/mcp/paper_search_cases.json``
+    holds the cases both suites run."""
+    words: list[tuple[str, bool]] = []
+    for token in _query_tokens(query):
+        m = _BIBKEY_RE.match(token)
+        if m:
+            family, title, year = m.groups()
+            words.append((fold(family), False))
+            words.extend((fold(w), True) for w in _CAMEL_RE.findall(title))
+            words.append((year, False))
+            continue
+        word = fold(token).strip(_EDGE_PUNCT)
+        if any(ch.isalnum() for ch in word):  # not a bare "-" between fields
+            words.append((word, False))
+    return words
+
+
+def _forms(text: str) -> tuple[str, str, str]:
+    """A haystack folded, without hyphens, and with only letters and digits."""
+    folded = fold(text)
+    return folded, folded.replace("-", ""), _NON_ALNUM_RE.sub("", folded)
+
+
+def _word_in(
+    word: str, title_word: bool, forms: tuple[str, str, str], loose: bool = True
+) -> bool:
+    """Whether a :func:`query_words` word occurs in a :func:`_forms` haystack:
+    as it is, or (``loose``) without its hyphens in the hyphen-less haystack or
+    by every part of it split on '-' or '/'."""
+    folded, bare_hay, alnum_hay = forms
+    if title_word:
+        return word in alnum_hay
+    if word in folded:
+        return True
+    if not loose:
+        return False
+    bare = word.replace("-", "")
+    if bare and bare in bare_hay:
+        return True
+    parts = [p for p in _PART_SPLIT_RE.split(word) if p]
+    return len(parts) > 1 and all(p in folded for p in parts)
 
 
 def norm_doi(text: str) -> str:
@@ -181,20 +327,47 @@ def resolve_paper(paper: str, by_doi: dict | None = None) -> tuple[str, list[str
     return doi, (_keys_by_doi(meta) if by_doi is None else by_doi).get(doi, [])
 
 
-async def _kb_documents(rag) -> dict[str, list[tuple[str, set[str]]]]:
-    """Storage key -> [(doc id, chunk ids)] of every processed document."""
-    now = time.monotonic()
-    cache = _docs_cache
-    if cache["owner"] is rag.doc_status and now - cache["at"] < _DOCS_TTL:
-        return cache["by_key"]
-    docs = await rag.doc_status.get_docs_by_statuses([DocStatus.PROCESSED])
+async def _load_kb_documents(doc_status) -> dict[str, list[tuple[str, set[str]]]]:
+    docs = await doc_status.get_docs_by_statuses([DocStatus.PROCESSED])
     by_key: dict[str, list[tuple[str, set[str]]]] = {}
     for doc_id, status in docs.items():
         key = zotero_citations.zotero_key(status.file_path or "")
         if key:
             by_key.setdefault(key, []).append((doc_id, set(status.chunks_list or [])))
-    cache.update(at=now, owner=rag.doc_status, by_key=by_key)
+    _docs_cache.update(at=time.monotonic(), owner=doc_status, by_key=by_key)
     return by_key
+
+
+def _refresh_done(task: asyncio.Task) -> None:
+    pending = _docs_cache.get("pending")
+    if pending is not None and pending[1] is task:
+        _docs_cache["pending"] = None
+    if not task.cancelled() and task.exception() is not None:
+        logger.warning(
+            f"zotero_papers: reading the processed documents failed: {task.exception()}"
+        )
+
+
+async def _kb_documents(rag) -> dict[str, list[tuple[str, set[str]]]]:
+    """Storage key -> [(doc id, chunk ids)] of every processed document.
+
+    The list is read at most once per _DOCS_TTL, and concurrent callers share
+    one read. Once it is older than that, callers get it at once while one
+    refresh runs behind them; only the first read is waited for."""
+    cache = _docs_cache
+    owner = rag.doc_status
+    known = cache["owner"] is owner
+    if known and time.monotonic() - cache["at"] < _DOCS_TTL:
+        return cache["by_key"]
+    loop = asyncio.get_running_loop()
+    pending = cache.get("pending")
+    if pending is None or pending[0] is not owner or pending[1].get_loop() is not loop:
+        task = loop.create_task(_load_kb_documents(owner))
+        task.add_done_callback(_refresh_done)
+        pending = cache["pending"] = (owner, task)
+    if known:
+        return cache["by_key"]
+    return await asyncio.shield(pending[1])
 
 
 def _cite_key(keys: list[str], kb: dict) -> str:
@@ -223,41 +396,54 @@ def _paper_summary(
     }
 
 
-async def search_papers(rag, query: str, limit: int = 20) -> list[dict]:
-    """Papers in the knowledge base whose DOI, storage key, title, authors or
-    year match ``query`` (every word must occur), best match first."""
-    words = (query or "").lower().split()
-    if not words:
-        return []
-    kb = await _kb_documents(rag)
+_index_lock = threading.Lock()
+# the folded haystacks of the indexed papers, rebuilt when the processed-document
+# list or the metadata is replaced
+_index: dict = {"kb": None, "meta": None, "rows": []}
+
+
+def _search_index(kb: dict, meta: dict) -> list[tuple]:
+    """(key, DOI, paper, year, title forms, haystack forms) per indexed key."""
+    with _index_lock:
+        if _index["kb"] is kb and _index["meta"] is meta:
+            return _index["rows"]
+        rows = []
+        for key in kb:
+            entry = meta.get(key)
+            entry = entry if isinstance(entry, dict) else {}
+            doi = norm_doi(entry.get("doi") or "")
+            title = zotero_citations._plain_title(entry) if entry else ""
+            year = str(entry.get("year") or "")
+            hay = " ".join(
+                [title, " ".join(entry.get("authors") or []), year, doi, key.lower()]
+            )
+            rows.append((key, doi, doi or key, year, _forms(title), _forms(hay)))
+        _index.update(kb=kb, meta=meta, rows=rows)
+        return rows
+
+
+def _search(kb: dict, query: str, words: list, wanted: set, limit: int) -> list[dict]:
     meta = zotero_citations._load()
+    rows = _search_index(kb, meta)
     doi_q = norm_doi(query)
     key_q = query.strip().upper()
+    chosen = {row[2] for row in rows if row[0] in wanted}
     best: dict[str, tuple] = {}  # paper (DOI, else key) -> best rank
     keys_of: dict[str, list[str]] = {}
-    for key in kb:
-        entry = meta.get(key)
-        if not isinstance(entry, dict):
+    for key, doi, paper, year, title_forms, hay_forms in rows:
+        if wanted and paper not in chosen:
             continue
-        doi = norm_doi(entry.get("doi") or "")
-        paper = doi or key
-        title = zotero_citations._plain_title(entry).lower()
-        hay = " ".join(
-            [
-                title,
-                " ".join(entry.get("authors") or []).lower(),
-                entry.get("year") or "",
-                doi,
-                key.lower(),
-            ]
-        )
-        exact = (doi_q and doi == doi_q) or key == key_q
-        if not exact and not all(w in hay for w in words):
+        named = bool(doi_q and doi == doi_q) or key == key_q
+        # a DOI is matched whole: its parts ("10.1", "x") are in most haystacks
+        if (
+            words
+            and not named
+            and not all(_word_in(w, t, hay_forms, not doi_q) for w, t in words)
+        ):
             continue
-        year = entry.get("year") or ""
         rank = (
-            not exact,
-            -sum(w in title for w in words),
+            not (named or key in wanted),
+            -sum(_word_in(w, t, title_forms) for w, t in words),
             -int(year) if year.isdigit() else 0,
         )
         best[paper] = min(best.get(paper, rank), rank)
@@ -269,6 +455,178 @@ async def search_papers(rag, query: str, limit: int = 20) -> list[dict]:
         _paper_summary(norm_doi(p), sorted(keys_of[p]), kb, refs, meta, by_doi)
         for p in papers
     ]
+
+
+async def search_papers(
+    rag, query: str, limit: int = 20, keys: list[str] | None = None
+) -> list[dict]:
+    """Papers in the knowledge base whose DOI, storage key, title, authors or
+    year match ``query`` (every word must occur, both sides folded, a BibTeX
+    key read as its words), best match first. With ``keys`` (storage keys),
+    only the papers carrying one of them, and ``query`` may be empty."""
+    words = query_words(query)
+    wanted = {k.strip().upper() for k in keys or [] if k.strip()}
+    if not words and not wanted:
+        return []
+    kb = await _kb_documents(rag)
+    # the scan and the summaries are plain Python over every indexed paper
+    return await asyncio.to_thread(_search, kb, query or "", words, wanted, limit)
+
+
+def _cosines(query_vector, vectors: dict) -> dict[str, float]:
+    ids = list(vectors)
+    if not ids:
+        return {}
+    matrix = np.asarray([vectors[i] for i in ids], dtype=np.float64)
+    q = np.asarray(query_vector, dtype=np.float64).reshape(-1)
+    norms = np.linalg.norm(matrix, axis=1) * np.linalg.norm(q)
+    dots = matrix @ q
+    sims = np.divide(dots, norms, out=np.zeros_like(dots), where=norms > 0)
+    return {i: float(s) for i, s in zip(ids, sims)}
+
+
+async def _vector_scores(
+    rag, question: str, ids: list[str], limit: int | None = None
+) -> dict[str, float]:
+    """Chunk id -> cosine similarity to the question, for the ``ids`` that have
+    a stored vector. The ranking covers the given chunks alone (a vector-index
+    query cannot be kept to one work). A storage with ``rank_ids_by_vector``
+    (Postgres) ranks them where they are stored and returns only the ``limit``
+    nearest, so the cost of the call does not grow with the length of the work;
+    another storage returns every vector by id and all the scores."""
+    vdb = rag.chunks_vdb
+    embedded = await vdb.embedding_func(
+        [question], context="query", _priority=DEFAULT_QUERY_PRIORITY
+    )
+    rank = getattr(vdb, "rank_ids_by_vector", None)
+    if rank is not None:
+        return await rank(ids, embedded[0], limit or len(ids))
+    vectors = await vdb.get_vectors_by_ids(ids)
+    return await asyncio.to_thread(_cosines, embedded[0], vectors)
+
+
+def _passage_candidates(ids, rows, key_of, drop_bibliography) -> list[dict]:
+    """The rows as reranker candidates: reference lists out when the filter is
+    on, and a text that two copies of the paper share only once."""
+    candidates, seen = [], set()
+    for chunk_id, row in zip(ids, rows):
+        if not isinstance(row, dict):
+            continue
+        content = row.get("content") or ""
+        if content in seen:
+            continue
+        seen.add(content)
+        candidates.append(
+            {
+                "key": key_of[chunk_id],
+                "file_path": row.get("file_path") or "",
+                "chunk_id": chunk_id,
+                "chunk_order_index": int(row.get("chunk_order_index") or 0),
+                "content": content,
+                "content_headings": format_parent_headings(row) or None,
+            }
+        )
+    if drop_bibliography:
+        candidates = filter_bibliography_chunks(candidates)
+    return candidates
+
+
+async def paper_passages(rag, keys: list[str], question: str, top_n: int = 3) -> dict:
+    """The ``top_n`` passages of one work that best answer ``question``.
+
+    ``keys`` are the storage keys of the work's copies. The answer's ``keys``
+    are those in the knowledge base and ``n_chunks`` is the number of chunks of
+    the work's longest copy (what ``chunk_order_index`` counts within).
+    A work of at most _PASSAGE_ALL chunks offers all of them; a longer one the
+    _PASSAGE_LEG best by cosine similarity of their stored vectors to the
+    question and the _PASSAGE_LEG best by the text storage's
+    ``rank_chunks_by_text`` (Postgres full-text rank; skipped on a storage
+    without it), both over the work's own chunk ids. Reference lists drop out
+    under DROP_BIBLIOGRAPHY_CHUNKS, and the server's reranker orders the rest
+    against the bare question; the first chunk is a candidate like any other.
+    Without a reranker, or when it fails, vector similarity orders them."""
+    kb = await _kb_documents(rag)
+    indexed = [k for k in dict.fromkeys(keys) if k in kb]
+    key_of: dict[str, str] = {}
+    for key in indexed:
+        for _, chunks in kb[key]:
+            for chunk_id in chunks:
+                key_of.setdefault(chunk_id, key)
+    ids = sorted(key_of)
+    # the paper's length is that of its longest copy: copies are not added up,
+    # so a passage's "chunk i" is at most n_chunks
+    n_chunks = max((len(c) for k in indexed for _, c in kb[k]), default=0)
+    out = {"keys": indexed, "n_chunks": n_chunks, "passages": []}
+    if not ids:
+        return out
+
+    if len(ids) <= _PASSAGE_ALL:
+        chosen = ids
+    else:
+        scores = await _vector_scores(rag, question, ids, _PASSAGE_LEG)
+        by_vector = sorted(scores, key=lambda c: -scores[c])[:_PASSAGE_LEG]
+        rank_text = getattr(rag.text_chunks, "rank_chunks_by_text", None)
+        by_text = await rank_text(ids, question, _PASSAGE_LEG) if rank_text else []
+        chosen = list(dict.fromkeys(by_vector + list(by_text)))[:_PASSAGE_MAX]
+    rows = await rag.text_chunks.get_by_ids(chosen)
+    candidates = await asyncio.to_thread(
+        _passage_candidates,
+        chosen,
+        rows,
+        key_of,
+        bool(getattr(rag, "drop_bibliography_chunks", False)),
+    )
+    if not candidates:
+        return out
+
+    ranked: list[tuple[dict, float]] | None = None
+    rerank_func = getattr(rag, "rerank_model_func", None)
+    how = "no reranker configured"
+    if rerank_func is not None:
+        reranked = await apply_rerank_if_enabled(
+            query=question,
+            retrieved_docs=candidates,
+            global_config={"rerank_model_func": rerank_func},
+            enable_rerank=True,
+            top_n=top_n,
+        )
+        if reranked and all("rerank_score" in c for c in reranked):
+            ranked = sorted(
+                ((c, float(c["rerank_score"])) for c in reranked),
+                key=lambda pair: -pair[1],
+            )
+            how = "reranked"
+        else:
+            how = "reranking failed"
+    if ranked is None:
+        # the first scores cover only the vector leg's leaders, not the text leg's
+        scores = await _vector_scores(
+            rag, question, [c["chunk_id"] for c in candidates]
+        )
+        ranked = sorted(
+            ((c, scores.get(c["chunk_id"], -1.0)) for c in candidates),
+            key=lambda pair: -pair[1],
+        )
+        how += ", in vector order"
+    level = logging.WARNING if "failed" in how else logging.INFO
+    logger.log(
+        level,
+        f"Paper passages: {len(candidates)} candidates of {len(ids)} chunks "
+        f"({', '.join(indexed)}), {how}",
+    )
+    out["passages"] = [
+        {
+            "key": c["key"],
+            "file_path": c["file_path"],
+            "chunk_id": c["chunk_id"],
+            "chunk_order_index": c["chunk_order_index"],
+            "content": c["content"],
+            "content_headings": c["content_headings"],
+            "score": score,
+        }
+        for c, score in ranked[:top_n]
+    ]
+    return out
 
 
 async def _contributions(

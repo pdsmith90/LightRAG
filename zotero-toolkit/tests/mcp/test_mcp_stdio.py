@@ -68,8 +68,11 @@ def test_stdio_lists_tools_and_compiles_citations(
         "add_note",
         "health",
     }
+    # Text only: no outputSchema, and no structuredContent copy of the text.
+    assert all(t.output_schema is None for t in tools.tools)
     search, health, failed = results
     assert not search.is_error
+    assert search.structured_content is None and len(search.content) == 1
     text = search.content[0].text
     assert text.startswith(
         "### Retrieved documents (compiled citations)\n- [1] "

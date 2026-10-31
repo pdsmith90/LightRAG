@@ -10,16 +10,22 @@ into real bibliographic citations using Zotero metadata. The LLM never writes th
 
 | Tool | What it returns |
 |---|---|
-| `search_library(query, mode="mix", top_k=10, answer=False, include_graph=False)` | Compiled citations **first**, then the retrieved passages as plain text, each headed `[n] Family Year · section` (see [Retrieved passages](#retrieved-passages)). No answer is generated, so it is faster. `include_graph=True` appends the knowledge-graph entities and relations. |
+| `search_library(query, mode="mix", top_k=10, answer=False, include_graph=False, passages=8)` | Compiled citations **first**, then the retrieved passages as plain text, each headed `[n] Family Year · section` (see [Retrieved passages](#retrieved-passages)). No answer is generated, so it is faster. `passages` sets how many are retrieved. `include_graph=True` appends the knowledge-graph entities and relations. |
 | `search_library(..., answer=True)` | The server's synthesized answer. Any reference section the model wrote is stripped, and a `### Sources (compiled from retrieval)` list is appended. |
-| `paper_passages(paper, question)` | The passages of **one** paper that best match `question`, under that paper's citation, then the other papers the question matched (citations only). `paper` is a Zotero key, a DOI, or words that must all occur in the title, authors or year. If no indexed paper or several match, it lists them instead of querying. |
-| `find_paper(paper)` | An exact lookup with the same `paper` forms: the matching papers that are indexed, then the Zotero items that match but are not. No retrieval and no LLM. |
+| `paper_passages(paper, question)` | Up to 3 passages of **one** paper ranked against `question`, under that paper's citation. `paper` is a Zotero key, a DOI, or words that must all occur in the title, authors or year. If no indexed paper, several, or only near matches fit, it lists them instead of querying. |
+| `find_paper(paper)` | A lookup with the same `paper` forms: the matching papers that are indexed, then the Zotero items that match but are not, then near matches when nothing has every word. No retrieval and no LLM. |
 | `add_note(text, description="")` | Inserts a text note into the knowledge base (`POST /documents/text`) under a unique document name (see below). |
 | `health()` | The server's `/health` status, or `unreachable at <url>: <error>`. |
 
 `mode` is one of `mix` (default: knowledge graph + vectors), `hybrid`, `local`, `global` or
 `naive`. Any other value, including LightRAG's `bypass`, falls back to `mix`. `top_k` is
-clamped to `1..LIGHTRAG_MCP_MAX_TOP_K` (see below).
+clamped to `1..LIGHTRAG_MCP_MAX_TOP_K` (see below). It sizes the knowledge-graph legs of
+retrieval, not the result: `passages` (default 8, clamped to `1..12`) is sent as the
+request's `chunk_top_k` and decides how many passages come back, at about 4 KB each.
+`answer=True` does not send it.
+
+Every tool returns one text block and declares no output schema, so a client that keeps
+both a result's text and its `structuredContent` does not receive the text twice.
 
 LightRAG uses a text insert's `file_source` as the document's name, and refuses with HTTP
 409 a name that its document status storage already holds. So `add_note` never sends a
@@ -77,7 +83,14 @@ servers, `content_headings`) and the server's own reference list. `search_librar
 returns the compiled citations, then each chunk in the server's ranked order as plain
 text, headed by its `[n]`, the first author's family name and year (from `creators`, else
 the server's `citation`, else `authors`) and its section path. The label keeps the
-passages of several same-topic papers apart. The entities and relations follow only
+passages of several same-topic papers apart. A paper's first chunk begins with the header
+the corpus builder writes (`# Title`, `**Authors:**`, `**Year:**`, `**Tags:**`,
+`**Zotero:**` lines, an optional `> **Abstract.**` line, then `---`). That header is
+dropped, because the citation carries it; the abstract line is kept only when the first
+80 characters of the abstract (folded, see below) do not occur in the text after it. A
+chunk without the `**Zotero:**` line is left as it is. A passage whose text, whitespace
+collapsed, repeats an earlier one in the same result (another Zotero copy of the paper) is
+dropped, and its `[n]` joins the earlier heading: `[1][4] Family Year · section`. The entities and relations follow only
 with `include_graph=True`, and the server's reference list is dropped because the
 compiled citations replace it. When the result would exceed `LIGHTRAG_MCP_MAX_CHARS`,
 the lowest-ranked passages are left out and a closing line says how many. A response in
@@ -87,17 +100,53 @@ any other layout is passed through whole after the citations.
 
 `find_paper` asks `GET /graph/papers/search?q=…&limit=100` (the zlightrag fork's paper
 lookup, which lists processed documents only) which papers are indexed, and matches the
-same words against `zotero_metadata.json`. A metadata entry is reported as not indexed
-only after the server, asked for that entry's exact key, does not return it either; one
-copy is listed per DOI. When the server finds 100 papers its list may be cut, so the
-Zotero-only list is withheld and the answer asks for a narrower lookup. On a stock
-LightRAG Server the route answers 404, and the index status is reported as unknown.
+same words against `zotero_metadata.json`. Both sides are folded first: NFKD, accents
+dropped, letters that NFKD keeps (`ı ł ø đ ð ß æ œ þ`) spelled out, every Unicode hyphen,
+dash, minus sign and soft hyphen made `-`, apostrophes and primes deleted, lowercase. A
+query word, without surrounding `()[]{},.;:"!?*`, curly double quotes and guillemets (and
+an `et al` that follows a name, as in `Doe et al. (2011)`), matches when it occurs in an entry's
+title, authors, year, DOI or key; when it does without its hyphens in that text without
+hyphens; or when each of its parts split on `-` or `/` does (a DOI-shaped query is matched
+whole, not loosely). So `widget-fo`, `widgetfo` and `orchards` match a title written
+`Widget‐FO` (U+2010) or `Orchard’s`. A BibTeX key such as
+`vaswaniAttentionAllYou2017` becomes the words `vaswani` and `2017` and the title words
+`attention`, `all`, `you` (camel words split as the server splits them: acronyms and digit
+runs apart, `IRI2016Model` is `iri`, `2016`, `model`), each matched against the text with
+every non-alphanumeric removed. A token with no letter or digit (the ` - ` of
+`Author - Year - Title`, an `&`) is no word. The server's search carries the same rule, and
+`tests/mcp/paper_search_cases.json` holds the cases both suites run.
 
-`paper_passages` resolves `paper` the same way, then sends a `naive` context-only query
-that starts with the paper's first author, year and title, followed by the question, and
-keeps only the chunks of that paper's keys. On a stock server it resolves `paper` from
-the metadata alone. A server that caps chunks per document (the fork's
-`MAX_CHUNKS_PER_DOC`) returns at most that many passages of the paper per call.
+A metadata entry the words search did not return is confirmed against the server by key
+before it is called not indexed: a server that sends `X-Paper-Search: 2` answers
+`GET /graph/papers/search?keys=K1,K2,…` for 50 keys at a time; an older one gets one request
+per key, four at a time. Entries are asked about in order until 10 are known not to be
+indexed or 100 keys were asked (`CONFIRM_MAX`); entries past that are listed apart as
+"index status NOT checked", never as not indexed. One copy is listed per DOI. Lookups are cached
+in the proxy for 120 seconds (256 requests at most). Indexed papers are listed with a
+title equal to the query's title words (those that are not an author's name or a year)
+first, then titles that hold them as a phrase, then by query words in the title, then in
+the server's order. After 10 rows a list says how many more it does not show, and that a
+cut list does not show absence. When the server finds 100 papers its list may be cut, so
+the Zotero-only list is withheld and the answer asks for a narrower lookup.
+
+When no item has every word, the answer says only that, and that it does not show the
+paper is missing (a wrong year, a differently spelled name, a topic word not in the title
+give it too); it then lists up to 5 near matches in a separate
+section, each marked indexed or Zotero only: entries matching every word but a year that is
+off by one, then entries whose author family name is the query's surname (the BibTeX
+family, else its first non-numeric word), within a year of a year the query gives. On a
+stock LightRAG Server the route answers 404 and the index status is reported as unknown.
+
+`paper_passages` resolves `paper` the same way and never queries for a near match. With
+one indexed paper it sends `POST /graph/papers/passages` with all of the paper's keys (the
+copy with a DOI, else the longest title, first), the bare question and `top_n` 3, and
+renders each passage, best first, as `[1] Family Year · section · chunk i of n` (n is the chunk count of the paper's longest copy). On a
+server without that route (404) it falls back to a `naive` context-only `/query` led by the first author
+and year (plus up to 3 title words when the metadata holds another work by that author in
+that year), keeps only the chunks of the paper's keys, and lists at most 5 other papers
+the question matched as `KEY · Family Year · title`. On a stock server it resolves `paper`
+from the metadata alone. A server that caps chunks per document (the fork's
+`MAX_CHUNKS_PER_DOC`) returns at most that many passages of the paper per fallback call.
 
 ### Answer mode (`answer=True`)
 
@@ -243,10 +292,13 @@ python3 -m venv /tmp/zl-mcp-venv
 
 The tests cover citation compilation (every source listed, server order kept, key
 resolution, fallbacks), stripping of invented references (including keeping `### Sources
-of error`), mode validation, the `top_k` clamp, the `X-API-Key` header, the `/query/data`
-fallback and its timeout, error propagation with the server's explanation, unique note
-names for `add_note` (the fake refuses a repeated name with 409, as LightRAG does), and the
-stdio tool listing.
+of error`), mode validation, the `top_k` clamp and `passages`, the `X-API-Key` header, the
+`/query/data` fallback and its timeout, error propagation with the server's explanation,
+unique note names for `add_note` (the fake refuses a repeated name with 409, as LightRAG
+does), folding and the paper lookup (key confirmation, cache, ranking, cut lists, near
+matches), both `paper_passages` paths, the header strip (checked against
+`corpus/build_corpus.py` when it imports), duplicate passages, and the stdio tool listing
+with text-only results.
 
 Do not add an `__init__.py` to `tests/mcp/`. A test package named `mcp` would shadow the
 `mcp` SDK.

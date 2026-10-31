@@ -4,7 +4,7 @@ This module contains all graph-related routes for the LightRAG API.
 
 from typing import Optional, Dict, Any, Literal
 import traceback
-from fastapi import APIRouter, Depends, Query, HTTPException
+from fastapi import APIRouter, Depends, Query, HTTPException, Response
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from lightrag import zotero_citations, zotero_papers
@@ -216,6 +216,43 @@ class SourceLabelsRequest(BaseModel):
     file_paths: list[str] = Field(..., max_length=500)
 
 
+# Fork: every answer of the paper search and passages routes carries this, so a
+# client can tell a server with folded search, keys= and /graph/papers/passages
+# from an older one.
+_PAPER_SEARCH_HEADERS = {"X-Paper-Search": "2"}
+
+
+def _marked(exc: HTTPException) -> HTTPException:
+    exc.headers = {**(exc.headers or {}), **_PAPER_SEARCH_HEADERS}
+    return exc
+
+
+class PaperPassagesRequest(BaseModel):
+    keys: list[str] = Field(
+        ...,
+        min_length=1,
+        max_length=zotero_papers.MAX_PASSAGE_KEYS,
+        description="Zotero storage keys of the copies of ONE work",
+    )
+    question: str = Field(..., min_length=1)
+    top_n: int = Field(3, ge=1, le=8)
+
+    @field_validator("keys", mode="after")
+    @classmethod
+    def validate_keys(cls, keys: list[str]) -> list[str]:
+        keys = [k.strip().upper() for k in keys]
+        if not all(zotero_papers._KEY_RE.match(k) for k in keys):
+            raise ValueError("keys must be 8-character Zotero storage keys")
+        return keys
+
+    @field_validator("question", mode="after")
+    @classmethod
+    def validate_question(cls, question: str) -> str:
+        if not question.strip():
+            raise ValueError("question cannot be empty")
+        return question.strip()
+
+
 def create_graph_routes(rag, api_key: Optional[str] = None):
     # Fresh router per call. A module-level instance would accumulate
     # duplicate routes when the factory is invoked more than once in the
@@ -324,23 +361,75 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
 
     @router.get("/graph/papers/search", dependencies=[Depends(combined_auth)])
     async def search_papers(
-        q: str = Query(
-            ..., description="DOI, Zotero key, or words of the title, authors or year"
+        response: Response,
+        q: Optional[str] = Query(
+            None,
+            description="DOI, Zotero key, BibTeX key, or words of the title, authors or year",
         ),
-        limit: int = Query(20, description="Maximum papers to return", ge=1, le=100),
+        keys: Optional[str] = Query(
+            None,
+            description=f"Comma-separated Zotero storage keys (at most {zotero_papers.MAX_SEARCH_KEYS}): only the papers carrying one of them",
+        ),
+        limit: Optional[int] = Query(
+            None,
+            description="Maximum papers to return (default 20, with keys their number)",
+            ge=1,
+            le=100,
+        ),
     ):
         """Papers in the knowledge base matching ``q`` (fork; the WebUI's paper filter).
 
         Each result carries the paper id to pass to ``/graphs/paper`` (its DOI,
         else its Zotero key), a short citation, and how many of its references
-        are library papers and in the knowledge base.
+        are library papers and in the knowledge base. Words match with
+        typography folded on both sides; ``keys`` looks up several storage keys
+        in one request, and ``q`` may then be left out. Every answer carries
+        ``X-Paper-Search: 2``.
         """
+        response.headers.update(_PAPER_SEARCH_HEADERS)
+        key_list = None
+        if keys is not None:
+            key_list = [k.strip().upper() for k in keys.split(",") if k.strip()]
+            if len(key_list) > zotero_papers.MAX_SEARCH_KEYS:
+                raise _marked(
+                    HTTPException(
+                        status_code=422,
+                        detail=f"keys takes at most {zotero_papers.MAX_SEARCH_KEYS} storage keys",
+                    )
+                )
+        if q is None and not key_list:
+            raise _marked(
+                HTTPException(status_code=422, detail="q or keys is required")
+            )
+        if limit is None:
+            limit = len(key_list) if key_list else 20
         try:
-            return await zotero_papers.search_papers(rag, q, limit)
+            return await zotero_papers.search_papers(rag, q or "", limit, keys=key_list)
         except Exception as e:
             logger.error(f"Error searching papers with query '{q}': {str(e)}")
             logger.error(traceback.format_exc())
-            raise internal_server_error(e)
+            raise _marked(internal_server_error(e))
+
+    @router.post("/graph/papers/passages", dependencies=[Depends(combined_auth)])
+    async def get_paper_passages(request: PaperPassagesRequest, response: Response):
+        """The passages of one paper that best answer a question (fork).
+
+        ``keys`` name the copies of one work. Its chunks -- all of them for a
+        short work, else the best by vector similarity and by full-text rank,
+        both kept to the work -- are reranked against the bare ``question``;
+        the first chunk competes like any other. Returns ``keys`` (those in
+        the knowledge base), ``n_chunks`` (the work's chunks) and ``passages``
+        (best first, at most ``top_n``). Carries ``X-Paper-Search: 2``.
+        """
+        response.headers.update(_PAPER_SEARCH_HEADERS)
+        try:
+            return await zotero_papers.paper_passages(
+                rag, request.keys, request.question, request.top_n
+            )
+        except Exception as e:
+            logger.error(f"Error finding passages of {request.keys}: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise _marked(internal_server_error(e))
 
     @router.post("/graph/sources/labels", dependencies=[Depends(combined_auth)])
     async def get_source_labels(request: SourceLabelsRequest):

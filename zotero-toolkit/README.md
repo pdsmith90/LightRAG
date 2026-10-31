@@ -122,7 +122,10 @@ cd zotero-toolkit
    ```
 
    The agent then has `search_library`, `paper_passages`, `find_paper`, `add_note` and
-   `health`.
+   `health`. `find_paper` and `paper_passages` use the fork's `/graph/papers/search` and
+   `/graph/papers/passages` routes; against a stock LightRAG Server they fall back to
+   `zotero_metadata.json` and a plain query (see
+   [mcp/README.md](mcp/README.md#one-papers-passages-and-the-paper-lookup)).
 
 4. **Optional.** Put [`fronts/`](fronts/README.md) between LightRAG and its model servers
    if you have a second place to run a model. Run

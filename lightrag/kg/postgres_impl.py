@@ -3735,6 +3735,27 @@ class PGKVStorage(BaseKVStorage):
         )
         return [dict(row) for row in rows or []]
 
+    async def rank_chunks_by_text(
+        self, ids: list[str], query: str, limit: int
+    ) -> list[str]:
+        """Up to ``limit`` of the chunks ``ids`` that hold one of the query's
+        terms, best ``ts_rank`` first (fork; POST /graph/papers/passages).
+
+        The ranking covers the given chunks alone, so a caller can rank one
+        work's chunks. The terms are OR-ed as in ``get_chunks_for_works``; a
+        query made only of stop words ranks nothing. Text-chunk namespace only.
+        """
+        if not ids or limit <= 0 or not (query or "").strip():
+            return []
+        if not is_namespace(self.namespace, NameSpace.KV_STORE_TEXT_CHUNKS):
+            return []
+        rows = await self.db.query(
+            SQL_TEMPLATES["rank_chunks_by_text_text_chunks"],
+            [self.workspace, list(ids), query, limit],
+            multirows=True,
+        )
+        return [row["id"] for row in rows or []]
+
     async def filter_keys(self, keys: set[str]) -> set[str]:
         """Filter out duplicated content"""
         if not keys:
@@ -5656,6 +5677,61 @@ class PGVectorStorage(BaseVectorStorage):
             logger.error(f"[{self.workspace}] Error getting vectors: {e}")
 
         return result
+
+    async def rank_ids_by_vector(
+        self, ids: list[str], query_embedding, limit: int
+    ) -> dict[str, float]:
+        """Cosine similarity to ``query_embedding`` of the ``limit`` nearest of
+        the chunks ``ids``, nearest first (fork; POST /graph/papers/passages).
+
+        The ranking runs in SQL over the given ids alone, so a long work ships
+        ``limit`` rows rather than every vector it holds. The ids are read
+        first (MATERIALIZED) and sorted exactly: an index scan ordered by
+        distance would apply the id filter after the fact and return few or
+        none of them. Vectors still in the upsert buffer are read from it, as
+        ``get_vectors_by_ids`` does.
+        """
+        if not ids or limit <= 0:
+            return {}
+        buffered = [i for i in ids if i in self._pending_vector_docs]
+        stored = [
+            i
+            for i in ids
+            if i not in self._pending_vector_docs
+            and i not in self._pending_vector_deletes
+        ]
+        sims: dict[str, float] = {}
+        if stored:
+            vector_cast = (
+                "halfvec"
+                if getattr(self.db, "vector_index_type", None) == "HNSW_HALFVEC"
+                else "vector"
+            )
+            sql = (
+                f"WITH c AS MATERIALIZED (SELECT id, content_vector "
+                f"FROM {self.table_name} WHERE workspace = $1 AND id = ANY($2)) "
+                f"SELECT id, content_vector <=> $3::{vector_cast} AS distance "
+                f"FROM c ORDER BY distance LIMIT $4"
+            )
+            try:
+                rows = await self.db.query(
+                    sql,
+                    [self.workspace, stored, query_embedding, limit],
+                    multirows=True,
+                )
+            except Exception as e:
+                logger.error(f"[{self.workspace}] Error ranking vectors by id: {e}")
+                rows = []
+            for row in rows or []:
+                sims[row["id"]] = 1.0 - float(row["distance"])
+        if buffered:
+            q = np.asarray(query_embedding, dtype=np.float64).reshape(-1)
+            for chunk_id, vector in (await self.get_vectors_by_ids(buffered)).items():
+                v = np.asarray(vector, dtype=np.float64)
+                norm = np.linalg.norm(v) * np.linalg.norm(q)
+                sims[chunk_id] = float(v @ q / norm) if norm > 0 else 0.0
+        best = sorted(sims, key=lambda i: -sims[i])[:limit]
+        return {i: sims[i] for i in best}
 
     async def drop(self) -> dict[str, str]:
         """Drop all rows scoped to this storage's workspace.
@@ -10239,6 +10315,24 @@ SQL_TEMPLATES = {
                 )
                 SELECT id, full_doc_id, file_path, content, chunk_order_index, work
                 FROM ranked WHERE rn <= $4 ORDER BY work, rn
+            """,
+    # Fork: the full-text leg of POST /graph/papers/passages
+    # (PGKVStorage.rank_chunks_by_text). $1 workspace, $2 chunk ids, $3 query
+    # text, $4 limit. The query's lexemes are OR-ed; the chunks are looked up by
+    # primary key, and MATERIALIZED parses each of them once.
+    "rank_chunks_by_text_text_chunks": """WITH q AS (
+                    SELECT string_agg(quote_literal(lex), ' | ')::tsquery AS tq
+                    FROM unnest(tsvector_to_array(to_tsvector('english', $3))) AS lex
+                ),
+                c AS MATERIALIZED (
+                    SELECT c.id, c.chunk_order_index, to_tsvector('english', c.content) AS tsv
+                    FROM LIGHTRAG_DOC_CHUNKS c
+                    WHERE c.workspace = $1 AND c.id = ANY($2)
+                )
+                SELECT c.id FROM c, q
+                WHERE q.tq IS NOT NULL AND c.tsv @@ q.tq
+                ORDER BY ts_rank(c.tsv, q.tq) DESC, c.chunk_order_index
+                LIMIT $4
             """,
     # The GIN index lexical_search_text_chunks needs; matched by definition, not name.
     "lexical_index_text_chunks": """SELECT 1 FROM pg_indexes

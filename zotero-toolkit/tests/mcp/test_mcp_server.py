@@ -201,6 +201,7 @@ def test_context_lists_every_source_in_server_order_before_context(
         "query": "attention",
         "mode": "mix",
         "top_k": 10,
+        "chunk_top_k": 8,
         "only_need_context": True,
     }
 
@@ -280,14 +281,15 @@ def test_passage_labels_prefer_creators_then_the_server_citation(
         },
         {"reference_id": "3", "file_path": "meeting notes.txt"},
     ]
-    chunks = [{"reference_id": n, "content": "t"} for n in ("1", "2", "3")]
+    # Distinct texts: identical ones would be shown once, as duplicate copies.
+    chunks = [{"reference_id": n, "content": f"t{n}"} for n in ("1", "2", "3")]
     fake_lightrag.routes[("POST", "/query")] = _answer_route(
         _context_text(chunks), refs
     )
     out = load_server().search_library("q")
-    assert "[1] He 2016\nt" in out
-    assert "[2] Vaswani 2017\nt" in out
-    assert "[3] meeting notes.txt\nt" in out
+    assert "[1] He 2016\nt1" in out
+    assert "[2] Vaswani 2017\nt2" in out
+    assert "[3] meeting notes.txt\nt3" in out
 
 
 def test_include_graph_appends_entities_and_relations(fake_lightrag, load_server):
@@ -393,10 +395,11 @@ def test_find_paper_moves_items_the_exact_key_lookup_knows(fake_lightrag, load_s
     assert "- BBBB0002 · He, Kaiming" in indexed and "(none)" in zotero
 
 
-def test_find_paper_without_a_match_says_absent(fake_lightrag, load_server):
+def test_find_paper_without_a_match_says_what_else_to_try(fake_lightrag, load_server):
     fake_lightrag.routes[("GET", "/graph/papers/search")] = lambda params: (200, [])
-    out = load_server().find_paper("Brashears 2016")
-    assert "Neither the index nor the corpus metadata" in out
+    out = load_server().find_paper("Nobody 2016")
+    assert "No indexed paper or Zotero item contains every word" in out
+    assert "a wrong year" in out
 
 
 def test_find_paper_on_a_stock_server_reports_the_index_unknown(
@@ -455,14 +458,15 @@ def test_paper_passages_returns_only_that_papers_passages(fake_lightrag, load_se
         and "Identity shortcuts add no parameters." in out
     )
     assert "Attention is all you need." not in out
+    # The server has no /graph/papers/passages (404), so the proxy queries /query.
+    assert len(fake_lightrag.calls("/graph/papers/passages")) == 1
     assert out.endswith(
         "### Other papers the question matched (no passages shown)\n"
-        f"- [2] {VASWANI_PAPER['citation']} [zotero://select/library/items/AAAA0001]"
+        "- AAAA0001 · Vaswani 2017 · Attention Is All You Need"
     )
     body = fake_lightrag.calls("/query")[0]["json"]
     assert body == {
-        "query": "He 2016 Deep Residual Learning for Image Recognition: "
-        "do shortcuts add parameters",
+        "query": "He 2016: do shortcuts add parameters",
         "mode": "naive",
         "top_k": 10,
         "only_need_context": True,
@@ -509,7 +513,10 @@ def test_paper_passages_without_a_passage_of_the_paper_says_so(
     )
     out = load_server().paper_passages("AAAA0001", "q")
     assert "No passage of this paper ranked for the question" in out
-    assert "Residual." not in out and "- [1] Kaiming He" in out
+    assert "Residual." not in out
+    assert out.endswith(
+        "- BBBB0002 · Kaiming He 2016 · Deep Residual Learning for Image Recognition"
+    )
 
 
 def test_paper_passages_on_a_stock_server_resolves_from_metadata(
@@ -524,7 +531,7 @@ def test_paper_passages_on_a_stock_server_resolves_from_metadata(
     assert out.startswith(f"### {VASWANI}")
     assert "[1] Ashish Vaswani 2017\nAttention." in out
     query = fake_lightrag.calls("/query")[0]["json"]["query"]
-    assert query == "Ashish Vaswani 2017 Attention Is All You Need: q"
+    assert query == "Ashish Vaswani 2017: q"
 
 
 def test_answer_replaces_invented_references_with_compiled_sources(

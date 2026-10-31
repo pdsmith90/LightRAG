@@ -25,6 +25,7 @@ starting with [README.md](./README.md), applies as written.
 | [One unusable multimodal analysis degrades its item](#one-unusable-multimodal-analysis-degrades-its-item) | none | always active |
 | [Named-work pin and notice](#named-work-pin-and-notice) | `NAMED_WORK_PIN`, `NAMED_WORK_NOTICE` | `false`, `false` |
 | [Paper filter in the graph view](#paper-filter-in-the-graph-view) | none; reference lists via `ZOTERO_REFERENCES` | always active |
+| [Paper lookup that forgives typography, and one paper's passages](#paper-lookup-that-forgives-typography-and-one-papers-passages) | none | always active |
 | WebUI query defaults for new browser profiles: `top_k` 10, `chunk_top_k` 12, entity/relation tokens 1500, total tokens 7000 (`lightrag_webui/src/stores/querySettings.ts`) | none | always active |
 
 ### Reference lists compiled from Zotero metadata
@@ -318,6 +319,48 @@ refresh, retries and the label history work as for an entity. Endpoints:
 `GET /graphs/paper?paper=<id>[&paper=<id>...]&mode=paper|shared|common&context=own|kb|linked`
 (`context` defaults to `own`). Code: `lightrag/zotero_papers.py`,
 `lightrag_webui/src/components/graph/PaperFilter.tsx`, `lightrag_webui/src/lib/paperFilter.ts`.
+
+### Paper lookup that forgives typography, and one paper's passages
+
+`GET /graph/papers/search` matches with both the query and each paper's title,
+authors, year, DOI and key folded the same way: accents and other combining marks
+dropped, the letters Unicode decomposition keeps whole spelled in ASCII (ı ł ø đ ð ß
+æ œ þ), every dash and the soft hyphen read as `-`, apostrophes and primes deleted,
+lowercased. A query word, without its leading and trailing punctuation (brackets, `*`,
+straight and curly quotes, guillemets; a token left with no letter or digit, such as the
+` - ` of `Author - Year - Title` or an `&`, is no word; the `et al` after a name, as in
+`Doe et al. (2011)`, is dropped), matches when
+it occurs in the folded text, when its hyphen-less form occurs in the text without
+hyphens, or when every part of it split on `-` or `/` occurs (a DOI query is matched
+whole). So `trefoil-fo`, `trefoilfo` and `orchards` find titles typeset with U+2010 hyphens
+or a curly apostrophe. A token shaped like a BibTeX key (`doePruningOrchardsAppleTrees2001`)
+is read as its family name, its camel-case title words (matched against the text with
+everything but letters and digits removed) and its year. The MCP proxy's `find_paper`
+carries the same rule; `zotero-toolkit/tests/mcp/paper_search_cases.json` holds the
+fold, word and lookup cases that both test suites run. `keys=K1,K2,...` (at most
+50 storage keys) lists the indexed papers carrying any of them in one request, with
+or without `q`; an indexed key without metadata is listed too. The scan runs off the
+event loop over haystacks folded once per document-list or metadata change, and the
+processed-document list is read at most every five minutes, one read shared by
+concurrent requests and later refreshes run behind the request.
+
+`POST /graph/papers/passages` with `{"keys": [...], "question": "...", "top_n": 3}`
+(1 to 10 storage keys, all copies of one work; `top_n` 1 to 8) returns that work's
+best passages for the question: `keys` (those in the knowledge base), `n_chunks` (the
+chunks of the work's longest copy, so `chunk_order_index` + 1 of `n_chunks` holds), and
+`passages` with `key`, `file_path`, `chunk_id`, `chunk_order_index`, `content`,
+`content_headings` and `score`. A work of up to 60 chunks offers all of them; a longer
+one the 40 closest to the question by the stored chunk vectors (ranked among the work's
+own chunk ids, in SQL on Postgres, so 40 rows come back however long the work is) and the 40 best by Postgres full-text rank over the
+work's chunk ids (other storages: the vector leg alone). Reference lists drop out under
+`DROP_BIBLIOGRAPHY_CHUNKS`, a text two copies share counts once, and the server's
+reranker orders the candidates (at most 80) against the bare question; without a
+reranker, or when it fails, the vector similarity does (logged). The first chunk, with
+its metadata header, competes like any other: `/query`'s author-year leg and the
+named-work pin, which always bring it, are not involved. Both routes answer with the
+header `X-Paper-Search: 2` (a FastAPI request-validation 422 carries none). Code:
+`lightrag/zotero_papers.py`, `PGKVStorage.rank_chunks_by_text`,
+`PGVectorStorage.rank_ids_by_vector`.
 
 ### PostgreSQL edge removal in plain SQL
 

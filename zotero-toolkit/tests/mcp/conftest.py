@@ -92,7 +92,8 @@ class FakeLightRAG:
                 # GET routes answer from the query string, POST routes from the body.
                 if method == "GET" and route:
                     body = dict(parse_qsl(url.query))
-                status, payload = (
+                # A route answers (status, payload) or (status, payload, headers).
+                status, payload, *extra = (
                     route(body) if route else (404, {"detail": "Not Found"})
                 )
                 data = (
@@ -103,6 +104,8 @@ class FakeLightRAG:
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(data)))
+                for name, value in (extra[0] if extra else {}).items():
+                    self.send_header(name, value)
                 self.end_headers()
                 self.wfile.write(data)
 
