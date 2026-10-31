@@ -63,7 +63,8 @@ def test_stdio_lists_tools_and_compiles_citations(
     )
     assert {t.name for t in tools.tools} == {
         "search_library",
-        "get_sources",
+        "paper_passages",
+        "find_paper",
         "add_note",
         "health",
     }

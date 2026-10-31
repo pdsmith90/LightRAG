@@ -121,7 +121,8 @@ cd zotero-toolkit
      -- /absolute/path/to/.venv/bin/python /absolute/path/to/mcp/lightrag_mcp_server.py
    ```
 
-   The agent then has `search_library`, `get_sources`, `add_note` and `health`.
+   The agent then has `search_library`, `paper_passages`, `find_paper`, `add_note` and
+   `health`.
 
 4. **Optional.** Put [`fronts/`](fronts/README.md) between LightRAG and its model servers
    if you have a second place to run a model. Run

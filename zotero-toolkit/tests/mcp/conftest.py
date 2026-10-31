@@ -16,6 +16,7 @@ import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qsl, urlsplit
 
 import pytest
 
@@ -76,15 +77,21 @@ class FakeLightRAG:
                 n = int(self.headers.get("Content-Length") or 0)
                 raw = self.rfile.read(n) if n else b""
                 body = json.loads(raw) if raw else None
+                url = urlsplit(self.path)
                 fake.requests.append(
                     {
                         "method": method,
-                        "path": self.path,
+                        "path": url.path,
+                        "url": self.path,
+                        "params": dict(parse_qsl(url.query)),
                         "headers": {k.lower(): v for k, v in self.headers.items()},
                         "json": body,
                     }
                 )
-                route = fake.routes.get((method, self.path))
+                route = fake.routes.get((method, url.path))
+                # GET routes answer from the query string, POST routes from the body.
+                if method == "GET" and route:
+                    body = dict(parse_qsl(url.query))
                 status, payload = (
                     route(body) if route else (404, {"detail": "Not Found"})
                 )
@@ -172,6 +179,7 @@ def load_server(monkeypatch, fake_lightrag, metadata_file):
             "LIGHTRAG_MCP_REF_FALLBACK_TIMEOUT",
             "LIGHTRAG_MCP_HEALTH_TIMEOUT",
             "LIGHTRAG_MCP_MAX_TOP_K",
+            "LIGHTRAG_MCP_MAX_CHARS",
         ):
             monkeypatch.delenv(name, raising=False)
         for name, value in base.items():

@@ -10,9 +10,10 @@ into real bibliographic citations using Zotero metadata. The LLM never writes th
 
 | Tool | What it returns |
 |---|---|
-| `search_library(query, mode="mix", top_k=10, answer=False)` | Compiled citations **first**, then the retrieved context (entities, relations, source passages). No answer is generated, so it is faster. A client that truncates long tool results still keeps the citations. |
+| `search_library(query, mode="mix", top_k=10, answer=False, include_graph=False)` | Compiled citations **first**, then the retrieved passages as plain text, each headed `[n] Family Year · section` (see [Retrieved passages](#retrieved-passages)). No answer is generated, so it is faster. `include_graph=True` appends the knowledge-graph entities and relations. |
 | `search_library(..., answer=True)` | The server's synthesized answer. Any reference section the model wrote is stripped, and a `### Sources (compiled from retrieval)` list is appended. |
-| `get_sources(query, mode="mix", top_k=10)` | The raw retrieved context, then the compiled citations. |
+| `paper_passages(paper, question)` | The passages of **one** paper that best match `question`, under that paper's citation, then the other papers the question matched (citations only). `paper` is a Zotero key, a DOI, or words that must all occur in the title, authors or year. If no indexed paper or several match, it lists them instead of querying. |
+| `find_paper(paper)` | An exact lookup with the same `paper` forms: the matching papers that are indexed, then the Zotero items that match but are not. No retrieval and no LLM. |
 | `add_note(text, description="")` | Inserts a text note into the knowledge base (`POST /documents/text`) under a unique document name (see below). |
 | `health()` | The server's `/health` status, or `unreachable at <url>: <error>`. |
 
@@ -67,6 +68,36 @@ The proxy checks the file for changes when compiling citations and reloads it wi
 restart. An atomic replacement takes effect on the next request. If the file becomes
 unreadable, the last valid metadata is retained until it recovers; if it was absent at
 startup, citations fall back to de-slugged file names until the file appears.
+
+### Retrieved passages
+
+A context-only `/query` response carries the knowledge-graph entities, the relations, the
+document chunks (one JSON object per line: `reference_id`, `content` and, on newer
+servers, `content_headings`) and the server's own reference list. `search_library`
+returns the compiled citations, then each chunk in the server's ranked order as plain
+text, headed by its `[n]`, the first author's family name and year (from `creators`, else
+the server's `citation`, else `authors`) and its section path. The label keeps the
+passages of several same-topic papers apart. The entities and relations follow only
+with `include_graph=True`, and the server's reference list is dropped because the
+compiled citations replace it. When the result would exceed `LIGHTRAG_MCP_MAX_CHARS`,
+the lowest-ranked passages are left out and a closing line says how many. A response in
+any other layout is passed through whole after the citations.
+
+### One paper's passages and the paper lookup
+
+`find_paper` asks `GET /graph/papers/search?q=…&limit=100` (the zlightrag fork's paper
+lookup, which lists processed documents only) which papers are indexed, and matches the
+same words against `zotero_metadata.json`. A metadata entry is reported as not indexed
+only after the server, asked for that entry's exact key, does not return it either; one
+copy is listed per DOI. When the server finds 100 papers its list may be cut, so the
+Zotero-only list is withheld and the answer asks for a narrower lookup. On a stock
+LightRAG Server the route answers 404, and the index status is reported as unknown.
+
+`paper_passages` resolves `paper` the same way, then sends a `naive` context-only query
+that starts with the paper's first author, year and title, followed by the question, and
+keeps only the chunks of that paper's keys. On a stock server it resolves `paper` from
+the metadata alone. A server that caps chunks per document (the fork's
+`MAX_CHUNKS_PER_DOC`) returns at most that many passages of the paper per call.
 
 ### Answer mode (`answer=True`)
 
@@ -129,6 +160,7 @@ Every setting is an environment variable, set in the MCP client's server entry.
 | `LIGHTRAG_MCP_REF_FALLBACK_TIMEOUT` | `90` | Seconds allowed for the `/query/data` reference fallback in answer mode. |
 | `LIGHTRAG_MCP_HEALTH_TIMEOUT` | `15` | Seconds allowed for `health()`. |
 | `LIGHTRAG_MCP_MAX_TOP_K` | `40` | Upper bound for `top_k`. Requests above it are lowered to it, and values below 1 are raised to 1 (the server rejects them). |
+| `LIGHTRAG_MCP_MAX_CHARS` | `48000` | Longest retrieved-passages result, in characters. Claude Code saves a tool result over 50,000 characters to a file and shows the agent a 2 KB preview, so the default keeps results inline there. |
 
 **Choosing `LIGHTRAG_MCP_MAX_TOP_K`.** The default equals LightRAG's own default `TOP_K`, so
 a stock server sees nothing it would not use anyway. On a server with a trimmed token

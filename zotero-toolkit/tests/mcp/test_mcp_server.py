@@ -69,14 +69,14 @@ def test_cite_renders_creators_as_family_comma_given(load_server, metadata_file)
     assert srv._cite("BBBB0002__x.md") == HE  # no creators: authors verbatim
 
 
-def test_get_sources_uses_creators_when_present(
+def test_context_citations_use_creators_when_present(
     fake_lightrag, load_server, metadata_file
 ):
     data = json.loads(metadata_file.read_text(encoding="utf-8"))
     data["BBBB0002"]["creators"] = [["He", "Kaiming"], ["Sun", "Jian"]]
     metadata_file.write_text(json.dumps(data), encoding="utf-8")
     fake_lightrag.routes[("POST", "/query")] = _answer_route("CTX", REFERENCES[:1])
-    out = load_server().get_sources("q")
+    out = load_server().search_library("q")
     assert "- [1] He, Kaiming; Sun, Jian. (2016). Deep Residual" in out
 
 
@@ -212,15 +212,319 @@ def test_context_without_references_is_just_the_context(fake_lightrag, load_serv
     assert fake_lightrag.calls("/query/data") == []
 
 
-def test_get_sources_puts_citations_after_context(fake_lightrag, load_server):
-    fake_lightrag.routes[("POST", "/query")] = _answer_route("RAW CONTEXT", REFERENCES)
-    srv = load_server()
-    out = srv.get_sources("q", mode="local", top_k=5)
-    assert out == (
-        "RAW CONTEXT\n\n### Retrieved documents (compiled citations)\n"
-        + "\n".join(COMPILED)
+GRAPH = (
+    "Knowledge Graph Data (Entity):\n\n```json\n"
+    '{"entity": "Mar.", "type": "concept", "description": "The month of March."}\n'
+    "```\n\nKnowledge Graph Data (Relationship):\n\n```json\n"
+    '{"entity1": "ResNet", "entity2": "ImageNet", "description": "evaluated on"}\n'
+    "```\n\n"
+)
+
+
+def _context_text(chunks, graph=GRAPH):
+    """A context-only response in stock LightRAG's layout."""
+    lines = "\n".join(json.dumps(c, ensure_ascii=False) for c in chunks)
+    return (
+        f"\n{graph}Document Chunks (Each entry has a reference_id refer to the "
+        f"`Reference Document List`):\n\n```json\n{lines}\n```\n\n"
+        "Reference Document List (Each entry starts with a [reference_id]):\n\n"
+        "```\n[1] Deep Residual Learning\n[2] Attention Is All You Need\n```\n\n"
     )
-    assert fake_lightrag.calls("/query")[0]["json"]["only_need_context"] is True
+
+
+CHUNKS = [
+    {
+        "reference_id": "1",
+        "content": "Residual learning eases “very deep” training.",
+        "content_headings": "Deep Residual Learning → 1 Introduction",
+    },
+    {"reference_id": "2", "content": "Attention is all you need.\n"},
+    {"reference_id": "1", "content": "Identity shortcuts add no parameters."},
+]
+
+
+def test_context_renders_citations_then_labelled_passages_without_graph(
+    fake_lightrag, load_server
+):
+    fake_lightrag.routes[("POST", "/query")] = _answer_route(
+        _context_text(CHUNKS), REFERENCES[:2]
+    )
+    out = load_server().search_library("q")
+    assert out == (
+        "### Retrieved documents (compiled citations)\n"
+        + "\n".join(COMPILED[:2])
+        + "\n\n### Passages (the server's ranked order; [n] is the document listed above)"
+        "\n\n[1] Kaiming He 2016 · Deep Residual Learning → 1 Introduction\n"
+        "Residual learning eases “very deep” training."
+        "\n\n[2] Ashish Vaswani 2017\nAttention is all you need."
+        "\n\n[1] Kaiming He 2016\nIdentity shortcuts add no parameters."
+    )
+    # The graph, the chunk JSON and the server's own reference list are gone.
+    for gone in ("Knowledge Graph", "Mar.", '{"reference_id"', "Reference Document"):
+        assert gone not in out
+
+
+def test_passage_labels_prefer_creators_then_the_server_citation(
+    fake_lightrag, load_server, metadata_file
+):
+    data = json.loads(metadata_file.read_text(encoding="utf-8"))
+    data["BBBB0002"]["creators"] = [["He", "Kaiming"]]
+    del data["AAAA0001"]
+    metadata_file.write_text(json.dumps(data), encoding="utf-8")
+    refs = [
+        {"reference_id": "1", "file_path": "BBBB0002__x.md"},
+        {
+            "reference_id": "2",
+            "file_path": "AAAA0001__x.md",
+            "citation": "Vaswani, Ashish; Shazeer, Noam. (2017). Attention.",
+        },
+        {"reference_id": "3", "file_path": "meeting notes.txt"},
+    ]
+    chunks = [{"reference_id": n, "content": "t"} for n in ("1", "2", "3")]
+    fake_lightrag.routes[("POST", "/query")] = _answer_route(
+        _context_text(chunks), refs
+    )
+    out = load_server().search_library("q")
+    assert "[1] He 2016\nt" in out
+    assert "[2] Vaswani 2017\nt" in out
+    assert "[3] meeting notes.txt\nt" in out
+
+
+def test_include_graph_appends_entities_and_relations(fake_lightrag, load_server):
+    fake_lightrag.routes[("POST", "/query")] = _answer_route(
+        _context_text(CHUNKS), REFERENCES[:2]
+    )
+    out = load_server().search_library("q", include_graph=True)
+    assert out.endswith(GRAPH.strip())
+    assert out.index("### Passages") < out.index("Knowledge Graph Data (Entity)")
+
+
+def test_context_leaves_out_lowest_ranked_passages_past_the_cap(
+    fake_lightrag, load_server
+):
+    chunks = [
+        {"reference_id": "1", "content": f"passage {i} " + "x" * 400} for i in range(10)
+    ]
+    fake_lightrag.routes[("POST", "/query")] = _answer_route(
+        _context_text(chunks), REFERENCES[:1]
+    )
+    out = load_server(LIGHTRAG_MCP_MAX_CHARS="2500").search_library("q")
+    assert len(out) <= 2500
+    kept = re.findall(r"passage (\d) ", out)
+    assert kept == [str(i) for i in range(len(kept))] and 0 < len(kept) < 10
+    assert f"[{10 - len(kept)} lower-ranked passage(s) left out" in out
+
+
+def test_unknown_context_format_passes_through_whole(fake_lightrag, load_server):
+    ctx = "Some server's free-form context\n" + "y" * 60000
+    fake_lightrag.routes[("POST", "/query")] = _answer_route(ctx, REFERENCES[:1])
+    out = load_server().search_library("q")
+    assert (
+        out == f"### Retrieved documents (compiled citations)\n{COMPILED[0]}\n\n{ctx}"
+    )
+
+
+# --- paper lookup and one paper's passages ------------------------------------------
+
+VASWANI_PAPER = {
+    "paper": "10.48550/arxiv.1706.03762",
+    "doi": "10.48550/arxiv.1706.03762",
+    "keys": ["AAAA0001"],
+    "title": "Attention Is All You Need",
+    "citation": "Vaswani, Ashish; Shazeer, Noam et al. (2017). Attention Is All You Need",
+    "year": "2017",
+}
+HE_PAPER = {
+    "paper": "10.1109/cvpr.2016.90",
+    "doi": "10.1109/cvpr.2016.90",
+    "keys": ["BBBB0002"],
+    "title": "Deep Residual Learning for Image Recognition",
+    "citation": "He, Kaiming; Zhang, Xiangyu et al. (2016). Deep Residual Learning",
+    "year": "2016",
+}
+
+
+def _papers_route(index):
+    """The fork's /graph/papers/search over the given indexed papers: an exact key
+    or DOI, else every word in the title, citation or year."""
+
+    def route(params):
+        q = params.get("q", "")
+        exact = [p for p in index if q.upper() in p["keys"] or q.lower() == p["doi"]]
+        words = q.lower().split()
+        loose = [
+            p
+            for p in index
+            if all(
+                w in f"{p['title']} {p['citation']} {p['year']}".lower() for w in words
+            )
+        ]
+        return 200, exact or loose
+
+    return route
+
+
+def test_find_paper_separates_indexed_from_zotero_only(fake_lightrag, load_server):
+    fake_lightrag.routes[("GET", "/graph/papers/search")] = _papers_route(
+        [VASWANI_PAPER]
+    )
+    out = load_server().find_paper("learning")  # only He et al. has it in the title
+    indexed, zotero = out.split("In Zotero but NOT indexed")
+    assert "AAAA0001" not in indexed and "BBBB0002" not in indexed
+    assert "(none)" in indexed
+    assert "- BBBB0002 · Kaiming He et al. (2016). Deep Residual Learning" in zotero
+    out = load_server().find_paper("10.48550/arXiv.1706.03762")
+    indexed, zotero = out.split("In Zotero but NOT indexed")
+    assert "- AAAA0001 · Vaswani, Ashish; Shazeer, Noam et al. (2017)." in indexed
+    assert "(none)" in zotero
+    lookups = fake_lightrag.calls("/graph/papers/search")
+    assert lookups[0]["params"] == {"q": "learning", "limit": "100"}
+    # BBBB0002 was asked for by its exact key before being called not indexed.
+    assert {"q": "BBBB0002", "limit": "100"} in [r["params"] for r in lookups]
+
+
+def test_find_paper_moves_items_the_exact_key_lookup_knows(fake_lightrag, load_server):
+    def route(params):
+        return 200, [HE_PAPER] if params["q"] == "BBBB0002" else []
+
+    fake_lightrag.routes[("GET", "/graph/papers/search")] = route
+    out = load_server().find_paper("deep residual")
+    indexed, zotero = out.split("In Zotero but NOT indexed")
+    assert "- BBBB0002 · He, Kaiming" in indexed and "(none)" in zotero
+
+
+def test_find_paper_without_a_match_says_absent(fake_lightrag, load_server):
+    fake_lightrag.routes[("GET", "/graph/papers/search")] = lambda params: (200, [])
+    out = load_server().find_paper("Brashears 2016")
+    assert "Neither the index nor the corpus metadata" in out
+
+
+def test_find_paper_on_a_stock_server_reports_the_index_unknown(
+    fake_lightrag, load_server
+):
+    out = load_server().find_paper("attention")  # no route: the fake answers 404
+    assert "Index status unknown" in out
+    assert "- AAAA0001 · Ashish Vaswani et al. (2017). Attention Is All You Need" in out
+
+
+def test_find_paper_with_too_many_indexed_matches_lists_no_zotero_items(
+    fake_lightrag, load_server
+):
+    many = [dict(VASWANI_PAPER, paper=f"p{i}", keys=[f"K{i:07d}"]) for i in range(100)]
+    fake_lightrag.routes[("GET", "/graph/papers/search")] = lambda params: (200, many)
+    out = load_server().find_paper("attention")
+    assert "100 or more indexed papers match" in out
+    assert "NOT indexed" not in out and "… and 90 more" in out
+    assert len(fake_lightrag.calls("/graph/papers/search")) == 1
+
+
+def test_paper_lookup_errors_become_tool_errors(fake_lightrag, load_server):
+    fake_lightrag.routes[("GET", "/graph/papers/search")] = lambda params: (
+        500,
+        {"detail": "doc status unavailable"},
+    )
+    with pytest.raises(ToolError, match="doc status unavailable"):
+        load_server().find_paper("attention")
+
+
+def test_paper_passages_returns_only_that_papers_passages(fake_lightrag, load_server):
+    fake_lightrag.routes[("GET", "/graph/papers/search")] = _papers_route(
+        [VASWANI_PAPER, HE_PAPER]
+    )
+    refs = [
+        {
+            "reference_id": "1",
+            "file_path": "BBBB0002__Deep.md",
+            "citation": HE_PAPER["citation"],
+        },
+        {
+            "reference_id": "2",
+            "file_path": "AAAA0001__Attention.md",
+            "citation": VASWANI_PAPER["citation"],
+        },
+    ]
+    fake_lightrag.routes[("POST", "/query")] = _answer_route(
+        _context_text(CHUNKS), refs
+    )
+    out = load_server().paper_passages("BBBB0002", "do shortcuts add parameters")
+    assert out.startswith(
+        f"### {HE_PAPER['citation']} [zotero://select/library/items/BBBB0002]"
+    )
+    assert (
+        "Residual learning eases" in out
+        and "Identity shortcuts add no parameters." in out
+    )
+    assert "Attention is all you need." not in out
+    assert out.endswith(
+        "### Other papers the question matched (no passages shown)\n"
+        f"- [2] {VASWANI_PAPER['citation']} [zotero://select/library/items/AAAA0001]"
+    )
+    body = fake_lightrag.calls("/query")[0]["json"]
+    assert body == {
+        "query": "He 2016 Deep Residual Learning for Image Recognition: "
+        "do shortcuts add parameters",
+        "mode": "naive",
+        "top_k": 10,
+        "only_need_context": True,
+    }
+
+
+def test_paper_passages_with_several_matches_lists_them_and_does_not_search(
+    fake_lightrag, load_server
+):
+    fake_lightrag.routes[("GET", "/graph/papers/search")] = _papers_route(
+        [VASWANI_PAPER, HE_PAPER]
+    )
+    out = load_server().paper_passages("al.", "q")  # both citations contain "al."
+    assert "needs exactly one indexed paper" in out
+    assert "AAAA0001" in out and "BBBB0002" in out
+    assert fake_lightrag.calls("/query") == []
+
+
+def test_paper_passages_for_an_unindexed_paper_says_so_and_does_not_search(
+    fake_lightrag, load_server
+):
+    fake_lightrag.routes[("GET", "/graph/papers/search")] = _papers_route(
+        [VASWANI_PAPER]
+    )
+    out = load_server().paper_passages("residual", "q")
+    assert (
+        "- BBBB0002 · Kaiming He et al. (2016)"
+        in out.split("In Zotero but NOT indexed")[1]
+    )
+    assert "needs exactly one" not in out
+    assert fake_lightrag.calls("/query") == []
+
+
+def test_paper_passages_without_a_passage_of_the_paper_says_so(
+    fake_lightrag, load_server
+):
+    fake_lightrag.routes[("GET", "/graph/papers/search")] = _papers_route(
+        [VASWANI_PAPER, HE_PAPER]
+    )
+    refs = [{"reference_id": "1", "file_path": "BBBB0002__Deep.md"}]
+    chunks = [{"reference_id": "1", "content": "Residual."}]
+    fake_lightrag.routes[("POST", "/query")] = _answer_route(
+        _context_text(chunks), refs
+    )
+    out = load_server().paper_passages("AAAA0001", "q")
+    assert "No passage of this paper ranked for the question" in out
+    assert "Residual." not in out and "- [1] Kaiming He" in out
+
+
+def test_paper_passages_on_a_stock_server_resolves_from_metadata(
+    fake_lightrag, load_server
+):
+    refs = [{"reference_id": "1", "file_path": "AAAA0001__x.md"}]
+    chunks = [{"reference_id": "1", "content": "Attention."}]
+    fake_lightrag.routes[("POST", "/query")] = _answer_route(
+        _context_text(chunks), refs
+    )
+    out = load_server().paper_passages("10.48550/arXiv.1706.03762", "q")
+    assert out.startswith(f"### {VASWANI}")
+    assert "[1] Ashish Vaswani 2017\nAttention." in out
+    query = fake_lightrag.calls("/query")[0]["json"]["query"]
+    assert query == "Ashish Vaswani 2017 Attention Is All You Need: q"
 
 
 def test_answer_replaces_invented_references_with_compiled_sources(
@@ -337,7 +641,7 @@ def test_strip_resumes_prose_after_the_reference_block(load_server):
 def test_valid_modes_pass_through(fake_lightrag, load_server, mode):
     srv = load_server()
     srv.search_library("q", mode=mode)
-    srv.get_sources("q", mode=mode)
+    srv.search_library("q", mode=mode, answer=True)
     assert [c["json"]["mode"] for c in fake_lightrag.calls("/query")] == [mode, mode]
 
 
@@ -346,7 +650,6 @@ def test_invalid_modes_fall_back_to_mix(fake_lightrag, load_server, mode):
     srv = load_server()
     srv.search_library("q", mode=mode)
     srv.search_library("q", mode=mode, answer=True)
-    srv.get_sources("q", mode=mode)
     assert {c["json"]["mode"] for c in fake_lightrag.calls("/query")} == {"mix"}
 
 
@@ -357,8 +660,7 @@ def test_top_k_is_clamped_by_default(fake_lightrag, load_server, requested, sent
     srv = load_server()
     srv.search_library("q", top_k=requested)
     srv.search_library("q", top_k=requested, answer=True)
-    srv.get_sources("q", top_k=requested)
-    assert [c["json"]["top_k"] for c in fake_lightrag.calls("/query")] == [sent] * 3
+    assert [c["json"]["top_k"] for c in fake_lightrag.calls("/query")] == [sent] * 2
     assert [c["json"]["top_k"] for c in fake_lightrag.calls("/query/data")] == [sent]
 
 
@@ -373,15 +675,26 @@ def test_api_key_travels_in_header_never_in_url(fake_lightrag, load_server, api_
     srv = load_server()
     srv.search_library("q")
     srv.search_library("q2", answer=True)  # no references -> /query/data too
-    srv.get_sources("q")
+    srv.find_paper("Vaswani 2017")
+    srv.paper_passages("AAAA0001", "q")
     srv.add_note("text")
     assert srv.health().startswith("200:")
     paths = {r["path"] for r in fake_lightrag.requests}
-    assert paths == {"/query", "/query/data", "/documents/text", "/health"}
+    assert paths == {
+        "/query",
+        "/query/data",
+        "/graph/papers/search",
+        "/documents/text",
+        "/health",
+    }
     for r in fake_lightrag.requests:
         assert r["headers"].get("x-api-key") == api_key
-        assert "?" not in r["path"] and api_key not in r["path"]
+        assert api_key not in r["url"]
         assert api_key not in str(r["json"])
+    # Only the paper lookup carries a query string, and it holds the lookup words.
+    assert {r["path"] for r in fake_lightrag.requests if "?" in r["url"]} == {
+        "/graph/papers/search"
+    }
 
 
 def test_no_api_key_sends_no_header(fake_lightrag, load_server):
@@ -470,7 +783,7 @@ def test_http_errors_become_tool_errors_with_their_text(fake_lightrag, load_serv
     with pytest.raises(ToolError, match=r"LightRAG /query failed: .*422"):
         srv.search_library("q")
     with pytest.raises(ToolError, match="422"):
-        srv.get_sources("q")
+        srv.paper_passages("AAAA0001", "q")
 
 
 @pytest.mark.parametrize(
