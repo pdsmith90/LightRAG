@@ -652,6 +652,12 @@ def _title_hits(row: dict, words: list[str], title_words: list[str]) -> int:
     )
 
 
+def _whole_word(word: str, hay: str) -> bool:
+    """Whether a folded query word occurs in a folded haystack with no letter or
+    digit on either side (the server's ``_whole_word``)."""
+    return re.search(rf"(?<![^\W_]){re.escape(word)}(?![^\W_])", hay) is not None
+
+
 def _newest(row: dict) -> int:
     return -int(row["year"]) if row["year"].isdigit() else 0
 
@@ -673,8 +679,13 @@ def _metadata_matches(q: str) -> list[tuple[str, dict]]:
     if not words and not title_words:
         return []
     found = [k for k, r in rows.items() if _matches(r, words, title_words, not doi_q)]
+    # whole-word matches first: a short surname ("ho") is inside many title words
     found.sort(
-        key=lambda k: (-_title_hits(rows[k], words, title_words), _newest(rows[k]))
+        key=lambda k: (
+            not all(_whole_word(w, rows[k]["hay"]) for w in words),
+            -_title_hits(rows[k], words, title_words),
+            _newest(rows[k]),
+        )
     )
     return [(k, meta[k]) for k in found]
 
@@ -794,8 +805,10 @@ def _confirm(keys: list[str], new: bool) -> dict[str, dict]:
 def _ranked(q: str, papers: list[dict]) -> list[dict]:
     """Indexed papers whose title is the query's title words (those that are not
     an author's name or a year) first, then those holding them as a phrase, then
-    by query words in the title, then in the server's order."""
+    those holding every query word as a whole word, then by query words in the
+    title, then in the server's order."""
     words, title_words, _ = _terms(q)
+    rows = _rows()[1]
 
     def rank(item):
         i, p = item
@@ -811,9 +824,21 @@ def _ranked(q: str, papers: list[dict]) -> list[dict]:
         phrase = _plain(" ".join(content + title_words))
         flat = " ".join(re.findall(r"[a-z0-9]+", title))
         row = {"title": title, "title_alnum": re.sub(r"[^a-z0-9]", "", title)}
+        local = next((rows[k] for k in p.get("keys") or [] if k in rows), None)
+        hay = (
+            local["hay"]
+            if local
+            else _fold(
+                " ".join(
+                    [p.get("title") or "", p.get("citation") or "", p.get("doi") or ""]
+                    + list(p.get("keys") or [])
+                )
+            )
+        )
         return (
             not (phrase and flat == phrase),
             not (phrase and f" {phrase} " in f" {flat} "),
+            not all(_whole_word(w, hay) for w in words),
             -_title_hits(row, words, title_words),
             i,
         )
@@ -967,6 +992,8 @@ def _lookup_text(
                 + (
                     "The near matches below may be the paper itself: check one."
                     if near
+                    else "Try 'Author Year' alone."
+                    if _norm_doi(paper)
                     else "Try the DOI, the Zotero key, or 'Author Year' alone."
                 )
             )

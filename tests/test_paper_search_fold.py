@@ -282,6 +282,40 @@ async def test_existing_matches_still_hold(library):
     assert hits[0]["keys"] == ["AAAA0001", "AAAA0002"]
 
 
+async def test_a_whole_word_match_ranks_before_a_word_inside_another(tmp_path):
+    """A short surname occurs inside many title words ("Ho" in "Hoeing"); the
+    papers in which every query word is a whole word come first, so the
+    author's own papers are not cut off behind title hits."""
+    meta = {
+        "FFFF0001": {
+            "title": "Hoeing the rows of a shoreline garden",
+            "authors": ["Quillfeather Ada"],
+            "year": "2020",
+            "doi": "10.9/f1",
+        },
+        "FFFF0002": {
+            "title": "Thinning seedlings",
+            "authors": ["Ho Wen"],
+            "year": "2015",
+            "doi": "10.9/f2",
+        },
+    }
+    meta_path = tmp_path / "zotero_metadata.json"
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+    saved = zc.METADATA_PATH
+    zc.METADATA_PATH = str(meta_path)
+    zc._meta, zc._mtime, zc._next_stat, zc._warned = {}, None, 0.0, False
+    _reset()
+    try:
+        rag = _rag(docs={f"doc-{k}": (f"{k}__Paper.md", [f"{k}-c0"]) for k in meta})
+        hits = await zp.search_papers(rag, "Ho")
+        assert [h["paper"] for h in hits] == ["10.9/f2", "10.9/f1"]
+    finally:
+        zc.METADATA_PATH = saved
+        zc._meta, zc._mtime, zc._next_stat, zc._warned = {}, None, 0.0, False
+        _reset()
+
+
 # --- keys= -------------------------------------------------------------------
 
 

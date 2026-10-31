@@ -258,6 +258,11 @@ def _word_in(
     return len(parts) > 1 and all(p in folded for p in parts)
 
 
+def _whole_word(word: str, folded: str) -> bool:
+    """Whether ``word`` occurs in ``folded`` with no letter or digit on either side."""
+    return re.search(rf"(?<![^\W_]){re.escape(word)}(?![^\W_])", folded) is not None
+
+
 def norm_doi(text: str) -> str:
     """Lowercase DOI without a resolver prefix or ``doi:``; '' when not a DOI."""
     d = (text or "").strip().lower()
@@ -441,8 +446,11 @@ def _search(kb: dict, query: str, words: list, wanted: set, limit: int) -> list[
             and not all(_word_in(w, t, hay_forms, not doi_q) for w, t in words)
         ):
             continue
+        # a word inside a longer one ("ho" in "hoeing") ranks after whole words,
+        # so a short surname's own papers are not cut off behind title hits
         rank = (
             not (named or key in wanted),
+            not all(t or _whole_word(w, hay_forms[0]) for w, t in words),
             -sum(_word_in(w, t, title_forms) for w, t in words),
             -int(year) if year.isdigit() else 0,
         )

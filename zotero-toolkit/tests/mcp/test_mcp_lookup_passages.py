@@ -382,6 +382,44 @@ def test_indexed_list_puts_the_title_phrase_first(
     assert "A cut list does not show absence." in out
 
 
+def _short_surname_meta():
+    # "Ho" occurs inside "Hoeing"; the paper by Ho is older and has no title hit.
+    return {
+        "FFFF0001": _item(
+            "Hoeing the Rows of a Shoreline Garden", [("Quillfeather", "Ada")], "2020"
+        ),
+        "FFFF0002": _item("Thinning Seedlings", [("Ho", "Wen")], "2015"),
+    }
+
+
+def test_indexed_list_puts_whole_word_matches_first(
+    fake_lightrag, load_server, metadata_file
+):
+    meta = _short_surname_meta()
+    _write(metadata_file, meta)
+    index = [_paper(k, m) for k, m in meta.items()]
+    fake_lightrag.routes[("GET", "/graph/papers/search")] = _search_route(index)
+    rows = [
+        line
+        for line in load_server().find_paper("Ho").splitlines()
+        if line.startswith("- FFFF")
+    ]
+    assert [r[2:10] for r in rows] == ["FFFF0002", "FFFF0001"]
+
+
+def test_zotero_only_list_puts_whole_word_matches_first(load_server, metadata_file):
+    _write(metadata_file, _short_surname_meta())
+    found = [k for k, _ in load_server()._metadata_matches("Ho")]
+    assert found == ["FFFF0002", "FFFF0001"]
+
+
+def test_empty_doi_lookup_does_not_suggest_the_doi(fake_lightrag, load_server, items):
+    fake_lightrag.routes[("GET", "/graph/papers/search")] = _search_route([])
+    out = load_server().find_paper("10.9999/absent.2020.9")
+    assert "Try 'Author Year' alone." in out
+    assert "Try the DOI" not in out
+
+
 def test_empty_lookup_wording_no_longer_claims_absence(
     fake_lightrag, load_server, items
 ):
