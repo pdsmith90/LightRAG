@@ -172,12 +172,15 @@ def load_server(monkeypatch, fake_lightrag, metadata_file):
             "LIGHTRAG_BASE_URL": fake_lightrag.url,
             "LIGHTRAG_API_KEY": TEST_API_KEY,
             "ZOTERO_METADATA": str(metadata_file),
+            # never the developer's own ~/Zotero/storage
+            "ZOTERO_STORAGE": str(metadata_file.parent / "storage"),
         }
         base.update(env)
         for name in (
             "LIGHTRAG_BASE_URL",
             "LIGHTRAG_API_KEY",
             "ZOTERO_METADATA",
+            "ZOTERO_STORAGE",
             "LIGHTRAG_MCP_TIMEOUT",
             "LIGHTRAG_MCP_REF_FALLBACK_TIMEOUT",
             "LIGHTRAG_MCP_HEALTH_TIMEOUT",

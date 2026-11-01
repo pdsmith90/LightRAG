@@ -152,7 +152,7 @@ Every component is configured with command-line flags or environment variables.
 | Component | Configured by | Main settings | Reference |
 | --- | --- | --- | --- |
 | corpus | command-line flags | `--zotero`, `--out`, `--meta`, `--jobs`, `--ocr`, `--denylist` | [corpus/README.md](corpus/README.md#settings) |
-| mcp | environment variables in the MCP client's server entry | `LIGHTRAG_BASE_URL`, `LIGHTRAG_API_KEY`, `ZOTERO_METADATA`, `LIGHTRAG_MCP_MAX_TOP_K`, timeouts | [mcp/README.md](mcp/README.md#configuration) |
+| mcp | environment variables in the MCP client's server entry | `LIGHTRAG_BASE_URL`, `LIGHTRAG_API_KEY`, `ZOTERO_METADATA`, `ZOTERO_STORAGE`, `LIGHTRAG_MCP_MAX_TOP_K`, timeouts | [mcp/README.md](mcp/README.md#configuration) |
 | maintenance | flags, then the environment, then `--env-file` (LightRAG's own `.env` works unchanged) | `POSTGRES_*`, `POSTGRES_WORKSPACE`/`WORKSPACE`, `EMBEDDING_MODEL` + `EMBEDDING_DIM`, `LIGHTRAG_BASE_URL`, `LIGHTRAG_API_KEY` | [maintenance/README.md](maintenance/README.md#configuration) |
 | fronts | environment variables, optionally from an env file the launcher sources | `LLM_FO_PRIMARY`, `LLM_FO_FALLBACK`, `LLM_FO_FALLBACK_API`, `RERANK_FO_PRIMARY`, `RERANK_FO_FALLBACK`, timeouts, breaker | [fronts/README.md](fronts/README.md#settings-llm_failoverpy) |
 

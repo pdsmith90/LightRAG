@@ -12,7 +12,7 @@ into real bibliographic citations using Zotero metadata. The LLM never writes th
 |---|---|
 | `search_library(query, mode="mix", top_k=10, answer=False, include_graph=False, passages=8)` | Compiled citations **first**, then the retrieved passages as plain text, each headed `[n] Family Year · section` (see [Retrieved passages](#retrieved-passages)). No answer is generated, so it is faster. `passages` sets how many are retrieved. `include_graph=True` appends the knowledge-graph entities and relations. |
 | `search_library(..., answer=True)` | The server's synthesized answer. Any reference section the model wrote is stripped, and a `### Sources (compiled from retrieval)` list is appended. |
-| `paper_passages(paper, question)` | Up to 3 passages of **one** paper ranked against `question`, under that paper's citation. `paper` is a Zotero key, a DOI, or words that must all occur in the title, authors or year. If no indexed paper, several, or only near matches fit, it lists them instead of querying. |
+| `paper_passages(paper, question)` | Up to 3 passages of **one** paper ranked against `question`, under that paper's citation and, when this host has it, the path of the paper's file in Zotero's storage folder. `paper` is a Zotero key, a DOI, or words that must all occur in the title, authors or year. If no indexed paper, several, or only near matches fit, it lists them instead of querying. |
 | `find_paper(paper)` | A lookup with the same `paper` forms: the matching papers that are indexed, then the Zotero items that match but are not, then near matches when nothing has every word. No retrieval and no LLM. |
 | `add_note(text, description="")` | Inserts a text note into the knowledge base (`POST /documents/text`) under a unique document name (see below). |
 | `health()` | The server's `/health` status, or `unreachable at <url>: <error>`. |
@@ -83,11 +83,21 @@ servers, `content_headings`) and the server's own reference list. `search_librar
 returns the compiled citations, then each chunk in the server's ranked order as plain
 text, headed by its `[n]`, the first author's family name and year (from `creators`, else
 the server's `citation`, else `authors`) and its section path. The label keeps the
-passages of several same-topic papers apart. A paper's first chunk begins with the header
+passages of several same-topic papers apart. The section path is the server's
+`content_headings` without the levels that do not place the passage: the paper's title
+(whole, cut with `…`, or garbled into word pieces by the PDF converter: at least 80 % of
+its words of three or more letters occur in the folded title, and it is long enough to be
+the title), the journal (`publication`), an author line (two or more of the paper's family
+names), `Abstract`/`Summary` (also letter-spaced, `S U M M A R Y`) and article-type labels
+such as `LETTER`, and fragments with no three-letter word, an `=` or `|`, a link or a
+received/accepted date. Bold, italics, HTML tags and backticks are removed, and a passage
+with no level left shows no section. A paper's first chunk begins with the header
 the corpus builder writes (`# Title`, `**Authors:**`, `**Year:**`, `**Tags:**`,
 `**Zotero:**` lines, an optional `> **Abstract.**` line, then `---`). That header is
 dropped, because the citation carries it; the abstract line is kept only when the first
-80 characters of the abstract (folded, see below) do not occur in the text after it. A
+80 letters and digits of the abstract (folded, see below, and without a leading
+`Abstract`, which Zotero's copy often glues to the first word) do not occur among the
+letters and digits of the text after it. A
 chunk without the `**Zotero:**` line is left as it is. A passage whose text, whitespace
 collapsed, repeats an earlier one in the same result (another Zotero copy of the paper) is
 dropped, and its `[n]` joins the earlier heading: `[1][4] Family Year · section`. The entities and relations follow only
@@ -140,7 +150,7 @@ stock LightRAG Server the route answers 404 and the index status is reported as 
 `paper_passages` resolves `paper` the same way and never queries for a near match. With
 one indexed paper it sends `POST /graph/papers/passages` with all of the paper's keys (the
 copy with a DOI, else the longest title, first), the bare question and `top_n` 3, and
-renders each passage, best first, as `[1] Family Year · section · chunk i of n` (n is the chunk count of the paper's longest copy). On a
+renders each passage, best first, as `[1] Family Year · section · chunk i of n` (n is the chunk count of the paper's longest copy). Under the citation it names the paper's file, `Local file: <ZOTERO_STORAGE>/<key>/<filename>`, when that file exists on the host, because the index lacks what the corpus builder's text-layer converter drops from born-digital PDFs: display equations (only references such as "eq. (5)" remain) and often a table's layout. The tool's description tells the agent to read that file with `pdftotext -layout` for them. On a
 server without that route (404) it falls back to a `naive` context-only `/query` led by the first author
 and year (plus up to 3 title words when the metadata holds another work by that author in
 that year), keeps only the chunks of the paper's keys, and lists at most 5 other papers
@@ -205,6 +215,7 @@ Every setting is an environment variable, set in the MCP client's server entry.
 | `LIGHTRAG_BASE_URL` | `http://localhost:9621` | LightRAG Server base URL. A trailing `/` is ignored. |
 | `LIGHTRAG_API_KEY` | *(empty: no header sent)* | Must equal `LIGHTRAG_API_KEY` in the server's `.env`. Sent as `X-API-Key`. |
 | `ZOTERO_METADATA` | `~/Zotero/zotero_metadata.json` | Path to the metadata file. Unset or empty means the corpus builder's default output. A relative path resolves against the **working directory the client launches the server in**, which you usually do not control, so use an absolute path. `~` is expanded. |
+| `ZOTERO_STORAGE` | `~/Zotero/storage` | Zotero's attachment folders (`storage/<key>/`). `paper_passages` names a paper's file there (the metadata's `filename`) when it exists; nothing is read from it. `~` is expanded. |
 | `LIGHTRAG_MCP_TIMEOUT` | `300` | Seconds allowed for `/query` and `/documents/text` requests. |
 | `LIGHTRAG_MCP_REF_FALLBACK_TIMEOUT` | `90` | Seconds allowed for the `/query/data` reference fallback in answer mode. |
 | `LIGHTRAG_MCP_HEALTH_TIMEOUT` | `15` | Seconds allowed for `health()`. |
@@ -296,8 +307,9 @@ of error`), mode validation, the `top_k` clamp and `passages`, the `X-API-Key` h
 `/query/data` fallback and its timeout, error propagation with the server's explanation,
 unique note names for `add_note` (the fake refuses a repeated name with 409, as LightRAG
 does), folding and the paper lookup (key confirmation, cache, ranking, cut lists, near
-matches), both `paper_passages` paths, the header strip (checked against
-`corpus/build_corpus.py` when it imports), duplicate passages, and the stdio tool listing
+matches), both `paper_passages` paths and their local file line, the header strip
+(checked against `corpus/build_corpus.py` when it imports), the section-heading cleanup,
+duplicate passages, and the stdio tool listing
 with text-only results.
 
 Do not add an `__init__.py` to `tests/mcp/`. A test package named `mcp` would shadow the

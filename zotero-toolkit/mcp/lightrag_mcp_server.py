@@ -29,6 +29,9 @@ Config (environment variables):
                                        LIGHTRAG_API_KEY in the server's .env
     ZOTERO_METADATA                    default ~/Zotero/zotero_metadata.json, the
                                        corpus builder's default output (~ is expanded)
+    ZOTERO_STORAGE                     default ~/Zotero/storage, Zotero's attachment
+                                       folders: paper_passages names a paper's file
+                                       there when it exists (~ is expanded)
     LIGHTRAG_MCP_TIMEOUT               seconds per query, default 300
     LIGHTRAG_MCP_REF_FALLBACK_TIMEOUT  seconds for the /query/data fallback, default 90
     LIGHTRAG_MCP_HEALTH_TIMEOUT        seconds for health(), default 15
@@ -43,6 +46,11 @@ zlightrag fork's paper lookup) which papers are indexed, and paper_passages asks
 POST /graph/papers/passages for one paper's passages. A stock LightRAG Server has
 neither route: the lookup then falls back to zotero_metadata.json alone, and
 paper_passages to a /query that names the paper.
+
+Passage headings keep the section path only: the levels of the server's
+content_headings that do not place a passage (the paper's title, journal and author
+line, an Abstract or Summary heading made the parent of later sections, fragments)
+are dropped.
 
 Run:  python3 lightrag_mcp_server.py     (normally launched by the MCP client)
 Deps: pip install -r requirements.txt    (mcp 2.x, httpx)
@@ -98,6 +106,9 @@ CONFIRM_THREADS = 4
 META_PATH = os.path.expanduser(
     os.environ.get("ZOTERO_METADATA") or "~/Zotero/zotero_metadata.json"
 )
+# Zotero's attachment folders, one per corpus key: paper_passages names the paper's
+# file there, for what the index lacks (display equations).
+STORAGE = os.path.expanduser(os.environ.get("ZOTERO_STORAGE") or "~/Zotero/storage")
 _META_SIGNATURE = None
 _BAD_SIGNATURE = None
 
@@ -366,30 +377,125 @@ _HEADER = re.compile(
     r"\n?---[ \t]*(?:\n|\Z)"
 )
 _ABSTRACT = "> **Abstract.** "
+# The word Zotero's copy of an abstract often starts with, glued or not
+# ("AbstractThe widget census ...").
+_ABSTRACT_WORD = re.compile(
+    r"^\s*(?:Abstract|ABSTRACT|Summary|SUMMARY)[\s.:\u2014-]*(?=\S)"
+)
 
 
 def _strip_header(content: str) -> str:
     """A chunk's text without the corpus header, which the citation already
     carries. Its abstract line is kept only when the text after the header does
-    not repeat that abstract (the PDF's own first page usually does)."""
+    not repeat that abstract (the PDF's own first page usually does). They are
+    compared as bare letters and digits, without a leading "Abstract": the PDF's
+    copy carries emphasis and a heading of its own."""
     m = _HEADER.match(content.lstrip())
     if not m:
         return content
     rest = content.lstrip()[m.end() :].lstrip("\n")
     abstract = m.group(1)
     if abstract:
-        probe = " ".join(_fold(abstract[len(_ABSTRACT) :]).split())[:80]
-        if probe and probe in " ".join(_fold(rest).split()):
+        text = _ABSTRACT_WORD.sub("", abstract[len(_ABSTRACT) :])
+        probe = _plain(text).replace(" ", "")[:80]
+        if probe and probe in _plain(rest).replace(" ", ""):
             abstract = None
     if abstract:
         return f"{abstract}\n\n{rest}" if rest.strip() else abstract
     return rest if rest.strip() else content
 
 
-def _passages(chunks: list[dict], labels: dict) -> list[str]:
+# The server's content_headings is a chunk's parent heading chain, "h1 → h2", each
+# level cut at about 80 characters. In a sample of 40 papers most levels did not place
+# the passage: the paper's own title led the chain in most of them (cut, bold or
+# garbled by the PDF converter, while the citation already names the paper), and
+# journal names, author lines, an Abstract or SUMMARY heading that the converter made
+# the parent of every later section, and equation or link fragments took levels of
+# their own.
+_HEADING_SEP = " → "
+_TAGS = re.compile(r"<[^>]*>")
+_EMPHASIS = re.compile(r"\*\*|__|~~|`|(?<!\w)_|_(?!\w)")
+_JUNK_LEVEL = re.compile(
+    r"=|\||https?:|www\.|terms and conditions|downloaded from"
+    r"|\b(?:received|accepted|revised)\b.*\b(?:1[89]|20)\d\d\b",
+    re.IGNORECASE,
+)
+# Levels that label the text rather than place it, as bare letters.
+_LABEL_LEVELS = {
+    "abstract",
+    "summary",
+    "letter",
+    "article",
+    "originalarticle",
+    "researcharticle",
+    "reviewarticle",
+    "researchpaper",
+}
+
+
+def _section(headings, key: str = "", citation: str = "") -> str:
+    """A chunk's heading chain without the levels that do not place it in its
+    paper: the paper's title (the citation names it), its journal and author
+    line, Abstract/Summary and article-type labels, and fragments with no word
+    of three letters, an '=' or '|', a link or a received/accepted date. Bold,
+    italics, HTML tags and backticks are removed. '' when no level is left."""
+    if not headings:
+        return ""
+    m = _entry(key)
+    # Without a metadata entry, the title from the server's citation:
+    # "Family, Given; ... (Year). Title. Journal. doi:..."
+    cited = re.search(r"\(\d{4}\)\.\s*(.+?)(?:\.\s|\.?$)", citation or "")
+    title = m.get("title") or (cited.group(1) if cited else "")
+    title = _plain(_TAGS.sub("", title)).replace(" ", "")
+    journal = _plain(m.get("publication") or "").replace(" ", "")
+    families = {
+        f
+        for f in (
+            _plain(c[0])
+            for c in m.get("creators") or []
+            if isinstance(c, (list, tuple)) and c
+        )
+        if len(f) >= 2
+    }
+    kept = []
+    for level in str(headings).split(_HEADING_SEP):
+        text = " ".join(_EMPHASIS.sub("", _TAGS.sub("", level)).split())
+        text = text.strip(" -–—:|")
+        plain = _plain(text)
+        flat = plain.replace(" ", "")
+        if (
+            not re.search(r"[^\W\d_]{3}", text)
+            or _JUNK_LEVEL.search(text)
+            or flat in _LABEL_LEVELS
+            or flat == journal
+        ):
+            continue
+        words = [w for w in plain.split() if len(w) >= 3]
+        if (
+            title
+            and words
+            and len(flat) >= min(0.6 * len(title), 50)
+            and sum(w in title for w in words) >= 0.8 * len(words)
+        ):
+            continue  # the title, whole or cut ("…"), or garbled into word pieces
+        if (
+            len(families) >= 2
+            and sum(bool(re.search(rf"\b{re.escape(f)}\b", plain)) for f in families)
+            >= 2
+        ):
+            continue  # the author line
+        if not kept or kept[-1] != text:
+            kept.append(text)
+    return _HEADING_SEP.join(kept)
+
+
+def _passages(
+    chunks: list[dict], labels: dict, sources: dict | None = None
+) -> list[str]:
     """Each chunk as plain text headed by its [n], label and section, its corpus
     header stripped. A chunk whose text repeats an earlier one's (another Zotero
-    copy of the same paper) is dropped, and its [n] joins the earlier heading."""
+    copy of the same paper) is dropped, and its [n] joins the earlier heading.
+    sources maps [n] to (Zotero key, server citation) for the section cleanup."""
     groups, seen = [], {}
     for c in chunks:
         rid = str(c.get("reference_id", "?"))
@@ -405,10 +511,22 @@ def _passages(chunks: list[dict], labels: dict) -> list[str]:
     out = []
     for ids, c, body in groups:
         head = ("".join(f"[{i}]" for i in ids) + f" {labels.get(ids[0], '')}").rstrip()
-        if c.get("content_headings"):
-            head += f" · {c['content_headings']}"
+        key, citation = (sources or {}).get(ids[0], ("", ""))
+        if section := _section(c.get("content_headings"), key, citation):
+            head += f" · {section}"
         out.append(f"{head}\n{body}")
     return out
+
+
+def _sources(references: list) -> dict:
+    """[n] -> (Zotero key, server citation), for _passages."""
+    return {
+        str(r.get("reference_id")): (
+            _zotero_key(r.get("file_path", "")),
+            r.get("citation") or "",
+        )
+        for r in references
+    }
 
 
 def _fit(passages: list[str], budget: int) -> list[str]:
@@ -443,7 +561,7 @@ def _render_context(data: dict, include_graph: bool) -> str:
         "### Passages (the server's ranked order; [n] is the document listed above)"
     )
     budget = MAX_CHARS - len(head) - len(graph) - 300
-    passages = _passages(chunks, labels)
+    passages = _passages(chunks, labels, _sources(references))
     shown = _fit(passages, budget)
     out = f"{head}\n\n" + "\n\n".join(shown)
     if left := len(passages) - len(shown):
@@ -1088,9 +1206,21 @@ _NO_PASSAGE = (
 )
 
 
+def _local_file(key: str) -> str:
+    """The paper's attachment in this host's Zotero storage, '' when it has none."""
+    name = _entry(key).get("filename") or ""
+    path = os.path.join(STORAGE, key, name) if key and name else ""
+    return path if path and os.path.isfile(path) else ""
+
+
 def _paper_passages_text(lead_key: str, citation: str, data: dict) -> str:
-    """One paper's passages from POST /graph/papers/passages, under its citation."""
+    """One paper's passages from POST /graph/papers/passages, under its citation
+    and the path of its local file (for what the index lacks: equations)."""
     out = [f"### {_cite(f'{lead_key}__', citation)}"]
+    for key in [lead_key] + [k for k in data.get("keys") or [] if k != lead_key]:
+        if path := _local_file(key):
+            out[0] += f"\nLocal file: {path}"
+            break
     n_chunks = data.get("n_chunks")
     blocks = []
     for i, p in enumerate(data.get("passages") or [], start=1):
@@ -1098,8 +1228,9 @@ def _paper_passages_text(lead_key: str, citation: str, data: dict) -> str:
             continue
         file_path = p.get("file_path") or f"{p.get('key') or ''}__"
         head = [f"[{i}] {_label({'file_path': file_path})}"]
-        if p.get("content_headings"):
-            head.append(str(p["content_headings"]))
+        key = _zotero_key(file_path) or lead_key
+        if section := _section(p.get("content_headings"), key, citation):
+            head.append(section)
         if isinstance(p.get("chunk_order_index"), int):
             head.append(
                 f"chunk {p['chunk_order_index'] + 1}"
@@ -1148,7 +1279,8 @@ def search_library(
     several papers on one topic sit side by side, so check the [n] before you
     attribute a sentence. To check what one paper says, use paper_passages; to
     learn whether a paper is in the library, use find_paper, because a ranked
-    search cannot show that a paper is absent.
+    search cannot show that a paper is absent. Display equations are not in the
+    index (see paper_passages).
 
     passages: how many passages to retrieve, default 8, 1 to 12. Each is about
     4 KB, so the default result is about 30 KB. top_k does not change the result
@@ -1224,7 +1356,16 @@ def paper_passages(paper: str, question: str) -> str:
     alone searches every paper. When the paper is not indexed, or several papers or
     only near matches fit `paper`, it lists them instead of searching: call it again
     with one key or DOI. Quote the sentence you rely on; an abstract's list of
-    methods or error sources is not the paper's finding."""
+    methods or error sources is not the paper's finding.
+
+    Not in the index: display equations. The corpus builder's text-layer converter
+    drops them from born-digital PDFs (scans read by the OCR model keep them as
+    LaTeX), so only references to them ("eq. (5)") remain, and tables often arrive
+    scrambled. Asking again cannot reach them. For an equation's coefficients or a
+    table's values, read the file named under the citation ("Local file:", when
+    this host has the Zotero storage folder): `pdftotext -layout FILE out.txt`,
+    where an equation's number ends its line, so
+    `grep -n -B8 -A2 '(6)\\s*$' out.txt` shows equation (6)."""
     indexed, rest, truncated, near, unchecked = _lookup(paper)
     if indexed is None:
         if len(rest) != 1:
@@ -1286,7 +1427,7 @@ def paper_passages(paper: str, question: str) -> str:
             "Its passages that the question reached, best first (name a section or a "
             "distinctive term to reach others):"
         )
-        out += _fit(_passages(mine, labels), MAX_CHARS - 3000)
+        out += _fit(_passages(mine, labels, _sources(references)), MAX_CHARS - 3000)
     else:
         out.append(
             "No passage of this paper ranked for the question. Rephrase it in the "

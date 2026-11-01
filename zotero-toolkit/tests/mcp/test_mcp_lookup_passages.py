@@ -762,3 +762,136 @@ def test_search_library_strips_headers_and_merges_duplicate_copies(
     assert out.count("of two") == 1
     assert "[2] Larkspur 2008\nBody after the header." in out
     assert "**Zotero:**" not in out
+
+
+# --- section headings, glued abstracts, the local file -------------------------------
+
+WIDGET = _item(
+    "Recovering Widget Gravity from Sprocket Tracking of Quillstar Constellations",
+    [("Brightwater", "Ezra"), ("Pellworth", "Mira"), ("Quorrick", "Sefa")],
+    "2024",
+    doi="10.9999/widget.2024.5",
+)
+WIDGET["filename"] = "Brightwater et al. - 2024 - Recovering widget gravity.pdf"
+TITLE_CUT = "**Recovering Widget Gravity from Sprocket Tracking of Quillstar Constel…"
+GARBLED = "**Recov widget grav ering ity from spr ocket trac king of quills…"
+AUTHOR_LINE = (
+    "Ezra Brightwater,<sup>1</sup> Mira Pellworth,<sup>2</sup> and Sefa Quorrick<s…"
+)
+
+
+@pytest.fixture
+def widget(metadata_file):
+    _write(metadata_file, dict(ITEMS, WWWW0005=WIDGET))
+    return WIDGET
+
+
+@pytest.mark.parametrize(
+    "headings,section",
+    [
+        (f"{TITLE_CUT} → {AUTHOR_LINE} → **S U M M A R Y**", ""),
+        (
+            f"{GARBLED} → **SU MMARY** → **4.1** **_g_ w—a widget model**",
+            "4.1 g w—a widget model",
+        ),
+        (
+            f"<u>Journal of Invented Results</u> → {TITLE_CUT} → **1. Intro**",
+            "1. Intro",
+        ),
+        ("Abstract: → SPROCKET TRIAL → APPENDIX C", "SPROCKET TRIAL → APPENDIX C"),
+        ("**21** → **Sprocket Routing** → w: = 0.42", "Sprocket Routing"),
+        ("WIDGET | GAZETTE → `Terms: http://example.org/t…` → **Data**", "Data"),
+        ("3 April 2011; accepted 9 May 2011 → 3. Results", "3. Results"),
+        ("LETTER → 4. Discussion", "4. Discussion"),
+        ("Part II → **Part II** → Results", "Part II → Results"),
+        (None, ""),
+    ],
+)
+def test_section_drops_levels_that_do_not_place_the_passage(
+    load_server, widget, headings, section
+):
+    assert load_server()._section(headings, "WWWW0005") == section
+
+
+def test_section_keeps_short_headings_and_one_author_name(load_server, widget):
+    srv = load_server()
+    assert srv._section(f"{TITLE_CUT} → Sprocket tracking", "WWWW0005") == (
+        "Sprocket tracking"
+    )
+    assert srv._section("Widget gravity → Brightwater's method", "WWWW0005") == (
+        "Widget gravity → Brightwater's method"
+    )
+
+
+def test_section_takes_the_title_from_the_citation_without_metadata(load_server):
+    cite = "Quillfeather, Ada (2020). Sprocket orbits of the outer widget belt. J. Inv."
+    heads = "Sprocket orbits of the outer widget belt → 5. Summary"
+    assert load_server()._section(heads, "ZZZZ9999", cite) == "5. Summary"
+
+
+def test_header_strip_drops_a_glued_abstract_repeated_under_emphasis(load_server):
+    item = dict(ITEMS["BBBB0002"], abstract="Abstract" + ABSTRACT)
+    head = _header(item, "BBBB0002")
+    body = (
+        "#### **Abstract**\nWe count _widgets_ on the orchard and find the bud-\n"
+        "get closes within ten percent.\n\n1 Introduction\nText."
+    )
+    assert load_server()._strip_header(head + body) == body
+
+
+def _widget_routes(fake_lightrag, headings):
+    paper = _paper("WWWW0005", WIDGET)
+    fake_lightrag.routes[("GET", "/graph/papers/search")] = _search_route([paper])
+    fake_lightrag.routes[("POST", "/graph/papers/passages")] = _passages_route(
+        {
+            "keys": ["WWWW0005"],
+            "n_chunks": 14,
+            "passages": [
+                {
+                    "key": "WWWW0005",
+                    "file_path": "WWWW0005__x.md",
+                    "chunk_order_index": 5,
+                    "content": "#### 3.2 Counting\nSprockets drift by two teeth.",
+                    "content_headings": headings,
+                }
+            ],
+        }
+    )
+
+
+def test_paper_passages_names_the_local_file_and_cleans_headings(
+    fake_lightrag, load_server, metadata_file, widget
+):
+    _widget_routes(fake_lightrag, f"{GARBLED} → {AUTHOR_LINE} → **S U M M A R Y**")
+    pdf = metadata_file.parent / "storage" / "WWWW0005" / widget["filename"]
+    pdf.parent.mkdir(parents=True)
+    pdf.write_bytes(b"%PDF-1.4\n")
+    out = load_server().paper_passages("WWWW0005", "drift")
+    assert out.splitlines()[1] == f"Local file: {pdf}"
+    assert "\n\n[1] Brightwater 2024 · chunk 6 of 14\n#### 3.2 Counting" in out
+
+
+def test_paper_passages_without_the_local_file_names_none(
+    fake_lightrag, load_server, widget
+):
+    _widget_routes(fake_lightrag, None)
+    out = load_server().paper_passages("WWWW0005", "drift")
+    assert "Local file:" not in out
+    assert "[1] Brightwater 2024 · chunk 6 of 14\n" in out
+
+
+def test_search_library_cleans_section_headings(fake_lightrag, load_server, widget):
+    refs = [{"reference_id": "1", "file_path": "WWWW0005__x.md"}]
+    chunks = [
+        {
+            "reference_id": "1",
+            "content": "Widgets balance.",
+            "content_headings": f"{TITLE_CUT} → **3. Results**",
+        }
+    ]
+    fake_lightrag.routes[("POST", "/query")] = lambda body: (
+        200,
+        {"response": _context_text(chunks), "references": refs},
+    )
+    out = load_server().search_library("q", passages=1)
+    assert "[1] Brightwater 2024 · 3. Results\nWidgets balance." in out
