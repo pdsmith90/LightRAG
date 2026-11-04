@@ -94,16 +94,16 @@ as the fallback, so queries keep working while the primary is busy, restarting o
 - **Fallback model.** `LLM_FO_FALLBACK_MODEL` names the fallback's model. Empty (default) means
   the fallback receives the model named in the request.
 - **Both down.** The response is `502` with a JSON `error`.
-- **`X-LLM-Failover-Backend: primary|fallback`** is set on every completion.
+- **`X-LLM-Failover-Backend: primary|fallback|night`** is set on every completion.
 - **`GET /health`** returns `200` when either backend answers and `503` when neither does. The
   JSON body includes `primary`, `fallback` and `breaker_open`, plus the state of every optional
-  policy (`guard`, `quiet`, `yield`, `reserved`, `shared`, `schema_models`). The primary is
-  probed at `/v1/models`. The fallback is probed at `/api/tags` (ollama) or `/v1/models`
-  (openai).
+  policy (`guard`, `quiet`, `gap`, `yield`, `events`, `night`, `reserved`, `shared`,
+  `schema_models`). The primary is probed at `/v1/models`. The fallback is probed at
+  `/api/tags` (ollama) or `/v1/models` (openai).
 - **`GET /v1/models`** lists `LLM_FO_PRIMARY_MODELS` plus `LLM_FO_FALLBACK_MODEL`. It is a
   static list, not a proxy.
 - **Log.** One line per request, backend first, with the reason for any fallback (`breaker`,
-  `quiet`, `reserved`, `guarded`, `yield`, `shared`).
+  `quiet`, `reserved`, `guarded`, `yield`, `shared`, `night-draining`, `night-failed`).
 
 ## How `rerank_failover.py` behaves
 
@@ -150,16 +150,24 @@ each stays off until its own variable is set.
 | `LLM_FO_GUARDED_MODELS` | `*` | which requested models the quiet window, reservation, guard and yield apply to |
 | `LLM_FO_QUIET_WINDOW` | *(off)* | `HH:MM-HH:MM` local time, may cross midnight. Guarded requests use the fallback throughout |
 | `LLM_FO_RESERVED_FILE` | *(off)* | path to a file holding an epoch second. Until then, guarded requests use the fallback |
+| `LLM_FO_GAP_FILE` | *(off)* | path to a file holding an epoch second. Until then, the quiet window does not hold guarded requests |
 | `LLM_FO_ALLOWED_RUNNING` | *(off)* | llama-swap guard: use the primary only while every model in its `GET /running` is on this comma list |
-| `LLM_FO_YIELD_EVERY_S` | `0` (off) | shared + guarded models: periodically drain the primary so a queued model load can swap in |
+| `LLM_FO_YIELD_EVERY_S` | `0` (off) | shared + guarded models: periodically drain the primary so a queued model load can swap in (the fallback while request events are unavailable) |
 | `LLM_FO_YIELD_HOLD_S` / `LLM_FO_YIELD_MAX_S` | `3` / `120` | idle hold after the drain / give up waiting for a drain |
 | `LLM_FO_SHARED_MODELS` | *(off)* | comma list: use the fallback as a second worker for these models |
-| `LLM_FO_PRIMARY_SLOTS` / `LLM_FO_FALLBACK_SLOTS` | `4` / `2` | concurrent calls per side (match `--parallel` / `OLLAMA_NUM_PARALLEL`) |
+| `LLM_FO_EVENTS` | `1` (with the guard) | `0` stops the front from following llama-swap's `GET /api/events`; it runs only while `LLM_FO_ALLOWED_RUNNING` is set |
+| `LLM_FO_PRIMARY_SLOTS` / `LLM_FO_FALLBACK_SLOTS` | `8` / `2` | concurrent calls per side (match `--parallel` / `OLLAMA_NUM_PARALLEL`) |
 | `LLM_FO_FALLBACK_MAX_CHARS` | `20000` | longer prompts stay on the primary (about 6k tokens, which fits `num_ctx` 8192) |
 | `LLM_FO_SLOT_WAIT_S` | `90` | how long a shared request waits for a free slot before queueing on the primary |
 | `LLM_FO_RETRY_502_S` | `4` | shared models: one retry this many seconds after a primary 502/503 |
 | `LLM_FO_RETRY_READY_S` | `0` | before that retry, poll llama-swap `/running` up to this long for the model to be ready (40 works) |
 | `LLM_FO_SCHEMA_MODELS` | `$LLM_FO_SHARED_MODELS` | attach LightRAG's extraction JSON schema per request (see below) |
+| `LLM_FO_NIGHT_MODEL` | *(off)* | night lane: a second alias of the shared model, on another card behind the same llama-swap |
+| `LLM_FO_NIGHT_SLOTS` | `4` | concurrent night-lane calls (match that alias's `--parallel`) |
+| `LLM_FO_NIGHT_OFF_FILE` | `fronts/.night_lane_off` | while this file exists the night lane is shut |
+| `LLM_FO_NIGHT_BIG_HOLD_S` | `120` | shut the night lane while a model outside the allow list has a request in flight, and this long after; `0` off |
+| `LLM_FO_NIGHT_UTIL_YIELD_S` | `300` | a request for a model outside `LLM_FO_SHARED_MODELS` unloads the night model and shuts the lane this long; `0` off |
+| `LLM_FO_NIGHT_BREAKER_S` / `LLM_FO_NIGHT_TIMEOUT` | `300` / `300` | night-lane breaker after a failure / per-call timeout |
 
 - **Quiet window.** llama-swap does not swap a model out while requests are in flight. A steady
   stream of ingest calls therefore starves any other model requested on the same server, and
@@ -170,13 +178,39 @@ each stays off until its own variable is set.
   `date -d '+2 hours' +%s > "$LLM_FO_RESERVED_FILE"` reserves the primary, and `rm` releases it.
   A missing file, an unreadable file or a time already past means no reservation. Use an
   absolute path; the launcher runs the front from `fronts/`.
+- **Gap file.** Scheduled jobs leave idle gaps inside their window. A scheduler that knows
+  when its next job starts can unload its own idle model and write an epoch second, a few
+  minutes before that job, into `LLM_FO_GAP_FILE`. Until then guarded requests use the
+  primary as they do outside the window, and the night lane stays shut. At that moment the
+  window holds the primary again by itself, so a scheduler that dies cannot keep it open
+  into a job. The file means nothing outside the window, the reservation still wins, and a
+  missing, unreadable, empty or past value means no gap. The window itself is a fixed daily
+  span; the reservation and gap files are how a scheduler with its own timetable closes and
+  reopens the primary at the right moments.
 - **Running-model guard.** A small model in a llama-swap group that does not swap loads *beside*
   a resident large model and pushes that model's buffers out of VRAM. With the guard on, guarded
   requests use the fallback unless every running model is on the allow list. A failed probe
   also means fallback. The verdict is cached for 1 s.
+- **Request events.** With the guard on, the front also holds llama-swap's `GET /api/events`
+  stream open. It shows every in-flight request, including one still waiting for its model
+  to swap in, which `/running` cannot show. The yield then holds new guarded primary calls
+  exactly while a request for a model outside the allow list is in flight, instead of
+  draining on a clock. If the stream stays down for more than 20 s, the clock yield takes
+  over again and the night lane shuts. `/health` reports the yield's `mode` (`events`,
+  `clock` or `off`).
 - **Shared dispatch.** This is meant for the ingest (extraction) role when both sides serve
   the same weights. Each call goes to the side with a free slot, primary first, so both GPUs
   work. Prompts too long for the fallback's context wait for the primary.
+- **Night lane.** While the quiet window holds the primary, guarded shared requests that are
+  not streamed go first to `LLM_FO_NIGHT_MODEL`, a second alias of the same weights pinned
+  to another card that is idle in the window. Put it in a llama-swap group that never swaps,
+  so the scheduled jobs' model loads do not wait on it. The fallback stays the overflow
+  worker. `/health` gives the reason whenever the lane is shut: `off-file`,
+  `outside-window`, `gap`, `primary-draining` (primary calls still in flight after a gap),
+  `reserved`, `breaker`, `util-yield` (another role's model needed the room), `events-down`
+  or `big-model-active` (a power budget that cannot run both cards flat out). While
+  night-lane calls are in flight the primary starts no guarded calls (`night-draining`).
+  Night-lane requests carry the User-Agent `llm-failover-night-lane`.
 - **Schema shaping.** A role's `EXTRA_BODY` applies to every call of that role, including the
   entity/relation merge summaries, which must stay prose. So for `LLM_FO_SCHEMA_MODELS` the
   front decides per request:

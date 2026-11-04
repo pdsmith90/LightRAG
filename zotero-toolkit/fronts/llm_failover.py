@@ -15,7 +15,7 @@ or a timeout before the first byte, replays the request against a FALLBACK:
     GET /health     200 when either backend answers, 503 when neither; the JSON body says which,
                     whether the breaker is open, and the state of every optional policy
     GET /v1/models  LLM_FO_PRIMARY_MODELS plus LLM_FO_FALLBACK_MODEL
-    Header          X-LLM-Failover-Backend: primary|fallback on every completion
+    Header          X-LLM-Failover-Backend: primary|fallback|night on every completion
     Log             one line per request, backend first (LLM_FO_LOG; stderr when unset)
 
 After a primary failure a circuit breaker sends every request straight to the fallback for
@@ -24,10 +24,17 @@ context size, say), so it falls back without opening the breaker. Once a streame
 response has started there is no fallback: the client has already received bytes.
 
 Optional policies, all off by default (see README.md): a daily quiet window and a "reserved
-until" file that keep requests off the primary; a llama-swap guard that uses the primary only
-while every running model is on an allow list; a periodic yield that lets pending model loads
-in; shared dispatch that treats the fallback as a second worker; a JSON schema attached to
-LightRAG's entity-extraction prompts.
+until" file that keep requests off the primary, and a "gap until" file that reopens it inside
+the window; a llama-swap guard that uses the primary only while every running model is on an
+allow list; a yield that lets pending model loads in (driven by llama-swap's request events,
+or by a clock while those are unavailable); shared dispatch that treats the fallback as a
+second worker; a night lane that sends shared requests to a second copy of the model on
+another card while the quiet window holds the primary; a JSON schema attached to LightRAG's
+entity-extraction prompts.
+
+The quiet window is a fixed daily time span. A scheduler that knows its own timetable can
+still close and reopen the primary at the right moments from outside: it writes the
+reservation file to close it early and the gap file to reopen it between its jobs.
 
 Stdlib only, Python >= 3.10. All settings are read from the environment at start-up.
 """
@@ -122,7 +129,10 @@ def _big_model_running():
             running = sorted(
                 {m.get("model", "") for m in json.load(r).get("running", [])}
             )
-        big = bool(set(running) - ALLOWED_RUNNING)
+        # the night model runs on the secondary card, never beside the primary's models
+        big = bool(
+            set(running) - ALLOWED_RUNNING - ({NIGHT_MODEL} if NIGHT_MODEL else set())
+        )
     except Exception:
         running, big = [], True
     _guard_cache = (now, big, running)
@@ -137,7 +147,8 @@ def _big_model_running():
 # old one has drained. If the primary's GPU has scheduled
 # work of its own, name its window here and guarded requests use the fallback throughout it,
 # whatever /running says. Format "HH:MM-HH:MM" in this host's local time; it may cross midnight;
-# "" (default) disables. Start it a few minutes early so in-flight calls can drain.
+# "" (default) disables. Start it a few minutes early so in-flight calls can drain. Inside the
+# window, the gap file below can reopen the primary between scheduled jobs.
 QUIET_WINDOW = os.environ.get("LLM_FO_QUIET_WINDOW", "")
 
 
@@ -155,7 +166,12 @@ _QUIET = _parse_window(QUIET_WINDOW) if QUIET_WINDOW else None
 
 
 def _quiet(now=None):
-    """True while the quiet window is active (see QUIET_WINDOW)."""
+    """True while the quiet window holds the primary: inside the window and no gap open."""
+    return _in_window(now) and not _gap(now)
+
+
+def _in_window(now=None):
+    """True inside the quiet window itself (see QUIET_WINDOW), gap or not."""
     if _QUIET is None:
         return False
     t = time.localtime(time.time() if now is None else now)
@@ -197,6 +213,43 @@ def _reserved(now=None):
     return (time.time() if now is None else now) < _reserved_until()
 
 
+# ---- gap file -------------------------------------------------------------------------------
+# Scheduled work rarely fills its whole window: the jobs run with idle gaps between them, and
+# the quiet window keeps guarded requests off the primary for all of it. A scheduler that knows
+# when its next job starts can lend the primary out in between: it unloads its own idle model,
+# then writes an epoch second -- a few minutes before that next job -- into GAP_FILE. Until
+# then the quiet window does not hold guarded requests (the primary serves them as outside the
+# window) and the night lane stays shut, so the two cards do not both run flat out. At that
+# moment the window closes again by itself, so a scheduler that dies cannot keep the primary
+# open into a job. Outside the window the file changes nothing; the reservation file still
+# wins. A file that is missing, cannot be read or is empty, or that names a moment already
+# past, is no gap. "" (default) disables.
+GAP_FILE = os.environ.get("LLM_FO_GAP_FILE", "")
+_gap_cache = (0.0, 0)  # (checked_at, until_epoch)
+
+
+def _gap_until():
+    """Epoch second the current gap lasts until (0 = none), re-read at most once a second."""
+    global _gap_cache
+    if not GAP_FILE:
+        return 0
+    now = time.time()
+    if now - _gap_cache[0] < 1.0:
+        return _gap_cache[1]
+    try:
+        with open(GAP_FILE) as f:
+            until = int(float(f.read().strip().split()[0]))
+    except (OSError, ValueError, IndexError):
+        until = 0
+    _gap_cache = (now, until)
+    return until
+
+
+def _gap(now=None):
+    """True while GAP_FILE names a moment still in the future."""
+    return (time.time() if now is None else now) < _gap_until()
+
+
 # ---- periodic yield to pending model loads ---------------------------------------------------
 # The window and the reservation cover SCHEDULED loads. An unscheduled one -- another client
 # picking a different model on the primary -- still queues behind shared dispatch, which keeps
@@ -206,6 +259,10 @@ def _reserved(now=None):
 # YIELD_HOLD_S (a queued load swaps in during that gap), then re-reads /running uncached. A
 # waiting load then waits at most ~YIELD_EVERY_S + one call; the fallback keeps working
 # throughout. Applies to guarded SHARED_MODELS. YIELD_EVERY_S=0 (default) disables.
+# While llama-swap's request events are available (see "request events" below) the front CAN
+# see a pending load, and the yield follows them instead: no new primary calls exactly while a
+# request for a model outside ALLOWED_RUNNING is in flight, no drain otherwise. The clock above
+# is then only the fallback for when the event stream is down.
 # ---- local lane pause (2026-10-07) ----------------------------------------------------------------
 # ocr_server.sh writes an epoch second ("paused until") into PAUSE_FILE while the OCR model (PepperOCR-VL)
 # holds the VM's GPU in place of the ollama 7b -- the two do not fit the card together (operator decision 2026-10-07: "the
@@ -250,9 +307,25 @@ _yield = {"next": 0.0, "active_since": 0.0, "drained_at": 0.0, "count": 0}
 def _yielding(inflight_primary, now=None):
     """True while the primary must not start a new call. Caller holds _state_lock (reads _inflight)."""
     global _guard_cache
+    now = time.time() if now is None else now
+    if _events_ok_locked(now):
+        # event-driven: yield exactly while a big-model request is in flight on the primary
+        big = _big_inflight_locked()
+        y = _yield
+        if big and not y["active_since"]:
+            y["active_since"], y["drained_at"] = now, 0.0
+        if not big and y["active_since"]:
+            y["active_since"], y["drained_at"], y["next"] = (
+                0.0,
+                0.0,
+                now + YIELD_EVERY_S,
+            )
+            y["count"] += 1
+            # force a fresh /running read: the big model may be resident now
+            _guard_cache = (0.0, True, [])
+        return bool(big)
     if YIELD_EVERY_S <= 0:
         return False
-    now = time.time() if now is None else now
     y = _yield
     if not y["active_since"]:
         if y["next"] == 0.0:
@@ -289,10 +362,13 @@ def _yielding(inflight_primary, now=None):
 # are full the request waits up to SLOT_WAIT_S, then queues on the primary.
 # Empty SHARED_MODELS (default) disables.
 SHARED_MODELS = _csv("LLM_FO_SHARED_MODELS")
-PRIMARY_SLOTS = int(os.environ.get("LLM_FO_PRIMARY_SLOTS", "4"))
+# Default 8 slots: in one benchmark a 7B extraction model on a single card served about 44 %
+# more requests per minute with --parallel 8 than with 4, at the same power draw; 12 added
+# about 12 % more and 16 served fewer than 12. Match it to the primary's own --parallel.
+PRIMARY_SLOTS = int(os.environ.get("LLM_FO_PRIMARY_SLOTS", "8"))
 FALLBACK_SLOTS = int(os.environ.get("LLM_FO_FALLBACK_SLOTS", "2"))
 FALLBACK_MAX_CHARS = int(os.environ.get("LLM_FO_FALLBACK_MAX_CHARS", "20000"))
-_inflight = {"primary": 0, "fallback": 0}
+_inflight = {"primary": 0, "fallback": 0, "night": 0}
 SLOT_WAIT_S = float(
     os.environ.get("LLM_FO_SLOT_WAIT_S", "90")
 )  # shared model: wait this long for a free slot
@@ -335,6 +411,225 @@ class _slot:
     def __exit__(self, *exc):
         with _state_lock:
             _inflight[self.b] -= 1
+
+
+# ---- request events (llama-swap primaries) ----------------------------------------------------
+# llama-swap streams every in-flight request and its model on GET /api/events (SSE; events of
+# type "inflight": a "snapshot" on connect, then "upsert" and "remove"), INCLUDING a request
+# still waiting for its model to swap in -- the one thing /running cannot show. The front holds
+# that stream open on a daemon thread and uses it twice:
+#  (1) the yield above becomes exact: no new guarded primary calls while a request for a model
+#      outside ALLOWED_RUNNING is in flight, instead of a blind drain every YIELD_EVERY_S (on a
+#      busy ingest lane those periodic drains cost about a fifth of the primary's slot time);
+#  (2) the night lane below stays shut while such a model is generating.
+# A reconnect shorter than EVENTS_GRACE_S keeps the last verdicts; past it the stream counts as
+# down: the clock yield is back and the night lane shuts. "Big" is defined by the allow list, so
+# the watcher runs only with the running-model guard on (ALLOWED_RUNNING set; the guarded models
+# themselves belong on it). LLM_FO_EVENTS=0 turns it off.
+EVENTS = bool(ALLOWED_RUNNING) and os.environ.get("LLM_FO_EVENTS", "1") != "0"
+EVENTS_GRACE_S = 20.0
+EVENTS_READ_TIMEOUT_S = 300.0
+_ev = {
+    "connected": False,
+    "down_since": 0.0,
+    "inflight": {},  # request id -> model
+    "big_last": 0.0,  # last moment a big-model request was seen in flight
+    "events": 0,
+    "connects": 0,
+}
+
+
+def _is_big(model) -> bool:
+    return bool(model) and model not in ALLOWED_RUNNING and model != NIGHT_MODEL
+
+
+def _big_inflight_locked():
+    """Models outside ALLOWED_RUNNING with a request in flight on the primary. Caller holds _state_lock."""
+    return sorted({m for m in _ev["inflight"].values() if _is_big(m)})
+
+
+def _events_ok_locked(now=None) -> bool:
+    """Is the event stream trustworthy right now? Caller holds _state_lock."""
+    if not EVENTS:
+        return False
+    if _ev["connected"]:
+        return True
+    now = time.time() if now is None else now
+    return (
+        bool(_ev["down_since"])
+        and _ev["connects"] > 0
+        and now - _ev["down_since"] < EVENTS_GRACE_S
+    )
+
+
+def _apply_inflight(d: dict, now: float) -> None:
+    """Fold one llama-swap inflight event into _ev. Takes _state_lock."""
+    op = d.get("operation")
+    with _state_lock:
+        inf = _ev["inflight"]
+        if op == "snapshot":
+            inf.clear()
+            for q in d.get("requests") or []:
+                inf[str(q.get("id"))] = q.get("model") or ""
+        elif op == "upsert":
+            q = d.get("request") or {}
+            inf[str(q.get("id"))] = q.get("model") or ""
+        elif op == "remove":
+            inf.pop(str(d.get("id")), None)
+        _ev["events"] += 1
+        if _big_inflight_locked():
+            _ev["big_last"] = now
+
+
+def _events_once() -> None:
+    """Hold one /api/events connection until it ends or fails, then mark the stream down."""
+    try:
+        req = urllib.request.Request(
+            PRIMARY + "/api/events",
+            headers={"Accept": "text/event-stream", **_headers(PRIMARY_API_KEY)},
+        )
+        with urllib.request.urlopen(req, timeout=EVENTS_READ_TIMEOUT_S) as r:
+            with _state_lock:
+                _ev["connected"], _ev["connects"] = True, _ev["connects"] + 1
+            for raw in r:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line.startswith("data:") or '"inflight"' not in line:
+                    continue
+                try:
+                    ev = json.loads(line[5:])
+                    if ev.get("type") == "inflight":
+                        _apply_inflight(json.loads(ev.get("data") or "{}"), time.time())
+                except (ValueError, AttributeError):
+                    continue
+    except Exception:
+        pass
+    with _state_lock:
+        if _ev["connected"]:
+            _ev["down_since"] = time.time()
+        _ev["connected"] = False
+        _ev["inflight"] = {}
+
+
+def _events_loop() -> None:
+    """Keep the event stream open; reconnect 1 s after it ends. Daemon thread."""
+    while True:
+        _events_once()
+        time.sleep(1.0)
+
+
+# ---- night lane: a second copy of the shared model on another card ---------------------------
+# While the quiet window holds the primary, guarded shared requests have only the fallback. If
+# the primary's llama-swap also reaches a second card that is idle in the window, give it a
+# second alias of the SAME weights pinned to that card (NIGHT_MODEL; in a group that never
+# swaps, so the scheduled work's model loads neither wait on it nor evict it). Inside the window
+# guarded shared requests then take it first, and the fallback stays the overflow worker. Only
+# non-streamed requests use it. It is shut (fallback only) when any of these holds:
+#   - NIGHT_MODEL is unset, NIGHT_OFF_FILE exists, or the quiet window is not active;
+#   - a gap is open (the primary serves; see the gap file), or primary calls are still in
+#     flight after a gap closed ("primary-draining");
+#   - the reservation file is active;
+#   - a request it sent failed, for NIGHT_BREAKER_S;
+#   - a request for another role (a model outside SHARED_MODELS) came through the front in the
+#     last NIGHT_UTIL_YIELD_S: such a model may need the secondary card's memory, so the first
+#     request of a burst unloads the night model and the lane stays shut for that long
+#     (NIGHT_UTIL_YIELD_S=0 turns this off);
+#   - NIGHT_BIG_HOLD_S > 0 and a big model (outside ALLOWED_RUNNING) had a request in flight
+#     within that many seconds, or the event stream is down: on a power budget (a UPS, say) that
+#     cannot carry both cards at full load, the night lane runs only while the big model is idle.
+# Conversely the primary does not start guarded calls while night-lane calls are in flight
+# ("night-draining"), so a gap opening does not put both cards under load at once. Night-lane
+# requests carry User-Agent NIGHT_UA, so a monitor that counts this front's requests on the
+# primary inside the window can tell them apart.
+NIGHT_MODEL = os.environ.get("LLM_FO_NIGHT_MODEL", "")
+NIGHT_SLOTS = int(os.environ.get("LLM_FO_NIGHT_SLOTS", "4"))
+NIGHT_OFF_FILE = os.environ.get(
+    "LLM_FO_NIGHT_OFF_FILE",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), ".night_lane_off"),
+)
+NIGHT_BIG_HOLD_S = float(os.environ.get("LLM_FO_NIGHT_BIG_HOLD_S", "120"))
+NIGHT_UTIL_YIELD_S = float(os.environ.get("LLM_FO_NIGHT_UTIL_YIELD_S", "300"))
+NIGHT_BREAKER_S = float(os.environ.get("LLM_FO_NIGHT_BREAKER_S", "300"))
+NIGHT_TIMEOUT = float(os.environ.get("LLM_FO_NIGHT_TIMEOUT", "300"))
+NIGHT_UA = "llm-failover-night-lane"
+_night = {"down_until": 0.0, "util_until": 0.0, "unloads": 0}
+_night_room_lock = threading.Lock()
+
+
+def _night_open(now=None):
+    """(open, reason) for the night lane. Takes _state_lock briefly."""
+    now = time.time() if now is None else now
+    if not NIGHT_MODEL:
+        return False, "unset"
+    if os.path.exists(NIGHT_OFF_FILE):
+        return False, "off-file"
+    if not _in_window(now):
+        return False, "outside-window"
+    if _gap(now):
+        return False, "gap"
+    if _reserved(now):
+        return False, "reserved"
+    with _state_lock:
+        if _inflight["primary"] > 0:
+            return False, "primary-draining"
+        if now < _night["down_until"]:
+            return False, "breaker"
+        if now < _night["util_until"]:
+            return False, "util-yield"
+        if NIGHT_BIG_HOLD_S > 0:
+            if not _events_ok_locked(now):
+                return False, "events-down"
+            if _big_inflight_locked() or now - _ev["big_last"] < NIGHT_BIG_HOLD_S:
+                return False, "big-model-active"
+    return True, ""
+
+
+def _night_running() -> bool:
+    try:
+        req = urllib.request.Request(
+            PRIMARY + "/running", headers=_headers(PRIMARY_API_KEY)
+        )
+        with urllib.request.urlopen(req, timeout=3.0) as r:
+            return any(
+                m.get("model") == NIGHT_MODEL for m in json.load(r).get("running", [])
+            )
+    except Exception:
+        return False
+
+
+def _night_make_room(why: str) -> None:
+    """A request for another role inside the window: shut the night lane for NIGHT_UTIL_YIELD_S and
+    unload the night model so that role's model fits. Only the first of a burst unloads. Gaps
+    included: the night model can still be idling out its ttl when a gap opens."""
+    if not NIGHT_MODEL or NIGHT_UTIL_YIELD_S <= 0 or not _in_window():
+        return
+    with _state_lock:
+        fresh = time.time() >= _night["util_until"]
+        _night["util_until"] = time.time() + NIGHT_UTIL_YIELD_S
+    if not fresh:
+        return
+    with _night_room_lock:
+        if not _night_running():
+            return
+        t = time.time()
+        try:
+            req = urllib.request.Request(
+                PRIMARY + f"/api/models/unload/{NIGHT_MODEL}",
+                data=b"",
+                method="POST",
+                headers=_headers(PRIMARY_API_KEY),
+            )
+            with urllib.request.urlopen(req, timeout=120) as r:
+                code = r.status
+        except urllib.error.HTTPError as e:
+            code = e.code
+        except Exception as e:
+            code = type(e).__name__
+        with _state_lock:
+            _night["unloads"] += 1
+        _log(
+            f"night yield: unloaded {NIGHT_MODEL} for {why} (http={code}, {time.time() - t:.1f}s); "
+            f"night lane shut {NIGHT_UTIL_YIELD_S:g} s"
+        )
 
 
 # ---- JSON constraint by prompt shape -----------------------------------------------------------
@@ -584,6 +879,46 @@ class Handler(http.server.BaseHTTPRequestHandler):
         finally:
             resp.close()
 
+    def _night_forward(self, payload: dict, tag: str, t0: float) -> bool:
+        """Send a (non-streamed) shared request to the night model; True when answered."""
+        req = urllib.request.Request(
+            PRIMARY + "/v1/chat/completions",
+            data=json.dumps({**payload, "model": NIGHT_MODEL}).encode(),
+            method="POST",
+            headers={
+                **_headers(PRIMARY_API_KEY, json_body=True),
+                "User-Agent": NIGHT_UA,
+            },
+        )
+        client_error = False
+        with _slot("night"):
+            try:
+                with urllib.request.urlopen(req, timeout=NIGHT_TIMEOUT) as resp:
+                    data = resp.read()
+                    ctype = resp.headers.get("Content-Type", "application/json")
+            except urllib.error.HTTPError as e:
+                reason = f"status={e.code} body={e.read()[:120]!r}"
+                client_error = 400 <= e.code < 500
+            except Exception as e:
+                reason = f"{type(e).__name__}: {e}"
+            else:
+                try:
+                    u = json.loads(data).get("usage") or {}
+                    toks = f" tokens={u.get('prompt_tokens', '?')}+{u.get('completion_tokens', '?')}"
+                except Exception:
+                    toks = ""
+                _log(f"night    {tag} status=200 dt={time.time() - t0:.1f}s{toks}")
+                self._send(200, data, ctype, "night")
+                return True
+        if not client_error:
+            with _state_lock:
+                _night["down_until"] = time.time() + NIGHT_BREAKER_S
+        _log(
+            f"night    {tag} FAILED after {time.time() - t0:.1f}s ({reason}) -> fallback"
+            f"{'' if client_error else f' (night lane shut {NIGHT_BREAKER_S:g} s)'}"
+        )
+        return False
+
     def do_GET(self):
         if self.path == "/v1/models":
             data = [
@@ -608,6 +943,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
             breaker = time.time() < _primary_down_until
         big, running = _big_model_running()
         until = _reserved_until()
+        gap_until = _gap_until()
+        with _state_lock:
+            ev_ok = _events_ok_locked()
+            ev = {
+                "enabled": EVENTS,
+                "connected": _ev["connected"],
+                "connects": _ev["connects"],
+                "events": _ev["events"],
+                "big_inflight": _big_inflight_locked(),
+                "big_last_age_s": (
+                    round(time.time() - _ev["big_last"]) if _ev["big_last"] else None
+                ),
+            }
+            night_shut = max(_night["down_until"], _night["util_until"])
+        night_open, night_why = _night_open()
         body = json.dumps(
             {
                 "status": "ok" if (primary or fallback) else "down",
@@ -622,13 +972,45 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "guarded_models": sorted(GUARDED_MODELS),
                     "big_model_running": big,
                     "running_on_primary": running,
+                    "allowed_running": sorted(ALLOWED_RUNNING),
                 },
-                "quiet": {"window": QUIET_WINDOW, "active": _quiet()},
+                "quiet": {
+                    "window": QUIET_WINDOW,
+                    "active": _quiet(),
+                    "in_window": _in_window(),
+                },
+                "gap": {
+                    "file": GAP_FILE or None,
+                    "open": _gap(),
+                    "until": (
+                        time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(gap_until))
+                        if gap_until
+                        else None
+                    ),
+                },
                 "yield": {
                     "every_s": YIELD_EVERY_S,
                     "hold_s": YIELD_HOLD_S,
                     "active": bool(_yield["active_since"]),
                     "count": _yield["count"],
+                    "mode": (
+                        "events" if ev_ok else ("clock" if YIELD_EVERY_S > 0 else "off")
+                    ),
+                },
+                "events": ev,
+                "night": {
+                    "model": NIGHT_MODEL or None,
+                    "slots": NIGHT_SLOTS,
+                    "open": night_open,
+                    "why": night_why,
+                    "big_hold_s": NIGHT_BIG_HOLD_S,
+                    "util_yield_s": NIGHT_UTIL_YIELD_S,
+                    "unloads": _night["unloads"],
+                    "shut_until": (
+                        time.strftime("%H:%M:%S", time.localtime(night_shut))
+                        if night_shut > time.time()
+                        else None
+                    ),
                 },
                 "reserved": {
                     "file": RESERVED_FILE or None,
@@ -669,6 +1051,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             body = (
                 json.dumps(payload).encode()
             )  # what the primary receives; the fallback body is built from payload
+        if model not in SHARED_MODELS:
+            _night_make_room(f"model={model}")  # another role may need the night card
         guarded = _guarded(model)
         stream = bool(payload.get("stream"))
         msgs = payload.get("messages") or []
@@ -696,6 +1080,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 skip_primary = True
                 why_fallback = "guarded"
                 tag += f" guarded(running={','.join(running) or 'unreachable'})"
+        use_night = False
         if model in SHARED_MODELS:
             # Slot-aware scheduling: take the primary while it has a free slot, else the fallback
             # while IT has one, else WAIT (bounded) rather than overload either side -- a 502 burst
@@ -712,11 +1097,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     primary_ok = (
                         not _quiet() and not _reserved() and not _big_model_running()[0]
                     )
+                night_ok = False  # the night lane, while the primary is held
+                if not primary_ok and guarded and not stream:
+                    night_ok = _night_open()[0]
                 with _state_lock:
+                    if primary_ok and guarded and _inflight["night"] > 0:
+                        # a gap just opened: let the night card's calls finish first
+                        primary_ok, why_fallback = False, "night-draining"
                     if primary_ok and guarded and _yielding(_inflight["primary"]):
                         primary_ok, why_fallback = False, "yield"
                     if primary_ok and _inflight["primary"] < PRIMARY_SLOTS:
                         skip_primary, why_fallback = False, ""
+                        break
+                    if night_ok and _inflight["night"] < NIGHT_SLOTS:
+                        use_night, skip_primary, why_fallback = True, True, ""
                         break
                     if (
                         chars <= FALLBACK_MAX_CHARS
@@ -724,14 +1118,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     ):
                         skip_primary, why_fallback = (
                             True,
-                            ("shared" if primary_ok else (why_fallback or "breaker")),
+                            (
+                                "shared"
+                                if (primary_ok or night_ok)
+                                else (why_fallback or "breaker")
+                            ),
                         )
                         break
                 if time.time() > deadline:
-                    skip_primary, why_fallback = (
-                        (not primary_ok),
-                        ("" if primary_ok else (why_fallback or "breaker")),
-                    )
+                    if not primary_ok and night_ok:
+                        use_night, skip_primary, why_fallback = True, True, ""
+                    else:
+                        skip_primary, why_fallback = (
+                            (not primary_ok),
+                            ("" if primary_ok else (why_fallback or "breaker")),
+                        )
                     break
                 waited = True
                 time.sleep(0.5)
@@ -739,6 +1140,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 tag += " waited"
             if why_fallback == "shared":
                 tag += " shared"
+
+        # ---- night lane: the second copy of the shared model (see "night lane") ----
+        if use_night:
+            if self._night_forward(payload, tag, t0):
+                return
+            why_fallback = "night-failed"
 
         # ---- primary: OpenAI-compatible, request forwarded verbatim ----
         client_error = False
@@ -939,4 +1346,6 @@ if __name__ == "__main__":
         f"model={FALLBACK_MODEL or 'as requested'}, num_ctx={FALLBACK_NUM_CTX}) "
         f"primary_timeout={PRIMARY_TIMEOUT:g}s breaker={BREAKER_SECS:g}s"
     )
+    if EVENTS:
+        threading.Thread(target=_events_loop, name="events", daemon=True).start()
     Server(LISTEN, Handler).serve_forever()

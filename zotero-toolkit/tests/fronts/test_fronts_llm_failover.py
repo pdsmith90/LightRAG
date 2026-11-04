@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import queue
+import threading
 import time
 from pathlib import Path
 
@@ -99,7 +101,17 @@ def front(monkeypatch, primary, fallback):
         "_guard_cache": (0.0, True, []),
         "_reserved_cache": (0.0, 0),
         "_yield": {"next": 0.0, "active_since": 0.0, "drained_at": 0.0, "count": 0},
-        "_inflight": {"primary": 0, "fallback": 0},
+        "_inflight": {"primary": 0, "fallback": 0, "night": 0},
+        "_gap_cache": (0.0, 0),
+        "_night": {"down_until": 0.0, "util_until": 0.0, "unloads": 0},
+        "_ev": {
+            "connected": False,
+            "down_since": 0.0,
+            "inflight": {},
+            "big_last": 0.0,
+            "events": 0,
+            "connects": 0,
+        },
     }.items():
         monkeypatch.setattr(fo, name, value)
     with fakes.serve(fo) as url:
@@ -134,6 +146,9 @@ def test_defaults_are_loopback_and_every_policy_is_off():
         and not fo._quiet()
         and not fo._reserved()
     )
+    assert fo.PRIMARY_SLOTS == 8 and fo.GAP_FILE == "" and not fo._gap()
+    assert fo.NIGHT_MODEL == "" and fo._night_open() == (False, "unset")
+    assert fo.EVENTS is False  # the event watcher needs the running-model guard
 
 
 def test_primary_success_is_forwarded_verbatim(front, primary, fallback):
@@ -671,3 +686,329 @@ def test_yield_state_machine(monkeypatch):
     assert fo._yield["count"] == 2
     monkeypatch.setattr(fo, "YIELD_EVERY_S", 0.0)
     assert fo._yielding(0, now=5000.0) is False  # 0 disables
+
+
+# ---- request events, gap file, night lane -----------------------------------------------------
+
+
+def quiet_now(monkeypatch):
+    """Put the quiet window around the current minute."""
+    t = time.localtime()
+    cur = t.tm_hour * 60 + t.tm_min
+    monkeypatch.setattr(fo, "_QUIET", ((cur - 1) % 1440, (cur + 2) % 1440))
+    monkeypatch.setattr(fo, "QUIET_WINDOW", "now")
+
+
+def set_epoch_file(path, text, cache):
+    """Write (or with None remove) an epoch file and clear the front's 1 s cache of it."""
+    if text is None:
+        path.unlink(missing_ok=True)
+    else:
+        path.write_text(text)
+    setattr(fo, cache, (0.0, 0))
+
+
+def settle():
+    """Wait until the front has released every slot (it does so after sending the reply)."""
+    assert fakes.wait_until(lambda: not any(fo._inflight.values()))
+
+
+def backend(response):
+    return response[1]["X-LLM-Failover-Backend"]
+
+
+@pytest.fixture
+def night(front, primary, fallback, monkeypatch, tmp_path):
+    """The night lane configured inside an active quiet window; event stream up, nothing big."""
+    quiet_now(monkeypatch)
+    for name, value in {
+        "SHARED_MODELS": {"extract"},
+        "GUARDED_MODELS": {"extract"},
+        "ALLOWED_RUNNING": {"extract", "query"},
+        "EVENTS": True,
+        "NIGHT_MODEL": "extract-n",
+        "NIGHT_OFF_FILE": str(tmp_path / "night_off"),
+        "GAP_FILE": str(tmp_path / "gap_until"),
+        "RESERVED_FILE": str(tmp_path / "reserved_until"),
+        "LOG": str(tmp_path / "fo.log"),
+        "SLOT_WAIT_S": 0.3,
+    }.items():
+        monkeypatch.setattr(fo, name, value)
+    fo._ev.update(connected=True, connects=1)
+    primary.route("GET", "/running", lambda h, b: fakes.reply(h, 200, {"running": []}))
+    primary.route("POST", CHAT, ok_primary)
+    fallback.route("POST", "/api/chat", ok_ollama)
+    return tmp_path
+
+
+def test_night_lane_open_and_shut_reasons(night, monkeypatch):
+    assert fo._night_open() == (True, "")
+    fo._ev["inflight"] = {"1": "extract", "2": "extract-n"}  # allowed + night: not big
+    assert fo._night_open() == (True, "")
+
+    (night / "night_off").touch()
+    assert fo._night_open() == (False, "off-file")
+    (night / "night_off").unlink()
+
+    reserved = night / "reserved_until"
+    set_epoch_file(reserved, f"{int(time.time()) + 60}", "_reserved_cache")
+    assert fo._night_open() == (False, "reserved")
+    set_epoch_file(reserved, None, "_reserved_cache")
+
+    set_epoch_file(night / "gap_until", f"{int(time.time()) + 60}", "_gap_cache")
+    assert fo._night_open() == (False, "gap")
+    set_epoch_file(night / "gap_until", None, "_gap_cache")
+
+    fo._inflight["primary"] = 2
+    assert fo._night_open() == (False, "primary-draining")
+    fo._inflight["primary"] = 0
+
+    fo._night["down_until"] = time.time() + 60
+    assert fo._night_open() == (False, "breaker")
+    fo._night["down_until"] = 0.0
+    fo._night["util_until"] = time.time() + 60
+    assert fo._night_open() == (False, "util-yield")
+    fo._night["util_until"] = 0.0
+
+    fo._ev["inflight"] = {"3": "big-27b"}
+    assert fo._night_open() == (False, "big-model-active")
+    fo._ev["inflight"] = {}
+    fo._ev["big_last"] = time.time() - 5  # ended, but inside NIGHT_BIG_HOLD_S
+    assert fo._night_open() == (False, "big-model-active")
+    fo._ev["big_last"] = time.time() - fo.NIGHT_BIG_HOLD_S - 1
+    assert fo._night_open() == (True, "")
+
+    fo._ev["connected"] = False  # never connected: no verdicts to keep
+    assert fo._night_open() == (False, "events-down")
+    monkeypatch.setattr(fo, "NIGHT_BIG_HOLD_S", 0.0)  # no power hold: no events needed
+    assert fo._night_open() == (True, "")
+
+    monkeypatch.setattr(fo, "_QUIET", None)
+    assert fo._night_open() == (False, "outside-window")
+    monkeypatch.setattr(fo, "NIGHT_MODEL", "")
+    assert fo._night_open() == (False, "unset")
+
+
+def test_night_lane_serves_shared_requests_while_the_window_holds_the_primary(
+    night, front, primary, fallback
+):
+    r = chat(front, model="extract")
+    assert r[0] == 200 and backend(r) == "night"
+    sent = primary.hits("POST", CHAT)[-1]
+    assert json.loads(sent["body"])["model"] == "extract-n"
+    assert sent["headers"]["user-agent"] == fo.NIGHT_UA
+    d = json.loads(fakes.call("GET", front + "/health")[2])
+    assert d["night"]["open"] is True and d["night"]["model"] == "extract-n"
+    assert d["quiet"] == {"window": "now", "active": True, "in_window": True}
+    assert d["yield"]["mode"] == "events" and d["events"]["enabled"] is True
+    settle()
+
+    assert backend(chat(front, model="extract", stream=True)) == "fallback"
+    assert len(primary.hits("POST", CHAT)) == 1  # a stream never takes the night lane
+    settle()
+
+    primary.route("POST", CHAT, lambda h, b: fakes.reply(h, 500, {"error": "boom"}))
+    assert backend(chat(front, model="extract")) == "fallback"
+    assert fo._night["down_until"] > time.time() and fo._primary_down_until == 0.0
+    assert "(night-failed)" in (night / "fo.log").read_text()
+    settle()
+    assert backend(chat(front, model="extract")) == "fallback"
+    assert len(primary.hits("POST", CHAT)) == 2  # the night breaker holds
+    d = json.loads(fakes.call("GET", front + "/health")[2])
+    assert d["night"]["why"] == "breaker" and d["night"]["shut_until"] is not None
+
+
+def test_another_role_unloads_the_night_model_once_per_burst(
+    night, front, primary, monkeypatch
+):
+    running = {"running": [{"model": "extract-n", "state": "ready"}]}
+    primary.route("GET", "/running", lambda h, b: fakes.reply(h, 200, running))
+
+    def unload(h, _body):
+        running["running"] = []
+        fakes.reply(h, 200, {"msg": "ok"})
+
+    unload_path = "/api/models/unload/extract-n"
+    primary.route("POST", unload_path, unload)
+
+    assert backend(chat(front, model="query")) == "primary"
+    assert len(primary.hits("POST", unload_path)) == 1
+    settle()
+    assert fo._night["unloads"] == 1 and fo._night_open() == (False, "util-yield")
+    assert backend(chat(front, model="extract")) == "fallback"
+    running["running"] = [{"model": "extract-n", "state": "ready"}]
+    chat(front, model="query")  # same burst: no second unload
+    assert len(primary.hits("POST", unload_path)) == 1
+    settle()
+
+    fo._night["util_until"] = 0.0  # the yield period is over
+    assert backend(chat(front, model="extract")) == "night"
+    settle()
+
+    # inside a gap the night lane is shut anyway, but a night model still idling out
+    # its ttl must make room
+    set_epoch_file(night / "gap_until", f"{int(time.time()) + 60}", "_gap_cache")
+    fo._night["util_until"] = 0.0
+    chat(front, model="query")
+    assert len(primary.hits("POST", unload_path)) == 2
+    set_epoch_file(night / "gap_until", None, "_gap_cache")
+    settle()
+
+    running["running"] = [{"model": "extract-n", "state": "ready"}]
+    fo._night["util_until"] = 0.0
+    monkeypatch.setattr(fo, "NIGHT_UTIL_YIELD_S", 0.0)  # 0 turns the unload off
+    chat(front, model="query")
+    monkeypatch.setattr(fo, "NIGHT_UTIL_YIELD_S", 300.0)
+    monkeypatch.setattr(
+        fo, "_QUIET", None
+    )  # outside the window: nothing to make room for
+    chat(front, model="query")
+    assert len(primary.hits("POST", unload_path)) == 2
+
+
+def test_event_stream_drives_the_yield(front, primary, fallback, monkeypatch):
+    for name, value in {
+        "SHARED_MODELS": {"extract"},
+        "GUARDED_MODELS": {"extract"},
+        "ALLOWED_RUNNING": {"extract"},
+        "EVENTS": True,
+        "YIELD_EVERY_S": 3600.0,  # the clock never comes due during the test
+    }.items():
+        monkeypatch.setattr(fo, name, value)
+    primary.route("GET", "/running", lambda h, b: fakes.reply(h, 200, {"running": []}))
+    primary.route("POST", CHAT, ok_primary)
+    fallback.route("POST", "/api/chat", ok_ollama)
+    q = queue.Queue()
+
+    def events(
+        h, _body
+    ):  # llama-swap's SSE framing: an "inflight" event's data is a JSON string
+        h.send_response(200)
+        h.send_header("Content-Type", "text/event-stream")
+        h.end_headers()
+
+        def send(ev):
+            h.wfile.write(b"event: message\ndata: " + json.dumps(ev).encode() + b"\n\n")
+            h.wfile.flush()
+
+        send({"type": "logData", "data": "{}"})
+        send(
+            {
+                "type": "inflight",
+                "data": json.dumps(
+                    {
+                        "operation": "snapshot",
+                        "requests": [{"id": 1, "model": "extract"}],
+                    }
+                ),
+            }
+        )
+        while (d := q.get(timeout=10)) is not None:
+            send({"type": "inflight", "data": json.dumps(d)})
+        h.close_connection = True
+
+    primary.route("GET", "/api/events", events)
+    t = threading.Thread(target=fo._events_once, daemon=True)
+    t.start()
+    assert fakes.wait_until(lambda: fo._ev["inflight"] == {"1": "extract"})
+    assert fo._ev["connected"] and fo._ev["connects"] == 1
+    with fo._state_lock:
+        assert fo._yielding(0) is False  # only an allowed model in flight
+
+    q.put({"operation": "upsert", "request": {"id": 7, "model": "big-27b"}})
+    assert fakes.wait_until(lambda: "7" in fo._ev["inflight"])
+    with fo._state_lock:
+        assert fo._yielding(0) is True and fo._ev["big_last"] > 0
+    r = chat(front, model="extract")
+    assert backend(r) == "fallback"
+    assert primary.hits("POST", CHAT) == []
+    d = json.loads(fakes.call("GET", front + "/health")[2])
+    assert d["yield"]["mode"] == "events" and d["events"]["big_inflight"] == ["big-27b"]
+
+    fo._guard_cache = (time.time(), False, [])
+    q.put({"operation": "remove", "id": 7})
+    assert fakes.wait_until(lambda: "7" not in fo._ev["inflight"])
+    with fo._state_lock:
+        assert fo._yielding(0) is False
+    assert fo._yield["count"] == 1 and fo._guard_cache[0] == 0.0  # fresh /running read
+    assert backend(chat(front, model="extract")) == "primary"  # no clock drain
+
+    q.put(None)  # the stream ends
+    t.join(5)
+    assert not t.is_alive()
+    assert not fo._ev["connected"] and fo._ev["inflight"] == {}
+    with fo._state_lock:
+        assert fo._events_ok_locked() is True  # inside the reconnect grace
+    monkeypatch.setattr(fo, "EVENTS_GRACE_S", 0.0)
+    with fo._state_lock:
+        assert fo._events_ok_locked() is False
+        fo._yield["next"] = time.time() - 1  # down: the clock yield is back
+        assert fo._yielding(2) is True
+    d = json.loads(fakes.call("GET", front + "/health")[2])
+    assert d["yield"]["mode"] == "clock" and d["events"]["connected"] is False
+
+
+def test_gap_file_reopens_the_primary_inside_the_window(
+    night, front, primary, monkeypatch
+):
+    gap = night / "gap_until"
+    assert backend(chat(front, model="extract")) == "night"
+    settle()
+
+    set_epoch_file(
+        gap, f"{int(time.time()) + 120} written by the scheduler\n", "_gap_cache"
+    )
+    assert fo._gap() and fo._in_window() and not fo._quiet()
+    assert backend(chat(front, model="extract")) == "primary"
+    assert json.loads(primary.hits("POST", CHAT)[-1]["body"])["model"] == "extract"
+    settle()
+    d = json.loads(fakes.call("GET", front + "/health")[2])
+    assert d["gap"]["open"] is True and d["gap"]["until"] is not None
+    assert d["quiet"]["active"] is False and d["quiet"]["in_window"] is True
+    assert d["night"]["open"] is False and d["night"]["why"] == "gap"
+
+    set_epoch_file(gap, f"{int(time.time()) - 5}", "_gap_cache")  # expired
+    assert not fo._gap() and fo._quiet()
+    assert backend(chat(front, model="extract")) == "night"
+    settle()
+    for text in ("garbage", "", None):  # unreadable, empty, missing: no gap
+        set_epoch_file(gap, text, "_gap_cache")
+        assert fo._gap_until() == 0 and fo._quiet()
+        assert backend(chat(front, model="extract")) == "night"
+        settle()
+
+    monkeypatch.setattr(
+        fo, "_QUIET", None
+    )  # outside the window the file changes nothing
+    set_epoch_file(gap, f"{int(time.time()) + 120}", "_gap_cache")
+    assert backend(chat(front, model="extract")) == "primary"
+    assert fo._night_open() == (False, "outside-window")
+
+
+def test_gap_and_night_lane_drain_before_the_other_card_starts(night, front):
+    gap = night / "gap_until"
+    set_epoch_file(gap, f"{int(time.time()) + 120}", "_gap_cache")
+    fo._inflight["night"] = 1  # a gap just opened: night calls still finishing
+    assert backend(chat(front, model="extract")) == "fallback"
+    assert "(night-draining)" in (night / "fo.log").read_text()
+    fo._inflight["night"] = 0
+    assert backend(chat(front, model="extract")) == "primary"
+    settle()
+
+    set_epoch_file(gap, f"{int(time.time()) - 1}", "_gap_cache")  # the gap closed
+    fo._inflight["primary"] = 2  # primary calls still finishing
+    assert fo._night_open() == (False, "primary-draining")
+    assert backend(chat(front, model="extract")) == "fallback"
+    fo._inflight["primary"] = 0
+    assert backend(chat(front, model="extract")) == "night"
+
+
+def test_running_guard_ignores_the_night_model(front, primary, monkeypatch):
+    monkeypatch.setattr(fo, "ALLOWED_RUNNING", {"extract"})
+    monkeypatch.setattr(fo, "NIGHT_MODEL", "extract-n")
+    running = {"running": [{"model": "extract"}, {"model": "extract-n"}]}
+    primary.route("GET", "/running", lambda h, b: fakes.reply(h, 200, running))
+    assert fo._big_model_running()[0] is False
+    running["running"].append({"model": "big-27b"})
+    fo._guard_cache = (0.0, True, [])
+    assert fo._big_model_running()[0] is True
