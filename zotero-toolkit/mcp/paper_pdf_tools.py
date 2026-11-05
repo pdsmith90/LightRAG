@@ -463,8 +463,9 @@ class OcrUnavailable(RuntimeError):
     pass
 
 
-def _pdeathsig():
-    """Child setup: killed with this process; address-space limit lifted for the server."""
+def _pdeathsig(parent: int):
+    """Child setup: killed with its parent `parent` (the helper); address-space limit lifted
+    for the server. A parent that died before the prctl is caught by comparing pids."""
     import ctypes
     import resource
 
@@ -472,15 +473,21 @@ def _pdeathsig():
         ctypes.CDLL("libc.so.6", use_errno=True).prctl(
             1, signal.SIGKILL
         )  # PR_SET_PDEATHSIG
+        if (
+            os.getppid() != parent
+        ):  # reparented before the signal was armed: it will never come
+            os.kill(os.getpid(), signal.SIGKILL)
     except Exception:
         pass
     soft, hard = resource.getrlimit(resource.RLIMIT_AS)
     resource.setrlimit(resource.RLIMIT_AS, (hard, hard))
 
 
-def _die_with_parent():
-    """Ask the kernel to SIGTERM this process when its parent dies (Linux; best effort), so
-    the SIGTERM handler unwinds, stops the OCR server and frees its lock."""
+def _die_with_parent(parent: int | None = None):
+    """Ask the kernel to SIGTERM this process when its parent `parent` (the pid recorded at
+    start-up) dies (Linux; best effort), so the SIGTERM handler unwinds, stops the OCR server
+    and frees its lock. If the parent is already gone by the time the request is armed (this
+    process was reparented), the signal would never come: send it to ourselves."""
     if not sys.platform.startswith("linux"):
         return
     try:
@@ -489,6 +496,8 @@ def _die_with_parent():
         ctypes.CDLL("libc.so.6", use_errno=True).prctl(
             1, signal.SIGTERM
         )  # PR_SET_PDEATHSIG
+        if parent is not None and os.getppid() != parent:
+            os.kill(os.getpid(), signal.SIGTERM)
     except Exception:
         pass
 
@@ -560,7 +569,7 @@ class OcrServer:
             self._log = open(os.path.join(CACHE_DIR, "ocr-server.log"), "wb")
             self.proc = subprocess.Popen(
                 cmd, env=env, stdin=subprocess.DEVNULL, stdout=self._log, stderr=subprocess.STDOUT,
-                start_new_session=True, preexec_fn=_pdeathsig,
+                start_new_session=True, preexec_fn=lambda parent=os.getpid(): _pdeathsig(parent),
             )  # fmt: skip
             self._wait_ready()
             self.load_s = time.monotonic() - started_at
@@ -1155,6 +1164,9 @@ def _limit_memory():
 
 
 def main(argv=None) -> int:
+    parent = (
+        os.getppid()
+    )  # the proxy (it execs this helper directly), before anything else runs
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
     ap.add_argument("mode", choices=("equation", "table"))
     ap.add_argument("pdf")
@@ -1164,7 +1176,7 @@ def main(argv=None) -> int:
     signal.signal(
         signal.SIGTERM, lambda *_: sys.exit(143)
     )  # runs the `with` blocks' cleanup
-    _die_with_parent()
+    _die_with_parent(parent)
     real_stdout = sys.stdout
     sys.stdout = sys.stderr  # nothing but the result may reach stdout
     _limit_memory()

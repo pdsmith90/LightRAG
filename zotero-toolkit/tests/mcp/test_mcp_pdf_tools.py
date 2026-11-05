@@ -550,6 +550,36 @@ time.sleep(60)
     assert not stub.alive(), "the OCR server outlived the helper"
 
 
+def test_a_parent_that_is_already_gone_is_caught(t):
+    """PR_SET_PDEATHSIG only fires on a death AFTER it is armed: a process reparented before
+    that must notice by comparing pids (the helper SIGTERMs itself; the OCR server SIGKILLs
+    itself)."""
+    child = f"""
+import importlib.util, os, signal, sys, time
+spec = importlib.util.spec_from_file_location("h", {str(HELPER_PY)!r})
+t = importlib.util.module_from_spec(spec); spec.loader.exec_module(t)
+signal.signal(signal.SIGTERM, lambda *_: (print("term", flush=True), sys.exit(0)))
+t._die_with_parent(os.getppid() + int(sys.argv[1]))
+time.sleep(1.5)
+print("survived", flush=True)
+"""
+    run = [sys.executable, "-c", child]
+    # a recorded parent that is not the live one: reparented, so the helper stops itself
+    gone = subprocess.run([*run, "1"], capture_output=True, text=True, timeout=30)
+    assert gone.stdout.strip() == "term"
+    kept = subprocess.run([*run, "0"], capture_output=True, text=True, timeout=30)
+    assert kept.stdout.strip() == "survived"
+    # the OCR server's preexec: a parent other than the real one, so the child kills itself
+    p = subprocess.Popen(
+        ["sleep", "30"], preexec_fn=lambda: t._pdeathsig(os.getpid() + 1)
+    )
+    assert p.wait(timeout=10) == -signal.SIGKILL
+    p = subprocess.Popen(
+        ["sleep", "0.3"], preexec_fn=lambda parent=os.getpid(): t._pdeathsig(parent)
+    )
+    assert p.wait(timeout=10) == 0
+
+
 def test_ocr_server_dies_with_its_caller(t, stub, tmp_path):
     """SIGKILL of the helper (the proxy's timeout) must not leave the OCR server behind."""
     code = f"""
