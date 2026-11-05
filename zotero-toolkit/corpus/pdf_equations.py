@@ -284,6 +284,8 @@ def strip_own_number(latex: str, number: str) -> str:
     """`latex` without a trailing "(N)" (and the spacing commands before it) when N is the equation's
     number: the model sometimes copies the printed number into the formula, and \\tag{N} must not repeat it."""
     n = re.escape(norm_number(number))
+    if re.fullmatch(r"\s*\(\s*" + n + r"\s*\)\s*", latex):
+        return ""  # nothing but the number: no formula at all
     return re.sub(
         r"(?:\\(?:q?quad|hfill|hspace\*?\{[^}]*\}|[;:,! ])|\s)+\(\s*"
         + n
@@ -298,22 +300,24 @@ def assemble(entries: list[dict], box_tags: list[str]) -> tuple[list[str], str]:
     """(lines of `$...$`, how): a box's formulas paired with the equation numbers its text layer
     carries. As many numbers as formulas pair by order; one number is the box's last formula (a
     long equation the model wrote as several lines); no number leaves them unnumbered; any other
-    count writes the formulas without numbers."""
+    count writes the formulas without numbers. A formula that was only its own number is dropped
+    (no lines: the box falls back to its text layer)."""
     n, t = len(entries), len(box_tags)
     if not n:
         return [], "none"
     if t == 0:
         return [f"${e['latex']}$" for e in entries], "unnumbered"
     if t == n:
-        return [
-            tagged(strip_own_number(e["latex"], box_tags[i]), box_tags[i])
+        pairs = [
+            (strip_own_number(e["latex"], box_tags[i]), box_tags[i])
             for i, e in enumerate(entries)
-        ], "order"
+        ]
+        return [tagged(lx, k) for lx, k in pairs if lx], "order"
     if t == 1:
         lines = [f"${e['latex']}$" for e in entries[:-1]]
-        lines.append(
-            tagged(strip_own_number(entries[-1]["latex"], box_tags[0]), box_tags[0])
-        )
+        last = strip_own_number(entries[-1]["latex"], box_tags[0])
+        if last:
+            lines.append(tagged(last, box_tags[0]))
         return lines, "single-number"
     return [f"${e['latex']}$" for e in entries], "unpaired"
 
@@ -525,6 +529,10 @@ class Equations:
             self.stats["text_layer"] += 1
             return fallback
         lines, how = assemble(entries, [t for t, _ in tw])
+        if not lines:
+            self.reasons["only the equation number"] += 1
+            self.stats["text_layer"] += 1
+            return fallback
         self.stats["ocr"] += 1
         self.stats["eq_lines"] += len(lines)
         self.stats["pair_" + how] += 1

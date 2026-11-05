@@ -34,6 +34,7 @@ LEAD = (
 AFTER = (
     "where the symbols are explained in the invented list that follows this equation."
 )
+BETWEEN = "A second invented paragraph that sits between the two equations."
 EQ_LAYER = "x2 + y2 = z2                              (5)"  # one text line: formula, gap, equation number
 LATEX = "x^{2} + y^{2} = z^{2}"
 
@@ -82,6 +83,63 @@ def chunk_for(slot="\n\n", box=(40, 290, 560, 312), lead_class="text"):
                 "class": "text",
                 "bbox": (40, 330, 555, 400),
                 "pos": (len(lead) + len(slot), len(text)),
+            },
+        ],
+    }
+
+
+def page_with_two_equations(tmp_path, name="twoeq.pdf"):
+    """One page: a lead-in, equation (5) at y=305, a paragraph, equation (6) at y=405, a closing paragraph."""
+    p = str(tmp_path / name)
+    doc = pymupdf.open()
+    page = doc.new_page(width=595, height=842)
+    page.insert_textbox(pymupdf.Rect(40, 60, 555, 200), LEAD, fontsize=9)
+    page.insert_text((60, 305), EQ_LAYER, fontsize=10)
+    page.insert_textbox(pymupdf.Rect(40, 330, 555, 370), BETWEEN, fontsize=9)
+    page.insert_text((60, 405), "a + b = c                    (6)", fontsize=10)
+    page.insert_textbox(pymupdf.Rect(40, 420, 555, 460), AFTER, fontsize=9)
+    doc.save(p)
+    doc.close()
+    return p
+
+
+def chunk_for_two_boxes():
+    """A page chunk with two formula slots and the paragraph between them."""
+    lead = LEAD.strip() + "\n\n"
+    mid = BETWEEN + "\n\n"
+    slot = "\n\n"
+    text = lead + slot + mid + slot + AFTER + "\n\n"
+    p0 = len(lead)
+    p1, p2 = p0 + len(slot), p0 + len(slot) + len(mid)
+    p3 = p2 + len(slot)
+    return {
+        "text": text,
+        "metadata": {"page_number": 1},
+        "page_boxes": [
+            {"index": 0, "class": "text", "bbox": (40, 60, 555, 200), "pos": (0, p0)},
+            {
+                "index": 1,
+                "class": "formula",
+                "bbox": (40, 290, 560, 312),
+                "pos": (p0, p1),
+            },
+            {
+                "index": 2,
+                "class": "text",
+                "bbox": (40, 330, 555, 370),
+                "pos": (p1, p2),
+            },
+            {
+                "index": 3,
+                "class": "formula",
+                "bbox": (40, 390, 560, 412),
+                "pos": (p2, p3),
+            },
+            {
+                "index": 4,
+                "class": "text",
+                "bbox": (40, 420, 555, 460),
+                "pos": (p3, len(text)),
             },
         ],
     }
@@ -236,6 +294,43 @@ def test_two_numbered_equations_in_one_box_pair_by_order_and_a_stray_number_is_d
         out
     )  # the model's own "(6)" is not repeated
     assert e.stats["pair_order"] == 1
+
+
+def test_two_boxes_in_one_chunk_keep_their_slots_and_the_text_between_them(tmp_path):
+    answers = iter(["$$a + b = c \\quad (6)$$", f"$${LATEX}$$"])
+
+    def client(png):
+        # apply() replaces the boxes from the last one, so box (6) is sent to the client first
+        assert png.startswith(b"\x89PNG")
+        return next(answers)
+
+    out, e = run_apply(page_with_two_equations(tmp_path), chunk_for_two_boxes(), client)
+    assert (
+        out
+        == LEAD.strip()
+        + "\n"
+        + f"${LATEX} \\tag{{5}}$"
+        + "\n\n"
+        + BETWEEN
+        + "\n"
+        + "$a + b = c \\tag{6}$"
+        + "\n\n"
+        + AFTER
+        + "\n\n"
+    ), out
+    assert out.count("$") == 4 and e.stats["ocr"] == 2, e.stats
+    assert e.stats["pair_order"] == 2 and e.stats["boxes"] == 2, e.stats
+
+
+def test_a_box_whose_ocr_is_only_its_number_falls_back_to_the_text_layer(tmp_path):
+    # the layer is the number alone, so the transcription passes the check; with its own number
+    # stripped there is no formula left and the box must not become a \tag-only line
+    out, e = run_apply(
+        page_with_equation(tmp_path, layer="(6)"), chunk_for(), lambda p: "$$(6)$$"
+    )
+    assert "(6)" in out and "$" not in out, out
+    assert e.stats["text_layer"] == 1 and e.stats["ocr"] == 0, e.stats
+    assert e.reasons["only the equation number"] == 1, e.reasons
 
 
 def test_assemble_cases():
