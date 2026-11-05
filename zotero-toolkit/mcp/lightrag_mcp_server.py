@@ -1534,26 +1534,35 @@ def _pdf_tool(mode: str, path: str, number: str, page: int = 0) -> dict | str:
     if page:
         cmd += ["--page", str(page)]
     try:
-        r = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
-            capture_output=True,
-            text=True,
-            timeout=PDF_TIMEOUT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,
+            text=True,
         )
+    except OSError as e:
+        return f"The PDF reader could not be started ({PDF_PYTHON}): {e}"
+    try:
+        stdout, stderr = proc.communicate(timeout=PDF_TIMEOUT)
     except subprocess.TimeoutExpired:
+        # SIGTERM first: the helper saves what it has read and stops its OCR server
+        proc.terminate()
+        try:
+            proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
         return (
             f"The PDF reader did not finish in {PDF_TIMEOUT:.0f} s and was stopped "
             "(a very long paper on a first look, or a busy machine). Asking again "
             "continues from the pages it had already cached."
         )
-    except OSError as e:
-        return f"The PDF reader could not be started ({PDF_PYTHON}): {e}"
     try:
-        out = json.loads(r.stdout.strip().splitlines()[-1])
+        out = json.loads(stdout.strip().splitlines()[-1])
     except (ValueError, IndexError):
-        tail = (r.stderr or "").strip()[-400:]
-        return f"The PDF reader failed (exit {r.returncode}). {tail}"
+        tail = (stderr or "").strip()[-400:]
+        return f"The PDF reader failed (exit {proc.returncode}). {tail}"
     if not isinstance(out, dict) or out.get("status") == "error":
         return f"The PDF reader could not read this file: {(out or {}).get('message')}"
     return out

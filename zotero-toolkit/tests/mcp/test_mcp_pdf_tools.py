@@ -304,6 +304,10 @@ def pdf(tmp_path):
     for i, w in enumerate(words):
         p3.insert_text((90 + 30 * (i % 12), 130 + 12 * (i // 12)), w)
     p3.insert_text((90, 400), "Table 2 shows nothing else of interest here.")
+    for k in range(3):  # prose pages: nothing the tools look for
+        doc.new_page().insert_text(
+            (72, 100), f"Discussion part {k}: the widgets stay put in all cases."
+        )
     path = tmp_path / "invented.pdf"
     doc.save(path)
     return str(path)
@@ -323,6 +327,10 @@ def test_equation_with_ocr_picks_the_numbered_formula(t, stub, pdf, monkeypatch)
     assert d["ocr_cached"] and d["equation"] == ["$x = y + z, \\tag{2}$"]
     assert d["citing"][0]["page"] == 1 and "Eq. (2)" in d["citing"][0]["text"]
     assert stub.started() == 1
+    # a replaced model file does not reuse the old transcriptions
+    Path(t.OCR_MODEL).write_bytes(b"a different, longer model file")
+    d = t.cmd_equation(pdf, "(2)")
+    assert not d["ocr_cached"] and stub.started() == 2
 
 
 def test_equation_with_unmatched_formulas_shows_the_block(t, stub, pdf, monkeypatch):
@@ -425,6 +433,121 @@ def test_table_rows_are_split_by_order(t, pdf, monkeypatch):
         t, "layout_page", lambda doc, pno, cache: {"boxes": [], "tables": []}
     )
     assert t.cmd_table(pdf, "1")["status"] == "no-table"
+
+
+def test_page_scans_are_cached_and_survive_a_cut_off_run(t, pdf, monkeypatch):
+    """Page words and texts are read once per file: a retry (or the next question about the
+    same paper) does not re-read every page, and a run that is cut off keeps its progress."""
+    pymupdf = pytest.importorskip("pymupdf")
+    monkeypatch.setattr(t, "layout_page", fake_layout)
+    monkeypatch.setenv("LIGHTRAG_MCP_OCR", "off")
+    real = pymupdf.Page.get_text
+    calls = []
+
+    def spy(self, option="text", *a, **k):
+        calls.append((self.number, option))
+        return real(self, option, *a, **k)
+
+    def cut_off(self, option="text", *a, **k):
+        if option == "words" and self.number >= 3:
+            raise RuntimeError("cut off")
+        return spy(self, option, *a, **k)
+
+    monkeypatch.setattr(pymupdf.Page, "get_text", cut_off)
+    with pytest.raises(RuntimeError):
+        t.cmd_equation(pdf, "3")
+    assert sorted(t.Cache(pdf).data["scan"]) == ["0", "1", "2"]  # kept on the way out
+    calls.clear()
+    monkeypatch.setattr(pymupdf.Page, "get_text", spy)
+    assert (
+        t.cmd_equation(pdf, "3")["status"] == "text-layer"
+    )  # the retry reads what is missing
+    assert sorted(p for p, o in calls if o == "words") == [1, 3, 4, 5]
+    # each page's text once (page 1 is also read through a clip for the box)
+    assert sorted(p for p, o in calls if o == "text" and p != 1) == [0, 2, 3, 4, 5]
+    calls.clear()
+    d = t.cmd_equation(pdf, "2")  # everything is cached now
+    assert sorted(p for p, o in calls if o == "words") == [1]
+    assert [c for c in calls if c[1] == "text" and c[0] != 1] == []
+    assert d["citing"][0]["page"] == 1
+    calls.clear()
+    t.cmd_table(pdf, "1")
+    assert sum(1 for c in calls if c[1] == "blocks") == 6
+    calls.clear()
+    t.cmd_table(pdf, "1")
+    assert [c for c in calls if c[1] == "blocks"] == []
+
+
+def test_a_stale_scan_does_not_crash_the_answer(t, pdf, monkeypatch):
+    """The cached scan names a number the live words lack: a labelled text-layer answer,
+    not a StopIteration turned into a generic error."""
+    monkeypatch.setattr(t, "layout_page", fake_layout)
+    monkeypatch.setenv("LIGHTRAG_MCP_OCR", "off")
+    t.cmd_equation(pdf, "3")
+    cache = t.Cache(pdf)
+    cache.data["scan"]["1"]["tags"] = [["9", 520.0, 310.0, 540.0, 320.0]]
+    cache.save()
+    d = t.cmd_equation(pdf, "9")
+    assert d["status"] == "text-layer" and "no formula box" in d["reason"]
+    assert d["number_label"] == "9" and d["page"] == 2
+
+
+def test_lock_fd_is_closed_when_the_wait_runs_out(t, stub):
+    import fcntl
+
+    os.makedirs(t.CACHE_DIR, exist_ok=True)
+    with open(Path(t.CACHE_DIR) / "ocr.lock", "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        srv = t.OcrServer(time.monotonic() + 0.3)
+        with pytest.raises(t.OcrUnavailable, match="held the model"):
+            srv.__enter__()
+        assert srv._lock.closed, "the lock file was left open"
+
+
+def _alive(pid):
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().split()[2] != "Z"
+    except OSError:
+        return False
+
+
+def test_helper_dies_with_its_parent(t, stub, tmp_path):
+    """SIGKILL of the proxy side: the helper gets SIGTERM from the kernel, unwinds, and its
+    OCR server goes with it (the helper holds the OCR lock, so it must not run on)."""
+    mid_pid = tmp_path / "mid.pid"
+    mid = f"""
+import importlib.util, os, signal, sys, time
+spec = importlib.util.spec_from_file_location("h", {str(HELPER_PY)!r})
+t = importlib.util.module_from_spec(spec); spec.loader.exec_module(t)
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+t._die_with_parent()
+t.CACHE_DIR = {t.CACHE_DIR!r}
+t.LLAMA_SERVER, t.OCR_MODEL, t.OCR_MMPROJ = {t.LLAMA_SERVER!r}, {t.OCR_MODEL!r}, {t.OCR_MMPROJ!r}
+with t.OcrServer(time.monotonic() + 30):
+    open({str(mid_pid)!r}, "w").write(str(os.getpid()))
+    print("up", flush=True)
+    time.sleep(60)
+"""
+    top = f"""
+import subprocess, sys, time
+p = subprocess.Popen([sys.executable, "-c", {mid!r}], stdout=subprocess.PIPE, text=True)
+print(p.stdout.readline().strip(), flush=True)
+time.sleep(60)
+"""
+    parent = subprocess.Popen(
+        [sys.executable, "-c", top], stdout=subprocess.PIPE, text=True
+    )
+    assert parent.stdout.readline().strip() == "up"
+    helper = int(mid_pid.read_text())
+    assert _alive(helper) and len(stub.alive()) == 1
+    parent.send_signal(signal.SIGKILL)
+    parent.wait()
+    for _ in range(50):
+        if not _alive(helper) and not stub.alive():
+            break
+        time.sleep(0.1)
+    assert not _alive(helper), "the helper outlived its parent"
+    assert not stub.alive(), "the OCR server outlived the helper"
 
 
 def test_ocr_server_dies_with_its_caller(t, stub, tmp_path):

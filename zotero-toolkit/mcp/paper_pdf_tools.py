@@ -88,7 +88,7 @@ OCR_PROMPT = (
     "directly without any conversational filler."
 )
 
-LAYOUT_VERSION = "1"
+LAYOUT_VERSION = "2"
 RAW_LIMIT = 1500  # characters of text layer returned
 
 
@@ -478,6 +478,21 @@ def _pdeathsig():
     resource.setrlimit(resource.RLIMIT_AS, (hard, hard))
 
 
+def _die_with_parent():
+    """Ask the kernel to SIGTERM this process when its parent dies (Linux; best effort), so
+    the SIGTERM handler unwinds, stops the OCR server and frees its lock."""
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        import ctypes
+
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(
+            1, signal.SIGTERM
+        )  # PR_SET_PDEATHSIG
+    except Exception:
+        pass
+
+
 def _free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -517,40 +532,42 @@ class OcrServer:
                 )
         os.makedirs(CACHE_DIR, exist_ok=True)
         self._lock = open(os.path.join(CACHE_DIR, "ocr.lock"), "w")
-        while True:  # one OCR server at a time, whatever the number of callers
-            try:
-                fcntl.flock(self._lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except OSError:
-                if self._left() <= 0:
-                    raise OcrUnavailable(
-                        "another OCR call held the model for the whole time budget"
-                    )
-                time.sleep(0.5)
-        self.port = _free_port()
-        env = {k: v for k, v in os.environ.items() if k != "LD_LIBRARY_PATH"}
-        env.update(
-            HIP_VISIBLE_DEVICES="-1", CUDA_VISIBLE_DEVICES="-1"
-        )  # no GPU, whatever the build
-        cmd = [
-            "nice", "-n", "19", LLAMA_SERVER,
-            "--host", "127.0.0.1", "--port", str(self.port),
-            "-m", OCR_MODEL, "--mmproj", OCR_MMPROJ,
-            "-c", "8192", "--parallel", "1",
-            "--device", "none", "-ngl", "0", "-t", str(OCR_THREADS),
-            "--jinja", "--no-warmup",
-        ]  # fmt: skip
-        started_at = time.monotonic()
-        self._log = open(os.path.join(CACHE_DIR, "ocr-server.log"), "wb")
-        self.proc = subprocess.Popen(
-            cmd, env=env, stdin=subprocess.DEVNULL, stdout=self._log, stderr=subprocess.STDOUT,
-            start_new_session=True, preexec_fn=_pdeathsig,
-        )  # fmt: skip
         try:
+            while True:  # one OCR server at a time, whatever the number of callers
+                try:
+                    fcntl.flock(self._lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if self._left() <= 0:
+                        raise OcrUnavailable(
+                            "another OCR call held the model for the whole time budget"
+                        )
+                    time.sleep(0.5)
+            self.port = _free_port()
+            env = {k: v for k, v in os.environ.items() if k != "LD_LIBRARY_PATH"}
+            env.update(
+                HIP_VISIBLE_DEVICES="-1", CUDA_VISIBLE_DEVICES="-1"
+            )  # no GPU, whatever the build
+            cmd = [
+                "nice", "-n", "19", LLAMA_SERVER,
+                "--host", "127.0.0.1", "--port", str(self.port),
+                "-m", OCR_MODEL, "--mmproj", OCR_MMPROJ,
+                "-c", "8192", "--parallel", "1",
+                "--device", "none", "-ngl", "0", "-t", str(OCR_THREADS),
+                "--jinja", "--no-warmup",
+            ]  # fmt: skip
+            started_at = time.monotonic()
+            self._log = open(os.path.join(CACHE_DIR, "ocr-server.log"), "wb")
+            self.proc = subprocess.Popen(
+                cmd, env=env, stdin=subprocess.DEVNULL, stdout=self._log, stderr=subprocess.STDOUT,
+                start_new_session=True, preexec_fn=_pdeathsig,
+            )  # fmt: skip
             self._wait_ready()
             self.load_s = time.monotonic() - started_at
         except BaseException:
-            self.__exit__(None, None, None)
+            self.__exit__(
+                None, None, None
+            )  # kills the server if it started, closes the lock and log
             raise
         return self
 
@@ -656,8 +673,15 @@ class Cache:
             self.data = {}
         self.data.setdefault("pages", {})
         self.data.setdefault("ocr", {})
+        self._saved = time.monotonic()
+
+    def checkpoint(self):
+        """Save, at most every 5 s: a run that is cut off keeps what it had read."""
+        if time.monotonic() - self._saved >= 5.0:
+            self.save()
 
     def save(self):
+        self._saved = time.monotonic()
         tmp = f"{self.file}.{os.getpid()}.tmp"
         try:
             with open(tmp, "w", encoding="utf-8") as f:
@@ -666,6 +690,55 @@ class Cache:
         except OSError:
             with contextlib.suppress(OSError):
                 os.unlink(tmp)
+
+
+def cached_pages(doc, cache: Cache, section: str, make) -> dict:
+    """{str(page): make(page)} for every page, each read from the PDF once: later calls (and
+    the retry of a call that timed out) find the pages already in the cache file, which is
+    saved every few seconds and when this returns or is cut short by SIGTERM."""
+    store = cache.data.setdefault(section, {})
+    fresh = False
+    try:
+        for pno in range(doc.page_count):
+            if str(pno) not in store:
+                store[str(pno)] = make(doc[pno])
+                fresh = True
+                cache.checkpoint()
+    finally:
+        if fresh:
+            cache.save()
+    return store
+
+
+def _scan_page(page) -> dict:
+    words = page.get_text("words")
+    return {
+        "n": len(words),
+        "tags": [[t, *map(float, w[:4])] for t, w in tags_on_page(words)],
+    }
+
+
+def _text_page(page) -> str:
+    return page.get_text("text")[:60000]
+
+
+def _caption_page(page) -> dict:
+    caps, n = [], 0
+    for b in page.get_text("blocks"):
+        if b[6] != 0:
+            continue
+        n += 1
+        m = _CAPTION.match(b[4])
+        if m:
+            caps.append(
+                [norm_number(m.group("n"), roman=True), *map(float, b[:4]), b[4][:2000]]
+            )
+    return {"n": n, "caps": caps}
+
+
+def page_texts(doc, cache: Cache) -> list[str]:
+    store = cached_pages(doc, cache, "text", _text_page)
+    return [store[str(p)] for p in range(doc.page_count)]
 
 
 def page_too_heavy(page) -> str:
@@ -691,9 +764,13 @@ def layout_page(doc, pno: int, cache: Cache) -> dict | None:
     key = str(pno)
     if key in cache.data["pages"]:
         return cache.data["pages"][key] or None
+    heavy = cache.data.setdefault("heavy", {})
+    if key in heavy:
+        return None
     why = page_too_heavy(doc[pno])
     if why:
-        cache.data.setdefault("skipped", {})[key] = why
+        heavy[key] = why
+        cache.save()
         return None
     import pymupdf4llm
 
@@ -724,7 +801,10 @@ def layout_page(doc, pno: int, cache: Cache) -> dict | None:
 
 
 def skipped_reason(cache: Cache, pno: int) -> str:
-    return (cache.data.get("skipped") or {}).get(str(pno), "")
+    key = str(pno)
+    return (cache.data.get("heavy") or {}).get(key) or (
+        cache.data.get("skipped") or {}
+    ).get(key, "")
 
 
 def page_is_scan(page) -> bool:
@@ -791,10 +871,21 @@ def band_text(page, words: list, tag_word) -> str:
 # ---------------------------------------------------------------- equation
 
 
+def _model_sig() -> str:
+    """The OCR model's name, size and mtime: a replaced model file does not reuse old text."""
+    try:
+        st = os.stat(OCR_MODEL)
+        return f"{os.path.basename(OCR_MODEL)}:{st.st_size}:{int(st.st_mtime)}"
+    except OSError:
+        return os.path.basename(OCR_MODEL)
+
+
 def _ocr_box(doc, pno, rect, cache: Cache, deadline_s: float):
     """(text, seconds, from_cache, seconds to load the model) for a box; raises OcrUnavailable."""
 
-    key = f"{pno}:{rect.x0:.0f},{rect.y0:.0f},{rect.x1:.0f},{rect.y1:.0f}:{os.path.basename(OCR_MODEL)}"
+    key = (
+        f"{pno}:{rect.x0:.0f},{rect.y0:.0f},{rect.x1:.0f},{rect.y1:.0f}:{_model_sig()}"
+    )
     if key in cache.data["ocr"]:
         return cache.data["ocr"][key], 0.0, True, 0.0
     started = time.monotonic()
@@ -855,14 +946,13 @@ def cmd_equation(path: str, number: str, only_page: int = 0) -> dict:
     want = norm_number(number)
     res: dict = {"number": number, "pages": doc.page_count}
     cache = Cache(path)
-    page_words, cands, found_tags, has_text = {}, [], set(), False
+    scan = cached_pages(doc, cache, "scan", _scan_page)
+    cands, found_tags = [], set()
+    has_text = any(v["n"] for v in scan.values())
     for pno in range(doc.page_count):
-        words = doc[pno].get_text("words")
-        has_text = has_text or bool(words)
-        page_words[pno] = words
-        tags = tags_on_page(words)
-        found_tags.update(norm_number(t) for t, _ in tags)
-        if any(norm_number(t) == want for t, _ in tags) and (
+        tags = scan[str(pno)]["tags"]
+        found_tags.update(norm_number(t[0]) for t in tags)
+        if any(norm_number(t[0]) == want for t in tags) and (
             not only_page or pno + 1 == only_page
         ):
             cands.append(pno)
@@ -873,10 +963,12 @@ def cmd_equation(path: str, number: str, only_page: int = 0) -> dict:
         return {**res, "status": "not-found", "numbers_seen": shown}
     res["other_pages"] = [p + 1 for p in cands[1:]]
     chosen = None
+    page_words: dict = {}
     for pno in cands:
         lay = layout_page(doc, pno, cache)
         if not lay:
             continue
+        page_words[pno] = doc[pno].get_text("words")
         chosen = _equation_box(page_words[pno], lay["boxes"], want)
         if chosen:
             chosen = (pno, *chosen)
@@ -887,15 +979,21 @@ def cmd_equation(path: str, number: str, only_page: int = 0) -> dict:
             skipped_reason(cache, first)
             or "the layout model found no formula box carrying this number"
         )
-        w = next(
-            w for t, w in tags_on_page(page_words[first]) if norm_number(t) == want
-        )
-        text = band_text(doc[first], page_words[first], w)
+        words = page_words.get(first) or doc[first].get_text("words")
+        w = next((w for t, w in tags_on_page(words) if norm_number(t) == want), None)
+        if (
+            w is None
+        ):  # the cached scan saw the number, the live words do not: use its position
+            t, *bb = next(
+                t for t in scan[str(first)]["tags"] if norm_number(t[0]) == want
+            )
+            w = (*bb, f"({t})")
+        text = band_text(doc[first], words, w)
         return {
             **res, "status": "text-layer", "page": first + 1, "scanned": page_is_scan(doc[first]),
             "text_layer": _flat(text)[:RAW_LIMIT], "reason": f"{why}; this is the text near the number",
             "number_label": w[4].strip("() "),
-            "citing": citing_sentences([doc[p].get_text("text") for p in range(doc.page_count)], number),
+            "citing": citing_sentences(page_texts(doc, cache), number),
             "seconds": round(time.monotonic() - started, 1),
         }  # fmt: skip
     pno, rect, tw, box_class = chosen
@@ -910,9 +1008,7 @@ def cmd_equation(path: str, number: str, only_page: int = 0) -> dict:
         text_layer=_flat(page.get_text("text", clip=rect))[:RAW_LIMIT],
         number_label=next(t for t in box_tags if norm_number(t) == want),
     )  # fmt: skip
-    res["citing"] = citing_sentences(
-        [doc[p].get_text("text") for p in range(doc.page_count)], number
-    )
+    res["citing"] = citing_sentences(page_texts(doc, cache), number)
     try:
         text, secs, cached, load_s = _ocr_box(doc, pno, rect, cache, OCR_BUDGET_S)
     except OcrUnavailable as e:
@@ -962,19 +1058,14 @@ def cmd_table(path: str, number: str) -> dict:
     want = norm_number(number, roman=True)
     res: dict = {"number": number, "pages": doc.page_count}
     cache = Cache(path)
-    cands, captions_seen, has_text = [], [], False
+    caps = cached_pages(doc, cache, "captions", _caption_page)
+    cands, captions_seen = [], []
+    has_text = any(v["n"] for v in caps.values())
     for pno in range(doc.page_count):
-        blocks = doc[pno].get_text("blocks")
-        for b in blocks:
-            if b[6] != 0:
-                continue
-            has_text = True
-            m = _CAPTION.match(b[4])
-            if m:
-                label = norm_number(m.group("n"), roman=True)
-                captions_seen.append(label)
-                if label == want:
-                    cands.append((pno, b))
+        for label, *b in caps[str(pno)]["caps"]:
+            captions_seen.append(label)
+            if label == want:
+                cands.append((pno, b))
     if not has_text:
         return {**res, "status": "no-text-layer"}
     if not cands:
@@ -1073,6 +1164,7 @@ def main(argv=None) -> int:
     signal.signal(
         signal.SIGTERM, lambda *_: sys.exit(143)
     )  # runs the `with` blocks' cleanup
+    _die_with_parent()
     real_stdout = sys.stdout
     sys.stdout = sys.stderr  # nothing but the result may reach stdout
     _limit_memory()

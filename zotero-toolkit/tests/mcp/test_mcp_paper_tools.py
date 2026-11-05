@@ -209,6 +209,16 @@ def test_helper_failures_become_sentences(setup, tmp_path):
     assert "failed (exit 0)" in run("print('not json')")
     srv.PDF_TIMEOUT = 1.0
     assert "did not finish in 1 s" in run("import time; time.sleep(30)")
+    # a timeout sends SIGTERM first, so the helper can save its cache and stop its OCR server
+    marker = tmp_path / "got-sigterm"
+    helper.write_text(
+        "import pathlib, signal, sys, time\n"
+        f"signal.signal(signal.SIGTERM, lambda *a: (pathlib.Path({str(marker)!r})"
+        ".write_text('term'), sys.exit(0)))\n"
+        "print('ready', flush=True); time.sleep(30)"
+    )
+    assert "did not finish in 1 s" in srv._pdf_tool("table", pdf, "2")
+    assert marker.read_text() == "term"
     srv.PDF_PYTHON = str(tmp_path / "no-such-python")
     assert "could not be started" in run("print(1)")
 
