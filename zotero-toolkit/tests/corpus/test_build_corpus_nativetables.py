@@ -4,8 +4,8 @@ Run:  .venv/bin/python test_build_corpus_nativetables.py     (plain asserts; pyt
 Every conversion path ends in clean_md, so there a table of numbers -- a pymupdf4llm pipe table from a PDF's own text
 layer, a pandoc table, a VLM table -- becomes the one-line marker of _drop_numeric_tables, before the tag and <br>
 passes. The tables that stay keep their cells apart: an HTML table becomes a pipe table (the tag pass used to run
-its cells together -- a row "-8.9 | 5 | -0.3" read "-8.95-0.3"), and a <br> inside a pipe row becomes a space
-instead of splitting the row.
+its cells together -- a row "-8.9 | 5 | -0.3" read "-8.95-0.3"), and a <br> inside a pipe row stays a <br> instead of
+splitting the row (2026-11-05; 2026-10-19 to 11-05 it became a space, which ran labels and values together).
 Synthetic PDFs via pymupdf; pymupdf4llm replaced by a fake; all text is invented."""
 
 import contextlib
@@ -70,9 +70,9 @@ def test_native_numeric_table_is_dropped_in_a_conversion():
 
 def test_native_text_table_stays_with_its_rows_whole():
     md = bc.clean_md(PROSE + "\n\n" + NATIVE_TEXT)
-    assert "|INVB|Invented receiver model two|Dome radome|" in md, (
+    assert "|INVB|Invented receiver model two|Dome<br>radome|" in md, (
         md
-    )  # <br> inside a row: a space, one line
+    )  # <br> inside a row stays (2026-11-05; it was a space from 2026-10-19), still one line
     assert md.count("\n|") == 5, md  # header, separator, three rows
 
 
