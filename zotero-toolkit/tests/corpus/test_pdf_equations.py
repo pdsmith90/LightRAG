@@ -364,6 +364,145 @@ def test_verify_numbers_letters_and_greek():
     assert eq.verify("x", ["x"], ["x $ y"]) == "malformed LaTeX"
 
 
+# ------------------------------------------------------------------ the corrupted text layer
+# Crops from the Phase C validation (results/validation-phaseC.md section 9, probe_all.json): a
+# broken PDF text layer, the OCR answer served from its cache, and the verdict. They pin the
+# normalisation of the layer's known glyph corruptions; the checks themselves still bind.
+
+
+def test_tag_of_reads_the_glyphs_a_broken_font_prints_for_parentheses_and_an_en_dash():
+    assert eq.tag_of("ð7Þ") == "7"  # VCNXJ5JV p3: '(' printed as eth, ')' as thorn
+    assert eq.tag_of("(1–30)") == "1-30"  # TCZLPVMV p26: an en dash between the digits
+    assert eq.tag_of("‹A12›") == "A12"
+    assert eq.tag_of("ðT") is None  # a mapped glyph alone is not a number
+    assert eq.tag_of("273:15Þ") is None
+
+
+def test_three_equations_in_one_box_with_the_fraction_glyph_and_colon_decimals_verify():
+    # VCNXJ5JV p3: the font prints '=' as U+2044 ('1⁄4') and '.' as ':' ('77:689'), so the layer
+    # manufactured the numbers 1, 4, 7, 8, 9, 15, 77, 269, ... OCR right; it was "numbers missing".
+    words = [
+        "DLtrop", "¼", "10", "6", "N", "D", "ð7Þ", "N", "¼", "77:689", "P", "e", "T",
+        "þ", "71:2952", "e", "T", "þ", "375463", "e", "T", "2", "ð8Þ", "e", "¼",
+        "6:1078", "exp", "17:269", "ðT", "273:15Þ", "237:30", "þ", "ðT", "273:15Þ", "f",
+        "ð9Þ",
+    ]  # fmt: skip
+    latexes = [
+        "\\Delta L_{trop} = 10^{-6} \\cdot N \\cdot D",
+        "N = 77.689 \\cdot \\frac{P - e}{T} + 71.2952 \\cdot \\frac{e}{T} + 375463 \\cdot \\frac{e}{T^2}",
+        "e = 6.1078 \\cdot \\exp\\left(\\frac{17.269 \\cdot (T - 273.15)}{237.30 + (T - 273.15)}\\right) \\cdot f",
+    ]  # fmt: skip
+    rest = [w for w in words if not eq.tag_of(w)]  # _box_layer() drops the tag words
+    assert len(words) - len(rest) == 3  # ð7Þ, ð8Þ, ð9Þ
+    assert eq.number_check(rest, latexes) == []
+    assert eq.verify(eq._flat(" ".join(rest)), rest, latexes) == ""
+
+
+def test_number_check_still_binds_on_a_real_digit():
+    assert eq.number_check(["10"], ["2"]) == ["10"]
+    assert eq.number_check(["¼", "10"], ["10"]) == []  # the '=' glyph is not a number
+    assert eq.number_check(["77:689"], ["77.689"]) == []  # a colon decimal point
+    assert eq.number_check(["77:68"], ["77.689"]) == [
+        "77.68"
+    ]  # a real digit difference
+    assert eq.number_check(["A1"], ["x_i = x_T + b_i,"]) == ["1"]
+
+
+def test_split_math_keeps_the_formula_whose_spacing_and_number_survive_beside_it():
+    # CHE7U6NC p2: the model wrote "$...$. \qquad (2)"; \qquad read as a two-letter word, so the
+    # line counted as inline prose and the box fell back with "no formula in the transcription".
+    raw = "$a_x = -\\frac{1}{2}\\rho C_d \\frac{A_x}{m} V_x^2$. \\qquad (2)"
+    entries, delimited = eq.split_math(raw)
+    assert delimited and entries == [
+        {"latex": "a_x = -\\frac{1}{2}\\rho C_d \\frac{A_x}{m} V_x^2", "tag": None}
+    ], entries
+    words = ["ax", "¼", "1", "2", "rCd", "Ax", "m", "Vx", "2:", "ð2Þ"]
+    rest = [w for w in words if not eq.tag_of(w)]
+    assert eq.verify(eq._flat(" ".join(rest)), rest, [entries[0]["latex"]]) == ""
+    # prose beside the math is still prose, not a display formula
+    assert eq.split_math("the mantle is that of $n=0$ samples") == ([], True)
+
+
+def test_split_math_takes_a_trailing_eqno_as_the_equation_number():
+    for raw, tag in (
+        ("$$a=b \\eqno(2.2)$$", "2.2"),  # WCLPVYVE p2
+        ("$$a=b \\eqno (4)$$", "4"),  # 5LFWGZJY p2
+        ("$$a=b \\eqno{(42)}$$", "42"),  # 9WPVX7DW p8
+    ):
+        entries, _ = eq.split_math(raw)
+        assert entries == [{"latex": "a=b", "tag": tag}], (raw, entries)
+
+
+def test_letter_recall_accepts_the_layers_glyph_substitutions():
+    assert eq.letter_recall("q", ["\\theta"]) == (
+        1,
+        1,
+    )  # TTP2IWXM p12: the font prints θ as q
+    assert eq.letter_recall("S", ["\\mathcal{J}"]) == (
+        1,
+        1,
+    )  # 9WPVX7DW: script J printed as S
+    # 9WPVX7DW p2, real crop: "∇S · ∇S = n2, (3)" against the OCR's \mathcal{J}
+    words = ["∇S", "·", "∇S", "=", "n2,"]
+    latex = "\\nabla \\mathcal{J} \\cdot \\nabla \\mathcal{J} = n^2,"
+    assert eq.verify(eq._flat(" ".join(words)), words, [latex]) == ""
+    # a glyph the table does not name is still a miss
+    assert eq.letter_recall("q", ["\\xi"]) == (0, 1)
+
+
+def test_a_number_in_a_broken_font_is_read_from_the_layer_and_the_box_verifies(
+    tmp_path,
+):
+    # the same eth/thorn pair through the whole pipeline: the tag is theirs, the formula is OCR's
+    layer = "x2 + y2 = z2                  ð7Þ"
+    out, e = run_apply(
+        page_with_equation(tmp_path, layer=layer),
+        chunk_for(),
+        lambda p: f"${LATEX}$. \\qquad (7)",
+    )
+    assert f"${LATEX} \\tag{{7}}$" in out, out
+    assert e.stats["ocr"] == 1 and e.stats["pair_order"] == 1, e.stats
+
+
+def test_a_ragged_pair_of_numbers_in_a_broken_layer_still_verifies():
+    # TCZLPVMV p26: the tag is '(1–30)' — an en dash — so it used to stay in the words and '30'
+    # was wanted; the OCR wrote "\\tag{1-30}" beside the formula, spaced out.
+    layer = "ds2 = dr2 + r2 dθ2 + r2 sin2θ dλ2 . (1–30)"
+    latex = "d s ^ { 2 } = d r ^ { 2 } + r ^ { 2 } \\, d \\vartheta ^ { 2 } + r ^ { 2 } \\sin ^ { 2 } \\! \\vartheta \\; d \\lambda ^ { 2 } \\, ."
+    assert eq.tag_of("(1–30)") == "1-30"
+    words = [
+        w for w in layer.split() if not eq.tag_of(w)
+    ]  # the tag word never reaches the check
+    assert eq.verify(eq._flat(" ".join(words)), words, [latex]) == ""
+    assert eq.strip_own_number(latex + " \\qquad \\qquad ( 1 - 3 0 )", "1-30") == latex
+
+
+def test_the_hand_audited_genuine_ocr_errors_stay_rejected():
+    # 3RM7ZTU7 p3: the OCR put the product under a fraction bar and invented a \\cdot
+    words = ["SNRR,i", "=", "IPR,i", "2", "+", "QPR,i", "2", "·", "√Fs", "PN,i"]
+    snr = "\\text{SNR}_{R,i} = \\frac{\\sqrt{\\text{IP}_{R,i}{}^2 + \\text{QP}_{R,i}{}^2}}{\\cdot\\sqrt{F_s}}"
+    assert eq.verify(eq._flat(" ".join(words)), words, [snr]) == "letters 15/18"
+    # 3RM7ZTU7 p3: subscript I read as 1
+    words = ["sTEC", "j", "R", "=", "sTEC", "j", "1", "+", "sTEC", "j", "2"]
+    stec = "\\text{sTEC}_R^j = \\text{sTEC}_I^j + \\text{sTEC}_{2}^j"
+    assert eq.verify(eq._flat(" ".join(words)), words, [stec]) == "numbers missing: 1"
+    # ZHT6NICB p4: the derivative is with respect to θ_i; the OCR read the printed θ as v
+    words = ["Ci", "=", "∂C(θ)", "∂ϑi", "."]
+    ci = "\\mathbf{C}_i = \\frac{\\partial\\mathbf{C}(\\boldsymbol{\\theta})}{\\partial v_i}."
+    assert eq.verify(eq._flat(" ".join(words)), words, [ci]) == "letters 5/6"
+    # 3VKPNJIQ p9: the layer's subscript 1 read as a capital I (the tag was 'A1', untagged)
+    words = ["xi", "xT", "bi", "i,", "A1"]
+    xf = "x_i = x_T + b_i + \\varepsilon_i,"
+    assert eq.verify(eq._flat(" ".join(words)), words, [xf]) == "numbers missing: 1"
+    # GJJX2V4E p4: the layer says zeta where the OCR wrote xi (unclear, so still rejected)
+    words = [
+        "ζP(ϕ,", "λ,rP)", "=", "ζ0(ϕ,", "λ,rE)", "+", "K", "k=1", "1", "k!", "∂kζ",
+        "∂rk", "rE", "hk", "+", "C1B(ϕ,", "λ,", "h)",
+    ]  # fmt: skip
+    xi = "\\xi_P(\\varphi,\\lambda,r_P)=\\xi_0(\\varphi,\\lambda,r_{\\mathrm{E}})+\\left\\{\\sum_{k=1}^{K}\\frac{1}{k!}\\left.\\frac{\\partial^k\\xi}{\\partial r^k}\\right|_{r_{\\mathrm{E}}}h^k\\right\\}+C_{1\\mathrm{B}}(\\varphi,\\lambda,h)"
+    assert eq.verify(eq._flat(" ".join(words)), words, [xi]) == "letters 24/27"
+
+
 # ------------------------------------------------------------------ the shared helpers and the prompt
 
 
@@ -385,7 +524,7 @@ def _fn_dump(path, names):
 def test_shared_helpers_match_the_mcp_proxys_pdf_tools():
     shared = (
         "norm_number tag_of _flat split_math tagged number_check line_end_words tags_on_page _center words_in "
-        "join_label_lines _ROMAN _TAG_WORD _MATH _TAG_CMD"
+        "join_label_lines _ROMAN _TAG_WORD _MATH _TAG_CMD _EQNO"
     ).split()
     mine = os.path.abspath(eq.__file__)
     theirs = os.path.join(os.path.dirname(mine), "..", "mcp", "paper_pdf_tools.py")

@@ -117,7 +117,16 @@ def norm_number(n, roman: bool = False) -> str:
 
 
 def tag_of(word: str) -> str | None:
-    """The equation number inside a text-layer word like '(6)', else None."""
+    """The equation number inside a text-layer word like '(6)', else None. A broken font maps the
+    parentheses to other glyphs ('ð7Þ', '‹7›') and the hyphen to an en dash ('(1–30)')."""
+    for glyph, plain in (
+        ("ð", "("),
+        ("Þ", ")"),
+        ("‹", "("),
+        ("›", ")"),
+        ("\u2013", "-"),
+    ):
+        word = word.replace(glyph, plain)
     m = _TAG_WORD.match(word.strip())
     return m.group(1) if m else None
 
@@ -137,13 +146,17 @@ _MATH = re.compile(
     re.S,
 )
 _TAG_CMD = re.compile(r"\\tag\*?\{([^}]*)\}")
+_EQNO = re.compile(
+    r"\\eqno\s*[({]*\s*([A-Za-z]{0,2}[.\-]?\d{1,3}(?:[.\-]\d{1,3})*[a-z]?)\s*[)}]*\s*$"
+)
 
 
 def split_math(text: str) -> tuple[list[dict], bool]:
     """The display formulas of an OCR transcription, in order, as [{'latex', 'tag'}] (a
     \\tag the model wrote is taken out and kept in 'tag'); and whether it had any math
     delimiters. A `$...$` inside a line of prose ("(c) Mantle for $n=0$") is not a display
-    formula and is left out."""
+    formula and is left out; the spacing commands and the equation number the model leaves
+    beside it ("$...$. \\qquad (2)") are not prose, so that formula is kept."""
     out, had = [], False
     for m in _MATH.finditer(text):
         had = True
@@ -151,13 +164,22 @@ def split_math(text: str) -> tuple[list[dict], bool]:
             ls = text.rfind("\n", 0, m.start()) + 1
             le = text.find("\n", m.end())
             line = text[ls : len(text) if le < 0 else le]
-            if re.search(r"[^\W\d_]{2,}", _MATH.sub(" ", line)):
+            rest = re.sub(
+                r"\\(?:q?quad|hfill|eqno|tag\*?\{[^}]*\}|hspace\*?\{[^}]*\})",
+                " ",
+                _MATH.sub(" ", line),
+            )
+            rest = " ".join(w for w in rest.split() if not tag_of(w))
+            if re.search(r"[^\W\d_]{2,}", rest):
                 continue
         body = next(
             m.group(g) for g in ("e", "dd", "br", "d") if m.group(g) is not None
         )
         tag = _TAG_CMD.search(body)
         body = _TAG_CMD.sub("", body)
+        if tag is None:
+            tag = _EQNO.search(body)
+        body = _EQNO.sub("", body)
         body = re.sub(r"\\label\{[^}]*\}", "", body)
         body = " ".join(body.split())
         if body:
@@ -195,9 +217,14 @@ def pick_equation(entries: list[dict], box_tags: list[str], number: str):
 
 
 def number_check(layer_words: list[str], latexes: list[str]) -> list[str]:
-    """Numbers that the text layer has and the transcription lacks (a misread digit)."""
+    """Numbers that the text layer has and the transcription lacks (a misread digit). The layer is
+    normalised first for the two glyph corruptions of a broken font, and nothing else: U+2044, the
+    fraction glyph this font prints for '=' ('1⁄4' manufactures a 1 and a 4), and a colon between
+    digits, which is its decimal point ('77:689' is 77.689)."""
     have = set(re.findall(r"\d+(?:\.\d+)?", " ".join(latexes)))
-    want = set(re.findall(r"\d+(?:\.\d+)?", _flat(" ".join(layer_words))))
+    layer = re.sub(r"\d*\u2044\d*", " ", _flat(" ".join(layer_words)))
+    layer = re.sub(r"(?<=\d):(?=\d)", ".", layer)
+    want = set(re.findall(r"\d+(?:\.\d+)?", layer))
     return sorted(want - have, key=lambda x: (len(x), x))
 
 
