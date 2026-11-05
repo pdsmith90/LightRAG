@@ -3,7 +3,7 @@
 lightrag_mcp_server.py — expose a Zotero-backed LightRAG knowledge base to any
 MCP client (Claude Code, Claude Desktop, other agents) over stdio.
 
-It's a thin, self-contained proxy over the LightRAG Server REST API. Five tools:
+It's a thin, self-contained proxy over the LightRAG Server REST API. Seven tools:
 
     search_library(query, mode, top_k, answer=False, include_graph=False,
                    passages=8)         -> compiled citations, then the retrieved
@@ -13,6 +13,9 @@ It's a thin, self-contained proxy over the LightRAG Server REST API. Five tools:
                                           against a question
     find_paper(paper)                  -> lookup: is a paper indexed, only in
                                           Zotero, or in neither?
+    paper_equation(paper, number)      -> one numbered display equation of ONE paper,
+                                          as LaTeX read from the paper's PDF
+    paper_table(paper, number)         -> one table of ONE paper, as rows, from the PDF
     add_note(text, description)        -> insert a note/snippet into the KB under
                                           a unique document name
     health()                           -> is the LightRAG server up?
@@ -32,6 +35,12 @@ Config (environment variables):
     ZOTERO_STORAGE                     default ~/Zotero/storage, Zotero's attachment
                                        folders: paper_passages names a paper's file
                                        there when it exists (~ is expanded)
+    LIGHTRAG_MCP_PDF_PYTHON            interpreter with PyMuPDF for paper_equation and
+                                       paper_table; default ../.venv/bin/python beside
+                                       this file's directory, else this interpreter
+    LIGHTRAG_MCP_PDF_HELPER            default paper_pdf_tools.py beside this file
+    LIGHTRAG_MCP_OCR_TIMEOUT           seconds the OCR model may take per equation,
+                                       default 120 (its other settings: paper_pdf_tools.py)
     LIGHTRAG_MCP_TIMEOUT               seconds per query, default 300
     LIGHTRAG_MCP_REF_FALLBACK_TIMEOUT  seconds for the /query/data fallback, default 90
     LIGHTRAG_MCP_HEALTH_TIMEOUT        seconds for health(), default 15
@@ -47,6 +56,11 @@ POST /graph/papers/passages for one paper's passages. A stock LightRAG Server ha
 neither route: the lookup then falls back to zotero_metadata.json alone, and
 paper_passages to a /query that names the paper.
 
+paper_equation and paper_table read what the index lacks (display equations, tables the
+converter scrambled) from the paper's own PDF in the Zotero storage folder. The PDF work
+is done by paper_pdf_tools.py, which this proxy runs as a subprocess under an interpreter
+that has PyMuPDF (pip install pymupdf pymupdf4llm): the proxy never imports it.
+
 Passage headings keep the section path only: the levels of the server's
 content_headings that do not place a passage (the paper's title, journal and author
 line, an Abstract or Summary heading made the parent of later sections, fragments)
@@ -61,6 +75,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -109,6 +124,18 @@ META_PATH = os.path.expanduser(
 # Zotero's attachment folders, one per corpus key: paper_passages names the paper's
 # file there, for what the index lacks (display equations).
 STORAGE = os.path.expanduser(os.environ.get("ZOTERO_STORAGE") or "~/Zotero/storage")
+_HERE = os.path.dirname(os.path.abspath(__file__))
+# paper_equation / paper_table shell out for the PDF work: PyMuPDF need not be importable here.
+PDF_HELPER = os.environ.get("LIGHTRAG_MCP_PDF_HELPER") or os.path.join(
+    _HERE, "paper_pdf_tools.py"
+)
+_VENV_PY = os.path.join(_HERE, "..", ".venv", "bin", "python")
+PDF_PYTHON = os.environ.get("LIGHTRAG_MCP_PDF_PYTHON") or (
+    _VENV_PY if os.path.isfile(_VENV_PY) else sys.executable
+)
+# The layout model can need up to ~60 s on a first look at a long paper; the OCR model has its
+# own budget inside the helper, so the helper gets that much more before it is killed.
+PDF_TIMEOUT = float(os.environ.get("LIGHTRAG_MCP_OCR_TIMEOUT") or "120") + 120.0
 _META_SIGNATURE = None
 _BAD_SIGNATURE = None
 
@@ -1361,11 +1388,10 @@ def paper_passages(paper: str, question: str) -> str:
     Not in the index: display equations. The corpus builder's text-layer converter
     drops them from born-digital PDFs (scans read by the OCR model keep them as
     LaTeX), so only references to them ("eq. (5)") remain, and tables often arrive
-    scrambled. Asking again cannot reach them. For an equation's coefficients or a
-    table's values, read the file named under the citation ("Local file:", when
-    this host has the Zotero storage folder): `pdftotext -layout FILE out.txt`,
-    where an equation's number ends its line, so
-    `grep -n -B8 -A2 '(6)\\s*$' out.txt` shows equation (6)."""
+    scrambled. Asking again cannot reach them. For an equation call
+    paper_equation(paper, "6"), which returns its LaTeX from the PDF; for a table's
+    values call paper_table(paper, "2"). Both need this host to have the paper's file
+    ("Local file:" under the citation, when this host has the Zotero storage folder)."""
     indexed, rest, truncated, near, unchecked = _lookup(paper)
     if indexed is None:
         if len(rest) != 1:
@@ -1440,6 +1466,305 @@ def paper_passages(paper: str, question: str) -> str:
             + "\n".join(_other_line(r) for r in others[:5])
         )
     return "\n\n".join(out)
+
+
+def _one_paper(paper: str, tool: str):
+    """(lead key, citation, local PDF path, None) for the one paper `paper` names (indexed
+    or only in Zotero), else (None, None, None, text) with the text to answer instead."""
+    indexed, rest, truncated, near, unchecked = _lookup(paper)
+    citation = ""
+    if indexed is None:
+        keys = [rest[0][0]] if len(rest) == 1 else None
+    elif len(indexed) == 1:
+        keys = list(indexed[0].get("keys") or [])
+        citation = indexed[0].get("citation") or ""
+    elif not indexed and len(rest) == 1 and not unchecked:
+        keys = [rest[0][0]]
+    else:
+        keys = None
+    if not keys:
+        shown = (
+            _lookup_text(paper, None, rest, False, near)
+            if indexed is None
+            else _lookup_text(paper, indexed, rest, truncated, near, unchecked)
+        )
+        return (
+            None,
+            None,
+            None,
+            shown
+            + (
+                f"\n\n{tool} needs exactly one paper: call it again with one Zotero key "
+                "or DOI from the list."
+                if indexed or rest or near or unchecked
+                else ""
+            ),
+        )
+    lead_key = _lead_key(keys)
+    if _entry(lead_key):
+        citation = ""
+    for key in [lead_key] + [k for k in keys if k != lead_key]:
+        if path := _local_file(key):
+            if not path.lower().endswith(".pdf"):
+                return (
+                    None,
+                    None,
+                    None,
+                    (
+                        f"### {_cite(f'{lead_key}__', citation)}\n"
+                        f"{tool} reads PDFs, and this paper's file is not one: {path}"
+                    ),
+                )
+            return lead_key, citation, path, None
+    return (
+        None,
+        None,
+        None,
+        (
+            f"### {_cite(f'{lead_key}__', citation)}\n"
+            f"This host has no local PDF of this paper (Zotero storage {STORAGE}), so {tool} "
+            "cannot read it. search_library and paper_passages work from the index."
+        ),
+    )
+
+
+def _pdf_tool(mode: str, path: str, number: str, page: int = 0) -> dict | str:
+    """The helper's JSON answer, or a sentence saying why there is none."""
+    cmd = [PDF_PYTHON, "-I", PDF_HELPER, mode, path, str(number)]
+    if page:
+        cmd += ["--page", str(page)]
+    try:
+        r = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=PDF_TIMEOUT,
+            stdin=subprocess.DEVNULL,
+        )
+    except subprocess.TimeoutExpired:
+        return (
+            f"The PDF reader did not finish in {PDF_TIMEOUT:.0f} s and was stopped "
+            "(a very long paper on a first look, or a busy machine). Asking again "
+            "continues from the pages it had already cached."
+        )
+    except OSError as e:
+        return f"The PDF reader could not be started ({PDF_PYTHON}): {e}"
+    try:
+        out = json.loads(r.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        tail = (r.stderr or "").strip()[-400:]
+        return f"The PDF reader failed (exit {r.returncode}). {tail}"
+    if not isinstance(out, dict) or out.get("status") == "error":
+        return f"The PDF reader could not read this file: {(out or {}).get('message')}"
+    return out
+
+
+def _paper_head(lead_key: str, citation: str, path: str) -> list[str]:
+    return [f"### {_cite(f'{lead_key}__', citation)}\nLocal file: {path}"]
+
+
+def _equation_text(head: list[str], number: str, d: dict) -> str:
+    st, page, label = d.get("status"), d.get("page"), d.get("number_label") or number
+    where = f"page {page} of {d.get('pages')}" if page else ""
+    out = list(head)
+    if st == "no-text-layer":
+        out.append(
+            "This PDF has no text layer (a scan), so the equation cannot be located by its "
+            "number. Scans are read by the OCR model when they are indexed, and keep their "
+            "equations as LaTeX: try paper_passages with the words around the equation."
+        )
+    elif st == "not-found":
+        seen = ", ".join(d.get("numbers_seen") or [])
+        out.append(
+            f"No text line of this PDF ends with ({number}). Numbers that do end a line: "
+            f"{seen or 'none'}. A paper may number equations another way (A.1, 2.3); pass "
+            "the number as printed, without parentheses."
+        )
+    elif st in ("ocr", "ocr-unmatched"):
+        secs = (
+            f"{d.get('ocr_seconds')} s on the CPU"
+            if not d.get("ocr_cached")
+            else "cached"
+        )
+        out.append(
+            f"Equation ({label}), {where}: LaTeX read from the PDF image by "
+            f"{d.get('ocr_model') or 'the OCR model'} ({secs}); the number comes from the "
+            "text layer."
+        )
+        if st == "ocr":
+            out.append("\n".join(d.get("equation") or []))
+            if d.get("pick") == "single-number":
+                out.append(
+                    "The number labels all the formulas above together (one number "
+                    "for the box); the \\tag sits on the last."
+                )
+        else:
+            out.append(
+                f"The box holds equations {', '.join('(' + t + ')' for t in d.get('box_tags') or [])}"
+                f" but the model wrote {len(d.get('ocr_block') or [])} formula(s) "
+                f"({d.get('pick')}), so they cannot be paired with the numbers. All of them, "
+                "in page order from top to bottom:"
+            )
+            out.append("\n".join(d.get("ocr_block") or []))
+        if d.get("box_class") and d["box_class"] != "formula":
+            out.append(
+                f'The layout model called this box a "{d["box_class"]}", not a formula: '
+                "check that the text layer of the box above is the equation."
+            )
+        if d.get("scanned"):
+            out.append(
+                "This page is a scan: its text layer is itself an OCR layer and may be wrong."
+            )
+        if d.get("missing_numbers"):
+            out.append(
+                "Check: these numbers are in the text layer but not in the LaTeX: "
+                + ", ".join(d["missing_numbers"])
+                + ". A digit may be misread."
+            )
+        if d.get("warning_delimiters"):
+            out.append(
+                "The model wrote no math delimiters, so the text above may not be LaTeX."
+            )
+    elif st == "text-layer":
+        out.append(
+            f"OCR NOT USED ({d.get('reason') or 'unavailable'}). What follows is the PDF's "
+            f"TEXT LAYER around equation ({label}), {where}, NOT LaTeX: fractions, "
+            "superscripts and roots are flattened into a line of words and numbers, and "
+            "symbols may be garbled."
+        )
+        if d.get("scanned"):
+            out.append(
+                "This page is a scan: the text layer is an OCR layer and is often wrong."
+            )
+        out.append(f"Text layer: {d.get('text_layer') or '(empty)'}")
+    else:
+        out.append(f"Unexpected answer from the PDF reader: {d}")
+    if st in ("ocr", "ocr-unmatched") and d.get("text_layer"):
+        out.append(
+            f"Text layer of the same box (flattened; to check numbers): {d['text_layer']}"
+        )
+    for c in d.get("citing") or []:
+        out.append(f'Cited on page {c["page"]}: "{c["text"]}"')
+    if d.get("other_pages"):
+        out.append(
+            "A line ending with this number is also on page(s) "
+            + ", ".join(map(str, d["other_pages"][:8]))
+            + f'; paper_equation(paper, "{number}", page=N) reads that one.'
+        )
+    return "\n\n".join(out)
+
+
+def _md_cell(c: str) -> str:
+    return str(c).replace("|", "\\|")
+
+
+def _table_text(head: list[str], number: str, d: dict) -> str:
+    st, out = d.get("status"), list(head)
+    if st == "no-text-layer":
+        out.append(
+            "This PDF has no text layer (a scan), so tables cannot be located. Scans "
+            "are read by the OCR model when they are indexed: try paper_passages."
+        )
+    elif st == "not-found":
+        seen = ", ".join(d.get("captions_seen") or [])
+        out.append(
+            f'No caption "Table {number}" found. Captions the PDF has: {seen or "none"}.'
+        )
+    elif st == "no-table":
+        out.append(
+            f"Caption found on page {d.get('page')}: {d.get('caption')}\n"
+            f"But no table was read from it: {d.get('reason')}. The table may be a "
+            "picture; read the page itself."
+        )
+    elif st == "text-layer":
+        out.append(f"{d.get('caption')}  (page {d.get('page')} of {d.get('pages')})")
+        out.append(
+            f"{d.get('reason')}. The lines, in reading order:\n"
+            + "\n".join(d.get("lines") or [])
+        )
+    elif st == "table":
+        rows = d.get("rows") or []
+        n = max((len(r) for r in rows), default=0)
+        rows = [r + [""] * (n - len(r)) for r in rows]
+        out.append(f"{d.get('caption')}  (page {d.get('page')} of {d.get('pages')})")
+        if rows:
+            body = [
+                "| " + " | ".join(_md_cell(c) for c in rows[0]) + " |",
+                "|" + "---|" * n,
+            ]
+            body += ["| " + " | ".join(_md_cell(c) for c in r) + " |" for r in rows[1:]]
+            out.append("\n".join(body))
+        notes = []
+        if d.get("split_rows"):
+            notes.append(
+                "Rows that the converter had merged into one were split by order "
+                "(each label line took the value on its own line, the counts "
+                "matching in every column)."
+            )
+        if d.get("unsplit_rows"):
+            notes.append(
+                f"{d['unsplit_rows']} row(s) hold several lines per cell that could "
+                "not be separated into rows (the line counts differ); their lines "
+                "stay joined by <br>, in reading order: pair them yourself, or "
+                "read the page."
+            )
+        out += notes
+        out.append(
+            "Read from the PDF's text layer by the layout converter; no OCR model."
+        )
+    else:
+        out.append(f"Unexpected answer from the PDF reader: {d}")
+    return "\n\n".join(out)
+
+
+@mcp.tool(structured_output=False)
+def paper_equation(paper: str, number: str, page: int = 0) -> str:
+    """One numbered display equation of ONE paper, as LaTeX, read from the paper's own
+    PDF: the index lacks display equations, so paper_passages and search_library cannot
+    return them. ~1-3 s for the page lookup, plus ~25-30 s the first time an equation's
+    page is transcribed on an 8-thread CPU (the result is cached, so the equations
+    beside it are instant); a long paper's first look can take longer.
+
+    paper: the paper's Zotero key, DOI, or words that all occur in its title, authors or
+    year (as for paper_passages). number: the equation number as printed, without
+    parentheses ("6", "A.1", "2.3"). page: only when the answer names another page that
+    also ends a line with this number.
+
+    Returns the equation as `$...$` LaTeX with its printed number as \\tag{N}, the PDF
+    text layer of the same box (flattened, to check digits), the page, and the sentence
+    that cites it ("according to eqs (6) and (7)..."). The LaTeX is a machine transcription
+    of the page image: check its numbers and exponents against the text layer before you
+    rely on a coefficient. When the OCR model cannot run or times out, the answer is the
+    text layer alone and says so in capitals; a scanned page's text layer is often wrong.
+    A paper with no local PDF on this host, or a PDF that is a scan, is reported as such."""
+    lead_key, citation, path, message = _one_paper(paper, "paper_equation")
+    if message:
+        return message
+    head = _paper_head(lead_key, citation, path)
+    d = _pdf_tool("equation", path, number, page)
+    return d if isinstance(d, str) else _equation_text(head, number, d)
+
+
+@mcp.tool(structured_output=False)
+def paper_table(paper: str, number: str) -> str:
+    """One numbered table of ONE paper, as rows, read from the paper's own PDF: tables
+    often arrive scrambled in the index (rows merged, values apart from their labels).
+    ~1-3 s; no OCR model.
+
+    paper: the paper's Zotero key, DOI, or words that all occur in its title, authors or
+    year (as for paper_passages). number: the table number as printed ("6", "A1", "II").
+
+    Returns the caption and the table as a Markdown table with the page. A row that the
+    PDF converter had merged into one is split by order only when every column has as many
+    lines as there are labels; otherwise its cells keep the lines joined by <br>, and the
+    answer says so. The values come from the text layer, so a scanned page is not read.
+    A paper with no local PDF on this host, or a table drawn as a picture, is reported as such."""
+    lead_key, citation, path, message = _one_paper(paper, "paper_table")
+    if message:
+        return message
+    head = _paper_head(lead_key, citation, path)
+    d = _pdf_tool("table", path, number)
+    return d if isinstance(d, str) else _table_text(head, number, d)
 
 
 @mcp.tool(structured_output=False)
