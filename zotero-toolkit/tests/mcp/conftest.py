@@ -186,6 +186,9 @@ def load_server(monkeypatch, fake_lightrag, metadata_file):
             "LIGHTRAG_MCP_HEALTH_TIMEOUT",
             "LIGHTRAG_MCP_MAX_TOP_K",
             "LIGHTRAG_MCP_MAX_CHARS",
+            "LIGHTRAG_MCP_PDF_PYTHON",
+            "LIGHTRAG_MCP_PDF_HELPER",
+            "LIGHTRAG_MCP_OCR_TIMEOUT",
         ):
             monkeypatch.delenv(name, raising=False)
         for name, value in base.items():
