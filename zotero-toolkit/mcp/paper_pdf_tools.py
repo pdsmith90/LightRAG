@@ -1163,6 +1163,13 @@ def _limit_memory():
             f.write("1000")
 
 
+def _be_nice():
+    """Lower this process's CPU priority: the host may be busy with something else (an ingest);
+    the OCR server below it already runs at nice 19."""
+    with contextlib.suppress(OSError, AttributeError):
+        os.nice(10)
+
+
 def main(argv=None) -> int:
     parent = (
         os.getppid()
@@ -1180,6 +1187,7 @@ def main(argv=None) -> int:
     real_stdout = sys.stdout
     sys.stdout = sys.stderr  # nothing but the result may reach stdout
     _limit_memory()
+    _be_nice()
     try:
         if not os.path.isfile(a.pdf):
             out = {"status": "error", "message": f"no such file: {a.pdf}"}

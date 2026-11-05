@@ -606,6 +606,22 @@ with t.OcrServer(time.monotonic() + 30):
     assert not stub.alive(), "the OCR server survived its caller"
 
 
+def test_helper_runs_at_lower_priority():
+    code = f"""
+import importlib.util, os
+spec = importlib.util.spec_from_file_location("h", {str(HELPER_PY)!r})
+t = importlib.util.module_from_spec(spec); spec.loader.exec_module(t)
+before = os.nice(0)
+t._be_nice()
+print(before, os.nice(0))
+"""
+    r = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=30
+    )
+    before, after = map(int, r.stdout.split())
+    assert after == min(19, before + 10)
+
+
 def test_cli_prints_one_json_line_even_on_failure(tmp_path):
     pytest.importorskip("pymupdf")
     run = [sys.executable, "-I", str(HELPER_PY)]
