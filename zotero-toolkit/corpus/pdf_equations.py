@@ -133,22 +133,26 @@ def _flat(s: str) -> str:
     return " ".join(s.split())
 
 
-# The glyphs a broken font prints for '(' and ')': eth and thorn, the guillemets, and the ellipsis
-# and dagger pair of one 2002 paper. A layer that shows one of these -- or the fraction glyph the
-# same fonts print for '=' -- is the only place the normalisations in number_check() and
-# letter_recall() may run; a healthy layer is checked strictly.
-_GLYPH_MARKS = ("ð", "Þ", "‹", "›", "…", "†")
+# The glyphs a broken font prints for '(' and ')': eth, thorn and the guillemets. The ellipsis and
+# dagger pair of one 2002 paper count only as the parentheses they replaced -- an ellipsis right
+# before a digit, a dagger right after one -- so a real 'x_1, …, x_n' and a conjugate transpose
+# survive. A layer that shows one of these, or the fraction glyph the same fonts print for '=', is
+# the only place the normalisations in number_check() and letter_recall() may run.
+_GLYPH_MARKS = ("ð", "Þ", "‹", "›")
+_ELISION_OPEN = re.compile(r"…\s*\d")  # the font's '(' before the number: '…4:6†'
+_ELISION_CLOSE = re.compile(r"\d\s*†")  # ... and its ')' after it
 
 
 def layer_garbled(text: str) -> bool:
-    """Whether a text layer shows a broken font's glyphs: the parentheses printed as eth, thorn,
-    guillemets, an ellipsis or a dagger, or '=' printed as the fraction glyph on its own ('¼'/'1⁄4'
-    as a word). Only such a layer may have those glyphs normalised, so a real half ('1⁄2') and a
-    real q or S on a healthy layer are checked strictly."""
-    words = text.split()
-    if any(m in w for w in words for m in _GLYPH_MARKS):
+    """Whether a text layer shows a broken font's glyphs: the parentheses printed as eth, thorn or
+    the guillemets, an ellipsis right before a digit or a dagger right after one, or '=' printed as
+    the fraction glyph on its own ('¼'/'1⁄4' as a word). Only such a layer may have those glyphs
+    normalised, so a real half ('1⁄2') and a real q or S on a healthy layer are checked strictly."""
+    if any(m in text for m in _GLYPH_MARKS):
         return True
-    return any(_flat(w) == "1⁄4" for w in words)
+    if _ELISION_OPEN.search(text) or _ELISION_CLOSE.search(text):
+        return True
+    return any(_flat(w) == "1⁄4" for w in text.split())
 
 
 _MATH = re.compile(

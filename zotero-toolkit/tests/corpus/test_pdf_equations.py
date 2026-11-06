@@ -473,9 +473,20 @@ def test_the_marker_is_the_fraction_glyph_standing_for_equals_not_a_real_fractio
     assert eq.layer_garbled("E 1⁄4 m c2")  # the same glyph written out
     assert not eq.layer_garbled("x = ½ y")  # a real half is not a marker
     assert not eq.layer_garbled("x = 1⁄2 y")
-    assert (
-        eq.layer_garbled("BðzÞ") and eq.layer_garbled("‹7›") and eq.layer_garbled("A†")
-    )
+    assert eq.layer_garbled("BðzÞ")
+
+
+def test_the_ellipsis_and_dagger_count_only_as_the_parentheses_they_replaced():
+    # the 2002 paper prints '(' as '…' and ')' as '†', around the equation number
+    assert eq.layer_garbled("…4:6†") and eq.layer_garbled("…2:2†")
+    assert eq.layer_garbled("r2 …4:6†")
+    # a healthy ellipsis in a range of subscripts and a conjugate transpose are not markers
+    assert not eq.layer_garbled("x_1, …, x_n")
+    assert not eq.layer_garbled("P…Q")
+    assert not eq.layer_garbled("A†")
+    assert not eq.layer_garbled("A^†")
+    # the guillemets are markers wherever they appear
+    assert eq.layer_garbled("‹7›") and eq.layer_garbled("›")
 
 
 def test_an_eqno_number_counts_as_written_and_the_wclpvyve_box_passes():
@@ -572,7 +583,7 @@ def _fn_dump(path, names):
 def test_shared_helpers_match_the_mcp_proxys_pdf_tools():
     shared = (
         "norm_number tag_of _flat split_math tagged number_check line_end_words tags_on_page _center words_in "
-        "join_label_lines _ROMAN _TAG_WORD _MATH _TAG_CMD _EQNO layer_garbled _GLYPH_MARKS"
+        "join_label_lines _ROMAN _TAG_WORD _MATH _TAG_CMD _EQNO layer_garbled _GLYPH_MARKS _ELISION_OPEN _ELISION_CLOSE"
     ).split()
     mine = os.path.abspath(eq.__file__)
     here = os.path.dirname(mine)
@@ -587,9 +598,13 @@ def test_shared_helpers_match_the_mcp_proxys_pdf_tools():
         if os.path.exists(theirs):
             break
     else:
-        import pytest
-
-        pytest.skip(f"no mcp/paper_pdf_tools.py in or beside {here}")
+        reason = f"no mcp/paper_pdf_tools.py in or beside {here}"
+        try:
+            import pytest
+        except ImportError:  # the plain runner the installer uses has no pytest
+            print("skip:", reason)
+            return
+        pytest.skip(reason)
     a, b = _fn_dump(mine, shared), _fn_dump(theirs, shared)
     assert set(a) == set(shared) == set(b), (
         sorted(set(shared) - set(a)),
