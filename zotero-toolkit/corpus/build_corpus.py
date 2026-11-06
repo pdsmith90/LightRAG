@@ -1452,7 +1452,10 @@ def ocr_too_thin(text: str, pages: int) -> str:
 # numbers are dropped from transcribed pages (2026-10-19). `--ocr-vlm off` disables all of it, and the route is
 # active only when CFG carries ocr_vlm == "auto" (main() sets it): a test that builds CFG by hand never reaches a
 # server -- on 2026-10-07 the old tests transcribed their synthetic PDFs through the live alias on :18000.
-OCR_VLM_LOCAL_URL = os.environ.get("OCR_VLM_LOCAL_URL", "http://127.0.0.1:19530")
+# :19530 was the embedding front's on the reference deployment (embed_failover.py, EMB_FO_PORT) from 2026-11-03: the OCR
+# server moved to :19531. `ocr_server.sh start` is given the port of this URL as OCR_PORT (_vlm_endpoint).
+OCR_VLM_LOCAL_URL = os.environ.get("OCR_VLM_LOCAL_URL", "http://127.0.0.1:19531")
+OCR_VLM_BUSY_WAIT_S = 240  # a local server that is up but silent (one OCR page: 131-169 s) is waited for, not skipped
 OCR_VLM_REMOTE_URL = os.environ.get("OCR_VLM_REMOTE_URL", "http://127.0.0.1:18000")
 OCR_VLM_MODEL = os.environ.get("OCR_VLM_MODEL", "pepperocr-vl")
 OCR_VLM_REMOTE_QUIET = os.environ.get(
@@ -1545,8 +1548,11 @@ def _vlm_quiet(now=None) -> bool:
     return lo <= t < hi if lo <= hi else (t >= lo or t < hi)
 
 
-def _vlm_alive(base: str, timeout: float = 3.0) -> bool:
-    """The server at `base` lists OCR_VLM_MODEL (llama-swap or a llama-server started with -a)."""
+def _vlm_probe(base: str, timeout: float = 3.0) -> str:
+    """What `base`/v1/models says: "model" (it lists OCR_VLM_MODEL), "other" (something answered without it: another
+    service holds the port, or a model that is not the OCR one), "busy" (a listener that stayed silent for `timeout` or
+    answered 5xx: a single-slot server in the middle of a page) or "down" (refused, unreachable)."""
+    import urllib.error
     import urllib.request
 
     try:
@@ -1554,9 +1560,40 @@ def _vlm_alive(base: str, timeout: float = 3.0) -> bool:
             base.rstrip("/") + "/v1/models", timeout=timeout
         ) as r:
             ids = {m.get("id") for m in (json.load(r).get("data") or [])}
-        return OCR_VLM_MODEL in ids
+        return "model" if OCR_VLM_MODEL in ids else "other"
+    except urllib.error.HTTPError as e:
+        return "busy" if e.code >= 500 else "other"
+    except urllib.error.URLError as e:
+        return "busy" if isinstance(e.reason, TimeoutError) else "down"
+    except TimeoutError:
+        return "busy"
+    except ValueError:
+        return "other"
     except Exception:
-        return False
+        return "down"
+
+
+def _vlm_alive(base: str, timeout: float = 3.0) -> bool:
+    """The server at `base` lists OCR_VLM_MODEL (llama-swap or a llama-server started with -a)."""
+    return _vlm_probe(base, timeout) == "model"
+
+
+def _vlm_wait(base: str, budget: float, step: float = 10.0) -> str:
+    """_vlm_probe until it answers anything but "busy", for at most `budget` s: a server working on another page
+    answers late, not never."""
+    end = time.time() + budget
+    while True:
+        t = time.time()
+        st = _vlm_probe(base, step)
+        if st != "busy" or time.time() >= end:
+            return st
+        time.sleep(max(0.0, min(step - (time.time() - t), end - time.time())))
+
+
+def _vlm_local_port() -> str:
+    from urllib.parse import urlparse
+
+    return str(urlparse(OCR_VLM_LOCAL_URL).port or "")
 
 
 def _vlm_endpoint():
@@ -1571,22 +1608,46 @@ def _vlm_endpoint():
         found = ("local", OCR_VLM_LOCAL_URL)
     elif OCR_VLM_REMOTE_URL and not _vlm_quiet() and _vlm_alive(OCR_VLM_REMOTE_URL):
         found = ("remote", OCR_VLM_REMOTE_URL)
-    elif OCR_VLM_LOCAL_START and os.access(OCR_VLM_LOCAL_START, os.X_OK):
-        try:
-            _run_child(
-                [OCR_VLM_LOCAL_START, "start", "--for-build"],
-                check=True,
-                timeout=900,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            if _vlm_alive(OCR_VLM_LOCAL_URL, 10.0):
-                found = ("local", OCR_VLM_LOCAL_URL)
-        except Exception as e:
+    else:
+        # Why it is not alive decides what to do: a listener that is only busy is waited for; one that answers without
+        # the model is another service on the port, which `ocr_server.sh start` would take for its own server
+        # ("already serving": its test is any {"status":"ok"}), so it is never started.
+        st = _vlm_probe(OCR_VLM_LOCAL_URL)
+        if st == "busy":
+            st = _vlm_wait(OCR_VLM_LOCAL_URL, OCR_VLM_BUSY_WAIT_S)
+        if st == "model":
+            found = ("local", OCR_VLM_LOCAL_URL)
+        elif st == "other":
             print(
-                f"[build_corpus] WARN: could not start the local OCR server ({type(e).__name__}: {str(e)[:80]})",
+                f"[build_corpus] WARN: {OCR_VLM_LOCAL_URL} answers but does not list {OCR_VLM_MODEL} "
+                "(another service holds the port); not starting the local OCR server",
                 flush=True,
             )
+        elif (
+            st == "down"
+            and OCR_VLM_LOCAL_START
+            and os.access(OCR_VLM_LOCAL_START, os.X_OK)
+        ):
+            try:
+                port = _vlm_local_port()
+                _run_child(
+                    [OCR_VLM_LOCAL_START, "start", "--for-build"],
+                    check=True,
+                    timeout=900,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    env=dict(os.environ, **({"OCR_PORT": port} if port else {})),
+                )
+                if (
+                    _vlm_alive(OCR_VLM_LOCAL_URL, 10.0)
+                    or _vlm_wait(OCR_VLM_LOCAL_URL, 60.0) == "model"
+                ):
+                    found = ("local", OCR_VLM_LOCAL_URL)
+            except Exception as e:
+                print(
+                    f"[build_corpus] WARN: could not start the local OCR server ({type(e).__name__}: {str(e)[:80]})",
+                    flush=True,
+                )
     _vlm_endpoint_cache = found
     return found
 
