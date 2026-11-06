@@ -136,6 +136,24 @@ def _flat(s: str) -> str:
     return " ".join(s.split())
 
 
+# The glyphs a broken font prints for '(' and ')': eth and thorn, the guillemets, and the ellipsis
+# and dagger pair of one 2002 paper. A layer that shows one of these -- or the fraction glyph the
+# same fonts print for '=' -- is the only place the normalisations in number_check() and
+# letter_recall() may run; a healthy layer is checked strictly.
+_GLYPH_MARKS = ("ð", "Þ", "‹", "›", "…", "†")
+
+
+def layer_garbled(text: str) -> bool:
+    """Whether a text layer shows a broken font's glyphs: the parentheses printed as eth, thorn,
+    guillemets, an ellipsis or a dagger, or '=' printed as the fraction glyph on its own ('¼'/'1⁄4'
+    as a word). Only such a layer may have those glyphs normalised, so a real half ('1⁄2') and a
+    real q or S on a healthy layer are checked strictly."""
+    words = text.split()
+    if any(m in w for w in words for m in _GLYPH_MARKS):
+        return True
+    return any(_flat(w) == "1⁄4" for w in words)
+
+
 # ---------------------------------------------------------------- LaTeX entries
 
 _MATH = re.compile(
@@ -216,14 +234,18 @@ def pick_equation(entries: list[dict], box_tags: list[str], number: str):
     return [], f"{len(entries)} formulas for {len(box_tags)} equation number(s)"
 
 
-def number_check(layer_words: list[str], latexes: list[str]) -> list[str]:
-    """Numbers that the text layer has and the transcription lacks (a misread digit). The layer is
-    normalised first for the two glyph corruptions of a broken font, and nothing else: U+2044, the
-    fraction glyph this font prints for '=' ('1⁄4' manufactures a 1 and a 4), and a colon between
-    digits, which is its decimal point ('77:689' is 77.689)."""
-    have = set(re.findall(r"\d+(?:\.\d+)?", " ".join(latexes)))
-    layer = re.sub(r"\d*\u2044\d*", " ", _flat(" ".join(layer_words)))
-    layer = re.sub(r"(?<=\d):(?=\d)", ".", layer)
+def number_check(layer_words: list[str], latexes: list[str], tags=()) -> list[str]:
+    """Numbers that the text layer has and the transcription lacks (a misread digit). A number the
+    model wrote as the equation's tag (\\tag{N} or \\eqno(N)) counts as written: it is the printed
+    number, taken out of the formula before this check. On a layer that shows a broken font's glyphs
+    (layer_garbled) it is first normalised for the two corruptions that font causes -- U+2044, the
+    fraction glyph printed for '=' ('1⁄4' manufactures a 1 and a 4), and a colon between digits,
+    which is its decimal point ('77:689' is 77.689); a healthy layer is not normalised."""
+    have = set(re.findall(r"\d+(?:\.\d+)?", " ".join([*latexes, *tags])))
+    layer = _flat(" ".join(layer_words))
+    if layer_garbled(" ".join(layer_words)):
+        layer = re.sub(r"\d*\u2044\d*", " ", layer)
+        layer = re.sub(r"(?<=\d):(?=\d)", ".", layer)
     want = set(re.findall(r"\d+(?:\.\d+)?", layer))
     return sorted(want - have, key=lambda x: (len(x), x))
 
@@ -1072,7 +1094,11 @@ def cmd_equation(path: str, number: str, only_page: int = 0) -> dict:
     res["missing_numbers"] = (
         []
         if res["scanned"]
-        else number_check([w[4] for w in layer], [e["latex"] for e in entries])
+        else number_check(
+            [w[4] for w in layer],
+            [e["latex"] for e in entries],
+            [e["tag"] for e in entries if e["tag"]],
+        )
     )
     res["seconds"] = round(time.monotonic() - started, 1)
     return res

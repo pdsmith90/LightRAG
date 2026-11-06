@@ -133,6 +133,24 @@ def _flat(s: str) -> str:
     return " ".join(s.split())
 
 
+# The glyphs a broken font prints for '(' and ')': eth and thorn, the guillemets, and the ellipsis
+# and dagger pair of one 2002 paper. A layer that shows one of these -- or the fraction glyph the
+# same fonts print for '=' -- is the only place the normalisations in number_check() and
+# letter_recall() may run; a healthy layer is checked strictly.
+_GLYPH_MARKS = ("ð", "Þ", "‹", "›", "…", "†")
+
+
+def layer_garbled(text: str) -> bool:
+    """Whether a text layer shows a broken font's glyphs: the parentheses printed as eth, thorn,
+    guillemets, an ellipsis or a dagger, or '=' printed as the fraction glyph on its own ('¼'/'1⁄4'
+    as a word). Only such a layer may have those glyphs normalised, so a real half ('1⁄2') and a
+    real q or S on a healthy layer are checked strictly."""
+    words = text.split()
+    if any(m in w for w in words for m in _GLYPH_MARKS):
+        return True
+    return any(_flat(w) == "1⁄4" for w in words)
+
+
 _MATH = re.compile(
     r"\\begin\{(?P<env>equation\*?|align\*?|gather\*?|eqnarray\*?|multline\*?)\}(?P<e>.+?)\\end\{(?P=env)\}"
     r"|\$\$(?P<dd>.+?)\$\$"
@@ -191,14 +209,18 @@ def tagged(latex: str, number: str) -> str:
     return f"${latex} \\tag{{{number}}}$"
 
 
-def number_check(layer_words: list[str], latexes: list[str]) -> list[str]:
-    """Numbers that the text layer has and the transcription lacks (a misread digit). The layer is
-    normalised first for the two glyph corruptions of a broken font, and nothing else: U+2044, the
-    fraction glyph this font prints for '=' ('1⁄4' manufactures a 1 and a 4), and a colon between
-    digits, which is its decimal point ('77:689' is 77.689)."""
-    have = set(re.findall(r"\d+(?:\.\d+)?", " ".join(latexes)))
-    layer = re.sub(r"\d*\u2044\d*", " ", _flat(" ".join(layer_words)))
-    layer = re.sub(r"(?<=\d):(?=\d)", ".", layer)
+def number_check(layer_words: list[str], latexes: list[str], tags=()) -> list[str]:
+    """Numbers that the text layer has and the transcription lacks (a misread digit). A number the
+    model wrote as the equation's tag (\\tag{N} or \\eqno(N)) counts as written: it is the printed
+    number, taken out of the formula before this check. On a layer that shows a broken font's glyphs
+    (layer_garbled) it is first normalised for the two corruptions that font causes -- U+2044, the
+    fraction glyph printed for '=' ('1⁄4' manufactures a 1 and a 4), and a colon between digits,
+    which is its decimal point ('77:689' is 77.689); a healthy layer is not normalised."""
+    have = set(re.findall(r"\d+(?:\.\d+)?", " ".join([*latexes, *tags])))
+    layer = _flat(" ".join(layer_words))
+    if layer_garbled(" ".join(layer_words)):
+        layer = re.sub(r"\d*\u2044\d*", " ", layer)
+        layer = re.sub(r"(?<=\d):(?=\d)", ".", layer)
     want = set(re.findall(r"\d+(?:\.\d+)?", layer))
     return sorted(want - have, key=lambda x: (len(x), x))
 
@@ -264,21 +286,24 @@ _GREEK = {
 
 # A broken font's substitution for a letter, beside the Greek ones above: the layer prints this
 # ASCII letter where the page has the symbol, so the LaTeX holds one of these commands instead.
+# Credited only on a layer that shows the same font's glyph corruption (layer_garbled).
 _GLYPH_CMDS = {"q": ("theta", "vartheta"), "S": ("mathcal",)}
 
 
 def letter_recall(layer_text: str, latexes: list[str]) -> tuple[int, int]:
     """(letters found, letters wanted): the ASCII letters (case-folded, multiset) and the Greek
     letters of the text layer that the LaTeX holds; a Greek letter counts when the LaTeX has one
-    of its commands. Glyphs the font could not map (U+FFFD) and other symbols are not counted."""
+    of its commands. Glyphs the font could not map (U+FFFD) and other symbols are not counted.
+    A glyph substitution of the font (_GLYPH_CMDS) is credited only on a layer_garbled layer."""
     layer = unicodedata.normalize("NFKC", layer_text)
     latex = "\n".join(latexes)
     want = collections.Counter(c.lower() for c in layer if c.isascii() and c.isalpha())
     have = collections.Counter(c.lower() for c in latex if c.isascii() and c.isalpha())
     cmds = collections.Counter(re.findall(r"\\([A-Za-z]+)", latex))
-    for glyph, names in _GLYPH_CMDS.items():
-        if glyph in layer:
-            have[glyph.lower()] += sum(cmds[v] for v in names)
+    if layer_garbled(layer_text):
+        for glyph, names in _GLYPH_CMDS.items():
+            if glyph in layer:
+                have[glyph.lower()] += sum(cmds[v] for v in names)
     wanted = hit = 0
     for ch, n in collections.Counter(c for c in layer if c in _GREEK).items():
         wanted += n
@@ -301,14 +326,15 @@ def balanced(latex: str) -> bool:
     return depth == 0
 
 
-def verify(layer_text: str, layer_words: list[str], latexes: list[str]) -> str:
-    """'' when the transcription holds the box's text layer, else why not."""
+def verify(layer_text: str, layer_words: list[str], latexes: list[str], tags=()) -> str:
+    """'' when the transcription holds the box's text layer, else why not. `tags` are the numbers the
+    model wrote as the equations' own tags (\\tag / \\eqno), which number_check counts as written."""
     if not latexes:
         return "no formula in the transcription"
     for lx in latexes:
         if "$" in lx or not balanced(lx):
             return "malformed LaTeX"
-    missing = number_check(layer_words, latexes)
+    missing = number_check(layer_words, latexes, tags)
     if missing:
         return "numbers missing: " + ", ".join(missing[:4])
     hit, wanted = letter_recall(layer_text, latexes)
@@ -560,7 +586,10 @@ class Equations:
         why = "" if delimited else "no math delimiters"
         layer_words = [w[4] for w in words]
         why = why or verify(
-            _flat(" ".join(layer_words)), layer_words, [e["latex"] for e in entries]
+            _flat(" ".join(layer_words)),
+            layer_words,
+            [e["latex"] for e in entries],
+            [e["tag"] for e in entries if e["tag"]],
         )
         if why:
             self.reasons["unverified: " + " ".join(why.split(":")[0].split()[:2])] += 1

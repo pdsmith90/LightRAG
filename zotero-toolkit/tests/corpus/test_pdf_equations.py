@@ -401,10 +401,12 @@ def test_three_equations_in_one_box_with_the_fraction_glyph_and_colon_decimals_v
 def test_number_check_still_binds_on_a_real_digit():
     assert eq.number_check(["10"], ["2"]) == ["10"]
     assert eq.number_check(["¼", "10"], ["10"]) == []  # the '=' glyph is not a number
-    assert eq.number_check(["77:689"], ["77.689"]) == []  # a colon decimal point
-    assert eq.number_check(["77:68"], ["77.689"]) == [
-        "77.68"
-    ]  # a real digit difference
+    # the colon decimal point is a glyph corruption too: only a layer that shows the font is read so
+    assert eq.number_check(["¼", "77:689"], ["77.689"]) == []
+    assert eq.number_check(["77:689"], ["77.689"]) == [
+        "77",
+        "689",
+    ]  # a healthy 'a:b' is a ratio
     assert eq.number_check(["A1"], ["x_i = x_T + b_i,"]) == ["1"]
 
 
@@ -433,21 +435,67 @@ def test_split_math_takes_a_trailing_eqno_as_the_equation_number():
         assert entries == [{"latex": "a=b", "tag": tag}], (raw, entries)
 
 
-def test_letter_recall_accepts_the_layers_glyph_substitutions():
-    assert eq.letter_recall("q", ["\\theta"]) == (
-        1,
-        1,
-    )  # TTP2IWXM p12: the font prints θ as q
-    assert eq.letter_recall("S", ["\\mathcal{J}"]) == (
-        1,
-        1,
-    )  # 9WPVX7DW: script J printed as S
-    # 9WPVX7DW p2, real crop: "∇S · ∇S = n2, (3)" against the OCR's \mathcal{J}
+def test_a_real_half_and_a_real_q_on_a_healthy_layer_are_checked_strictly():
+    # a layer with no glyph marker: '1⁄2' is a half, q and S are the letters q and S
+    words = ["x", "=", "1⁄2", "y"]
+    assert not eq.layer_garbled(" ".join(words))
+    assert eq.number_check(words, ["x = 1 y"]) == ["2"]  # the OCR dropped the 2
+    assert eq.number_check(words, ["x = \\frac{1}{2} y"]) == []
+    assert eq.number_check(words, ["x = 10 y"]) == [
+        "1",
+        "2",
+    ]  # a half's digits are checked
+    assert eq.letter_recall("q", ["\\theta"]) == (0, 1)  # a real q is not theta
+    assert eq.letter_recall("S", ["\\mathcal{J}"]) == (0, 1)
+    # 9WPVX7DW p2, real crop: "∇S · ∇S = n2, (3)" shows no marker, so its S is a real S and the
+    # OCR's \mathcal{J} is a miss (this box passed between aee9fc49 and this gate)
     words = ["∇S", "·", "∇S", "=", "n2,"]
     latex = "\\nabla \\mathcal{J} \\cdot \\nabla \\mathcal{J} = n^2,"
-    assert eq.verify(eq._flat(" ".join(words)), words, [latex]) == ""
-    # a glyph the table does not name is still a miss
-    assert eq.letter_recall("q", ["\\xi"]) == (0, 1)
+    assert eq.verify(eq._flat(" ".join(words)), words, [latex]) == "letters 1/3"
+
+
+def test_the_same_layer_in_a_broken_font_is_normalised():
+    # the same words, plus the marker the broken font prints for its parentheses: now the '1⁄2' is
+    # its '=' glyph (with a fabricated 1 and 2) and its q is theta
+    words = ["x", "=", "1⁄2", "y", "BðzÞ"]
+    assert eq.layer_garbled(" ".join(words))
+    assert eq.number_check(words, ["x = 1 y"]) == []  # the fabricated 2 is not wanted
+    assert eq.number_check(words, ["x = 10 y"]) == []  # nor the 1
+    assert eq.letter_recall("q ð", ["\\theta"]) == (1, 1)  # q credited as theta
+    assert eq.letter_recall("q ð", ["\\xi"]) == (
+        0,
+        1,
+    )  # a glyph the table does not name
+
+
+def test_the_marker_is_the_fraction_glyph_standing_for_equals_not_a_real_fraction():
+    assert eq.layer_garbled("E ¼ m c2")  # '¼' alone: the font's '='
+    assert eq.layer_garbled("E 1⁄4 m c2")  # the same glyph written out
+    assert not eq.layer_garbled("x = ½ y")  # a real half is not a marker
+    assert not eq.layer_garbled("x = 1⁄2 y")
+    assert (
+        eq.layer_garbled("BðzÞ") and eq.layer_garbled("‹7›") and eq.layer_garbled("A†")
+    )
+
+
+def test_an_eqno_number_counts_as_written_and_the_wclpvyve_box_passes():
+    # WCLPVYVE p9: the printed tag is '...4:6†' -- '(' is the font's ellipsis, ')' its dagger and
+    # ':' its decimal point -- and the number the model wrote as \eqno(4.6) is out of the formula by
+    # the time the check runs, so it counts as written only if the tag is credited.
+    raw = (
+        "$$r_i^2 = (\\hat{y}_i - \\bar{\\hat{y}}_i)^2 / \\hat{\\sigma}^2 \\eqno(4.6)$$"
+    )
+    entries, _ = eq.split_math(raw)
+    assert entries[0]["tag"] == "4.6"
+    words = ["r2", "i", "ˆ", "…yi", "¡", "^yi†2=^s2", "…4:6†"]
+    assert eq.number_check(words, [entries[0]["latex"]]) == ["4.6"]
+    assert eq.number_check(words, [entries[0]["latex"]], ["4.6"]) == []
+    # only the number the model actually wrote is credited
+    assert eq.number_check(words, [entries[0]["latex"]], ["4.7"]) == ["4.6"]
+    assert (
+        eq.verify(eq._flat(" ".join(words)), words, [entries[0]["latex"]], ["4.6"])
+        == ""
+    )
 
 
 def test_a_number_in_a_broken_font_is_read_from_the_layer_and_the_box_verifies(
@@ -524,12 +572,24 @@ def _fn_dump(path, names):
 def test_shared_helpers_match_the_mcp_proxys_pdf_tools():
     shared = (
         "norm_number tag_of _flat split_math tagged number_check line_end_words tags_on_page _center words_in "
-        "join_label_lines _ROMAN _TAG_WORD _MATH _TAG_CMD _EQNO"
+        "join_label_lines _ROMAN _TAG_WORD _MATH _TAG_CMD _EQNO layer_garbled _GLYPH_MARKS"
     ).split()
     mine = os.path.abspath(eq.__file__)
-    theirs = os.path.join(os.path.dirname(mine), "..", "mcp", "paper_pdf_tools.py")
-    if not os.path.exists(theirs):
-        return  # bundle layout: the proxy's helper lives in mcp/, not beside this file
+    here = os.path.dirname(mine)
+    for theirs in (
+        os.path.join(
+            here, "mcp", "paper_pdf_tools.py"
+        ),  # bundle layout: beside pdf_equations.py
+        os.path.join(
+            here, "..", "mcp", "paper_pdf_tools.py"
+        ),  # fork layout: corpus/../mcp
+    ):
+        if os.path.exists(theirs):
+            break
+    else:
+        import pytest
+
+        pytest.skip(f"no mcp/paper_pdf_tools.py in or beside {here}")
     a, b = _fn_dump(mine, shared), _fn_dump(theirs, shared)
     assert set(a) == set(shared) == set(b), (
         sorted(set(shared) - set(a)),
