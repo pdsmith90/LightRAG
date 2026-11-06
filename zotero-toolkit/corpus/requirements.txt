@@ -13,6 +13,8 @@ ebooklib>=0.18,<1            # optional: .epub  (fallback if `pandoc` is not ins
 #   tesseract-ocr -> OCR (ocrmypdf; recent PyMuPDF also uses it for image pages)
 #   ghostscript   -> required by ocrmypdf
 pikepdf>=6          # strips owner-password encryption before OCR (ocrmypdf refuses encrypted input)
-pymupdf4llm>=0.0.17,<2       # PDF -> Markdown with correct reading order (tested with 1.28.x)
+pymupdf>=2.1,<2.2            # PDF text layer and rendering; pymupdf4llm builds on it
+pymupdf-layout>=2.1,<2.2     # layout model pymupdf4llm uses for blocks and reading order
+pymupdf4llm>=2.1,<2.2        # PDF -> Markdown with correct reading order
 python-docx>=1.1.0,<2        # optional: .docx  (fallback if `pandoc` is not installed)
 python-pptx>=0.6.23,<2       # optional: .pptx
