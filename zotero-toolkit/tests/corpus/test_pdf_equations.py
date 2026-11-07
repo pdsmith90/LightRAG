@@ -657,7 +657,8 @@ def _fn_dump(path, names):
 def test_shared_helpers_match_the_mcp_proxys_pdf_tools():
     shared = (
         "norm_number tag_of _flat split_math tagged number_check line_end_words tags_on_page _center words_in "
-        "join_label_lines _ROMAN _TAG_WORD _MATH _TAG_CMD _EQNO layer_garbled _GLYPH_MARKS _ELISION_OPEN _ELISION_CLOSE"
+        "join_label_lines _ROMAN _TAG_WORD _MATH _TAG_CMD _EQNO layer_garbled _GLYPH_MARKS _ELISION_OPEN _ELISION_CLOSE "
+        "page_chapters bare_tags _SECTION_NO _BARE_CHAPTER _BARE_EQ"
     ).split()
     mine = os.path.abspath(eq.__file__)
     here = os.path.dirname(mine)

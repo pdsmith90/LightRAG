@@ -333,6 +333,38 @@ def test_equation_with_ocr_picks_the_numbered_formula(t, stub, pdf, monkeypatch)
     assert not d["ocr_cached"] and stub.started() == 2
 
 
+@pytest.fixture
+def bare_pdf(tmp_path):
+    """One page whose equation tag is printed without parentheses and dot ('2 7'), as a font that
+    draws them without text leaves it, under a section numbered 2.1."""
+    pymupdf = pytest.importorskip("pymupdf")
+    doc = pymupdf.open()
+    p = doc.new_page()
+    p.insert_text((72, 100), "2.1 Invented section. Widgets obey the following law.")
+    p.insert_text((120, 300), "x = y + z")
+    p.insert_text((520, 300), "2 7")
+    path = tmp_path / "bare.pdf"
+    doc.save(path)
+    return str(path)
+
+
+def test_equation_whose_tag_is_printed_without_parentheses(
+    t, stub, bare_pdf, monkeypatch
+):
+    monkeypatch.setattr(
+        t,
+        "layout_page",
+        lambda doc, pno, cache: {
+            "boxes": [["formula", 100, 280, 560, 310]],
+            "tables": [],
+        },
+    )
+    monkeypatch.setenv("STUB_TEXT", "$x = y + z$")
+    d = t.cmd_equation(bare_pdf, "2.7")
+    assert d["status"] == "ocr" and d["equation"] == ["$x = y + z \\tag{2.7}$"], d
+    assert d["box_tags"] == ["2.7"] and d["missing_numbers"] == [], d
+
+
 def test_equation_with_unmatched_formulas_shows_the_block(t, stub, pdf, monkeypatch):
     monkeypatch.setattr(t, "layout_page", fake_layout)
     monkeypatch.setenv("STUB_TEXT", "$only one$")
