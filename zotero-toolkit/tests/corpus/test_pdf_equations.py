@@ -333,6 +333,80 @@ def test_a_box_whose_ocr_is_only_its_number_falls_back_to_the_text_layer(tmp_pat
     assert e.reasons["only the equation number"] == 1, e.reasons
 
 
+# ------------------------------------------------------------------ bare chapter tags (2026-11-07)
+
+
+def page_with_bare_tag(tmp_path, section="42.5 An Invented Section", tag="42 34"):
+    """page_with_equation, but the tag is printed without parentheses or dot ('42 34', as a font that
+    draws them without text leaves it), and a running header may carry a section number."""
+    p = str(tmp_path / "bare.pdf")
+    doc = pymupdf.open()
+    page = doc.new_page(width=595, height=842)
+    if section:
+        page.insert_text((40, 40), section, fontsize=9)
+    page.insert_textbox(pymupdf.Rect(40, 60, 555, 270), LEAD, fontsize=9)
+    page.insert_text((60, 305), "x2 + y2 = z2", fontsize=10)
+    page.insert_text((520, 305), tag, fontsize=10)
+    page.insert_textbox(pymupdf.Rect(40, 330, 555, 400), AFTER, fontsize=9)
+    doc.save(p)
+    doc.close()
+    return p
+
+
+def test_a_bare_chapter_tag_is_the_equation_number_and_leaves_the_check(tmp_path):
+    out, e = run_apply(page_with_bare_tag(tmp_path), chunk_for(), ok_client)
+    assert f"${LATEX} \\tag{{42.34}}$" in out, out
+    assert e.stats["ocr"] == 1 and e.stats["text_layer"] == 0
+
+
+def test_a_bare_pair_without_its_chapter_on_the_page_stays_in_the_check(tmp_path):
+    for section in (None, "12.3 Another Invented Section"):
+        out, e = run_apply(
+            page_with_bare_tag(tmp_path, section=section), chunk_for(), ok_client
+        )
+        assert (
+            "\\tag{42.34}" not in out
+            and e.stats["ocr"] == 0
+            and e.stats["text_layer"] == 1
+        ), (
+            section,
+            out,
+        )
+        assert e.reasons["unverified: numbers missing"] == 1, e.reasons
+
+
+def test_bare_tags_and_page_chapters():
+    def w(x0, text, n, line=1):
+        return (x0, 0.0, x0 + 10.0, 10.0, text, 1, line, n)
+
+    formula = [w(100, "x", 0), w(112, "=", 1), w(124, "y", 2)]
+    assert [
+        t
+        for t, _, _ in eq.bare_tags(
+            formula + [w(500, "42", 3), w(512, "34", 4)], {"42"}
+        )
+    ] == ["42.34"]
+    assert (
+        eq.bare_tags(formula + [w(500, "42", 3), w(512, "34", 4)], {"12"}) == []
+    )  # another chapter
+    assert (
+        eq.bare_tags(formula + [w(500, "42", 3), w(512, "0", 4)], {"42"}) == []
+    )  # no equation 0
+    assert (
+        eq.bare_tags(formula + [w(300, "42", 3), w(512, "34", 4)], {"42"}) == []
+    )  # two separate numbers
+    assert eq.bare_tags([w(512, "34", 0)], {"42"}) == []  # one word is not a pair
+    _, merged, pair = eq.bare_tags([w(500, "7", 0), w(512, "12", 1)], {"7"})[0]
+    assert merged[0] == 500 and merged[2] == 522 and [p[4] for p in pair] == ["7", "12"]
+    heads = [
+        w(0, "42.5", 0),
+        w(20, "Table", 1, 2),
+        w(40, "42.1,", 2, 2),
+        w(60, "3.14159", 3, 3),
+    ]
+    assert eq.page_chapters(heads) == {"42"}
+
+
 def test_assemble_cases():
     ent = lambda *xs: [{"latex": x, "tag": None} for x in xs]  # noqa: E731
     assert eq.assemble(ent("a", "b"), ["1", "2"]) == (

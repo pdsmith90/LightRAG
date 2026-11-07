@@ -244,6 +244,53 @@ def tags_on_page(words: list) -> list[tuple[str, tuple]]:
     return [(t, w) for w in line_end_words(words) if (t := tag_of(w[4]))]
 
 
+_SECTION_NO = re.compile(r"^(\d{1,2})\.\d{1,2}(?:\.\d{1,2})*$")
+_BARE_CHAPTER = re.compile(r"^\d{1,2}$")
+_BARE_EQ = re.compile(r"^[1-9]\d{0,2}$")
+
+
+def page_chapters(words: list) -> set[str]:
+    """Chapter numbers the page prints at the head of a section number: '42.5', '42.5.6.3' or
+    'Table 42.1' give '42'."""
+    return {m.group(1) for w in words if (m := _SECTION_NO.match(w[4].strip(".,;:")))}
+
+
+def bare_tags(words: list, chapters: set[str]) -> list[tuple[str, tuple, tuple]]:
+    """[(number, merged word, (chapter word, number word))] for the lines that END in two bare
+    integers 'C N', C one of the page's chapters: an equation tag printed '(C.N)' whose parentheses
+    and dot the font draws without text. 2026-11-07: a two-volume book prints nearly every tag that
+    way (its text layer reads '42 34', '10 1'), so no '(N)' word was found, the tag's digits stayed
+    in the number check, and the model -- which leaves equation numbers out -- failed it 257 times
+    in one build. The caller uses these only for a box with no '(N)' tag."""
+    lines: dict = {}
+    for w in words:
+        lines.setdefault((w[5], w[6]), []).append(w)
+    out = []
+    for ws in lines.values():
+        if len(ws) < 2:
+            continue
+        a, b = sorted(ws, key=lambda w: w[7])[-2:]
+        c, n = a[4].strip(), b[4].strip()
+        if not (_BARE_CHAPTER.match(c) and _BARE_EQ.match(n) and c in chapters):
+            continue
+        if b[0] - a[2] > 1.5 * (
+            b[3] - b[1]
+        ):  # a wide gap: two separate numbers, not one tag
+            continue
+        merged = (
+            a[0],
+            min(a[1], b[1]),
+            b[2],
+            max(a[3], b[3]),
+            f"({c}.{n})",
+            a[5],
+            a[6],
+            b[7],
+        )
+        out.append((f"{c}.{n}", merged, (a, b)))
+    return out
+
+
 def _center(w):
     return ((w[0] + w[2]) / 2, (w[1] + w[3]) / 2)
 
@@ -522,6 +569,15 @@ class Equations:
         ] or tw
         tw = sorted(right, key=lambda x: _center(x[1])[1])
         tag_ids = {id(w) for _, w in tw}
+        if not tw:  # no '(N)' tag: a bare 'C N' at the right edge (bare_tags), both words leave the check
+            edge = rect.x1 - max(30.0, 0.15 * rect.width)
+            bare = [
+                b
+                for b in bare_tags(inside, page_chapters(self._page_words(pno)))
+                if b[1][2] >= edge
+            ]
+            tw = sorted(((t, w) for t, w, _ in bare), key=lambda x: _center(x[1])[1])
+            tag_ids = {id(p) for _, _, pair in bare for p in pair}
         rest = [w for w in inside if id(w) not in tag_ids]
         text = _flat(self.doc[pno].get_text("text", clip=rect))
         return rest, tw, text
