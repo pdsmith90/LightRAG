@@ -1,13 +1,14 @@
 # zlightrag
 
 `zlightrag` is the default branch of this fork of
-[LightRAG](https://github.com/HKUDS/LightRAG). It is LightRAG **v1.5.7** plus the
-changes listed below, and a `zotero-toolkit/` directory. Together they run LightRAG
+[LightRAG](https://github.com/HKUDS/LightRAG). It is upstream LightRAG's `main` as of
+2026-10-14 (commit `aaebfe1bb`, which reports version **1.5.8**; upstream has tagged no
+1.5.8 release) plus the changes listed below, and a `zotero-toolkit/` directory. Together they run LightRAG
 as a research knowledge base over a [Zotero](https://www.zotero.org) library: answers
 cite real bibliographic entries, reference-list text is kept out of the answer
 context, and retrieval budgets can be held to what a small LLM context window takes.
 
-The rest of the code is upstream LightRAG v1.5.7, unchanged, and its documentation,
+The rest of the code is upstream LightRAG at that commit, unchanged, and its documentation,
 starting with [README.md](./README.md), applies as written.
 
 ## Changes to LightRAG
@@ -20,12 +21,22 @@ starting with [README.md](./README.md), applies as written.
 | [Bibliography chunk filter](#bibliography-chunk-filter) | `DROP_BIBLIOGRAPHY_CHUNKS` | `false` |
 | [Per-work chunk cap](#per-work-chunk-cap) | `MAX_CHUNKS_PER_DOC` | `0` (off) |
 | [Lexical retrieval leg](#lexical-retrieval-leg) | `LEXICAL_CHUNK_TOP_K` | `0` (off) |
+| [Author-year and citation legs](#author-year-and-citation-legs) | `METADATA_CHUNK_TOP_K`, `CITATION_HOP_TOP_K` | `0`, `0` (off) |
+| [Named-work pin and notice](#named-work-pin-and-notice) | `NAMED_WORK_PIN`, `NAMED_WORK_NOTICE` | `false`, `false` |
+| [Low-level keyword fallback](#low-level-keyword-fallback) | `LL_KEYWORDS_FALLBACK` | `false` |
+| [Per-request rerank floor](#per-request-rerank-floor) | `min_rerank_score` request field | the server's `MIN_RERANK_SCORE` |
+| [Lexical document-frequency cap](#lexical-document-frequency-cap) | `LEXICAL_DF_CAP_PCT` | `2` |
+| [Strict entity types](#strict-entity-types) | `ENTITY_TYPE_STRICT` | `false` |
+| [Symbol entity names](#symbol-entity-names) | `DROP_SYMBOL_ENTITIES` | `false` |
+| [Apparatus entity names](#apparatus-entity-names) | `DROP_JUNK_ENTITIES` | `false` |
+| [Entity name fold](#entity-name-fold) | `ENTITY_NAME_FOLD`; lists and aliases via `ENTITY_NAME_FOLD_LISTS`, `ENTITY_NAME_ALIASES` | `false` |
+| [Sidecar relations](#sidecar-relations) | `SIDECAR_RELATIONS` | `all` (upstream behaviour) |
+| [Paper filter in the graph view](#paper-filter-in-the-graph-view) | none; reference lists via `ZOTERO_REFERENCES` | always active |
+| [Paper lookup that forgives typography, and one paper's passages](#paper-lookup-that-forgives-typography-and-one-papers-passages) | none | always active |
 | [PostgreSQL edge removal in plain SQL](#postgresql-edge-removal-in-plain-sql) | none | always active |
 | [Resume purge keeps a failed document retryable](#resume-purge-keeps-a-failed-document-retryable) | none | always active |
 | [One unusable multimodal analysis degrades its item](#one-unusable-multimodal-analysis-degrades-its-item) | none | always active |
-| [Named-work pin and notice](#named-work-pin-and-notice) | `NAMED_WORK_PIN`, `NAMED_WORK_NOTICE` | `false`, `false` |
-| [Paper filter in the graph view](#paper-filter-in-the-graph-view) | none; reference lists via `ZOTERO_REFERENCES` | always active |
-| [Paper lookup that forgives typography, and one paper's passages](#paper-lookup-that-forgives-typography-and-one-papers-passages) | none | always active |
+| [Changed text of a processed document](#changed-text-of-a-processed-document) | `SCAN_DIVERT_CHANGED_PROCESSED` | `false` |
 | WebUI query defaults for new browser profiles: `top_k` 10, `chunk_top_k` 12, entity/relation tokens 1500, total tokens 7000 (`lightrag_webui/src/stores/querySettings.ts`) | none | always active |
 
 ### Reference lists compiled from Zotero metadata
@@ -200,6 +211,38 @@ pairs such as `J2`, `Io` or `L1` are kept (`is_symbol_entity_name` in
 whatever the prompt says, and on a paper corpus the one-letter hubs collect
 thousands of unrelated edges. Applies to new extractions; existing symbol entities
 stay until deleted. Off by default.
+
+### Apparatus entity names
+
+With `DROP_JUNK_ENTITIES=true`, an extracted entity whose name is bibliography or
+document apparatus rather than subject matter is dropped, and so is every relation that
+names one (`junk_entity_class` in `lightrag/entity_name_guard.py`). A paper corpus hands
+the extraction LLM reference lists, in-text citations and captions, and the model turns
+them into entities whatever the type guidance says. Each becomes a hub linking unrelated
+papers, and because the local leg ranks an entity's relations by the summed degree of
+their endpoints, those hubs crowd real neighbours out of the relation budget. Dropped:
+
+- citations: `et al.` forms, author lists, an author and a year, URLs and DOIs, journal
+  abbreviations unless typed as something other than a venue, and the titles of journals
+  the library publishes in when typed as a publication or carrying a journal word;
+- persons: a name typed as a person, or shaped like a surname with initials (`Doe, J.`);
+  `J. Doe` only when `Doe` is one of the library's authors;
+- numbered labels of figures, tables, equations, sections, chapters, appendices,
+  theorems and the like;
+- generic placeholder words (`Concept`, `Table Name`);
+- names with no letter at all.
+
+An entity is judged on its name and on the type the LLM wrote, before
+`ENTITY_TYPE_STRICT` maps it, and some types protect a shape: an author-and-year name
+typed as an event, mission, dataset, model, software or instrument stays (a model named
+after its authors), as does a URL under a dataset, organization, software, model or
+mission type, and location, mission, instrument and similar types keep a person-shaped
+name (`N. America`). The two rules
+that need the library's author surnames and journals read them from the Zotero metadata
+(`lightrag/zotero_citations.py`); without it they never fire. Names of one or two
+characters are left to `DROP_SYMBOL_ENTITIES`. Applied as each chunk's extraction output
+is parsed, so existing apparatus entities stay until deleted. Reported in the `/health`
+configuration. Off by default.
 
 ### Entity name fold
 
@@ -403,12 +446,25 @@ The error message says `unparseable JSON` when nothing could be parsed, rather t
 naming the first required field, and every such message ends with the response
 length and `finish_reason=length` when the output budget cut the response off.
 
+### Changed text of a processed document
+
+A scan archives a file whose document is already processed into `__parsed__/` unread,
+so a document first ingested as a stub never takes the full text that later arrives
+under the same name. With `SCAN_DIVERT_CHANGED_PROCESSED=true`, a scanned `.md`, `.txt`
+or `.markdown` file of a processed document whose stored text it no longer matches --
+at least twice as long or at most half as long, and at least 2,000 characters
+different -- is moved to `<input_dir>/__changed__/` with a scan warning instead. The
+stored document is never touched: delete it and move the file back to replace it. Off,
+the scan does no extra I/O. Reported in the `/health` configuration. Code:
+`_content_materially_changed` in `lightrag/api/routers/document_routes.py`.
+
 ### Tests
 
 The unit tests for these changes, including the upstream tests the branch modifies,
 are marked `offline`, so upstream's
 [.github/workflows/tests.yml](./.github/workflows/tests.yml) runs them; on this branch it
-also triggers on pushes and pull requests to `zlightrag`. The exception is the Apache
+also triggers on pushes and pull requests to `zlightrag`, as does upstream's
+[.github/workflows/linting.yaml](./.github/workflows/linting.yaml). The exception is the Apache
 AGE integration test for the edge removal,
 `tests/kg/postgres_impl/test_postgres_remove_edges_age.py`, which needs
 `--run-integration` and a live AGE server; no workflow runs it.
@@ -416,22 +472,22 @@ AGE integration test for the edge removal,
 ## `zotero-toolkit/`
 
 Scripts that sit beside LightRAG rather than inside it: a corpus builder that turns a
-Zotero library into citable Markdown and writes `zotero_metadata.json`, an MCP server
-that answers with citations, PostgreSQL maintenance for chunk references left behind
-by out-of-band deletions, and primary/fallback fronts for the LLM and reranker
-servers. The toolkit neither imports nor patches the LightRAG code and also works
+Zotero library into citable Markdown, with display equations written as LaTeX and merged
+table rows split, and writes `zotero_metadata.json`; an MCP server that answers with
+citations and reads one paper's numbered equations and tables from its PDF; PostgreSQL
+maintenance for chunk references left behind by out-of-band deletions, and audits of
+the corpus's text layers; primary/fallback fronts for the LLM and reranker servers; and
+an on-demand OCR server that takes the GPU only while LightRAG has no work for it. The toolkit neither imports nor patches the LightRAG code and also works
 with a stock LightRAG Server. See [zotero-toolkit/README.md](./zotero-toolkit/README.md).
 Its offline tests run from
 [.github/workflows/zotero-toolkit.yml](./.github/workflows/zotero-toolkit.yml).
 
 ## How this branch follows upstream
 
-The branch is rebased onto upstream release tags: when a new LightRAG release is
-tagged, the changes above are replayed onto it and the branch is updated to the
-result. Its history is therefore rewritten at each such step; pin a commit if you
-need a fixed point.
+The changes above were rebuilt onto the v1.5.7 release tag on 2026-09-26, and the
+branch has since taken upstream `main` once, by merge (`aaebfe1bb`, merged
+2026-10-19). Its history is no longer rewritten: a rebuild onto a new base is published
+as a merge commit whose tree is the rebuild's, so any commit you pin stays on the
+branch.
 
-Nothing here is proposed to or maintained by the LightRAG project. Three of the
-changes are also kept on this fork as topic branches based on upstream's `main`:
-`feat/query-token-budget-ceiling`, `feat/query-drop-bibliography-chunks` and
-`perf/postgres-remove-edges-sql`.
+Nothing here is proposed to or maintained by the LightRAG project.
