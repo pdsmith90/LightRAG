@@ -48,6 +48,11 @@ import tempfile
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
 
+sys.path.insert(
+    0, os.path.dirname(os.path.abspath(__file__))
+)  # pdf_equations.py sits beside this script
+import pdf_equations as _eq  # noqa: E402
+
 # Denylist semantics are shared with quarantine_junk.py, which runs immediately
 # after this script and would move any denylisted output straight back out.
 # Import rather than reimplement so the two can never drift. Degrade to an empty
@@ -131,7 +136,7 @@ _tag_re = re.compile(
 # chapter title appears in the TOC and as a running header on every page, and
 # dropping every copy would delete the heading itself. Structural markdown is
 # excluded outright so tables, lists, quotes and headings are never candidates.
-_struct_re = re.compile(r"^\s*(\||#{1,6}\s|[-*+]\s|>\s|```|\d+\.\s)")
+_struct_re = re.compile(r"^\s*(\||#{1,6}\s|[-*+]\s|>\s|```|\d+\.\s|\$)")
 _REPEAT_MIN = 5  # occurrences before a line counts as furniture
 _REPEAT_MINLEN = 40  # chars; shorter lines are too ambiguous to judge
 _REPEAT_MAX_SHRINK = 0.25  # bail out above this; see SAFETY VALVE below
@@ -686,7 +691,7 @@ def clean_md(md: str) -> str:
     md = _strip_references(md)  # bibliography / reference-list sections
     md = _drop_repeats(md)  # running headers, page stamps
     md = _manyblank.sub("\n\n", md)
-    return md.strip()
+    return md.replace(_BR_KEEP, "<br>").strip()
 
 
 def looks_empty(text: str, min_chars: int) -> bool:
@@ -1133,6 +1138,49 @@ def _heavy_pages(doc) -> dict:
 
 
 # ---------- per-format extractors ----------
+def _equations_session(doc, chunks, name: str):
+    """The pdf_equations.Equations object for this document's formula boxes, or None (no formula box,
+    BUILD_EQUATIONS=off). Its OCR client is BUILD_EQ_OCR_URL's server when that is set (validation), else
+    this build's own OCR lane -- the one whole-document OCR uses, with its windows and turn-taking -- when
+    OCR is on; otherwise there is no client and a formula is written as its text layer. A failed crop
+    is that crop's text layer, never a failed document."""
+    if _eq.EQ_MODE == "off":
+        return None
+    n = _eq.count_formulas(chunks)
+    if not n:
+        return None
+    client = None
+    if _eq.EQ_MODE == "auto":
+        if _eq.EQ_OCR_URL:
+            client = _eq.http_client(_eq.EQ_OCR_URL)
+        elif CFG.get("ocr_vlm") == "auto" and CFG.get("ocr", "auto") in (
+            "auto",
+            "force",
+        ):
+            kind, base = _vlm_endpoint()
+            if not base:
+                if OCR_VLM_REMOTE_URL or (
+                    OCR_VLM_LOCAL_START and os.access(OCR_VLM_LOCAL_START, os.X_OK)
+                ):
+                    raise VlmDeferred(
+                        f"{n} formula box(es); no OCR lane is free now"
+                    )  # a lane exists, none is usable: wait for it
+            else:
+
+                def client(png: bytes) -> str:
+                    try:
+                        return _vlm_ocr_page(base, png)
+                    except Exception as e:
+                        if _vlm_lane_down(e):
+                            raise VlmDeferred(
+                                f"{n} formula box(es); the {kind} lane went down "
+                                f"({type(e).__name__}: {str(e)[:80]})"
+                            ) from e
+                        raise _eq.OcrFailed(f"{type(e).__name__}: {str(e)[:60]}") from e
+
+    return _eq.Equations(doc, client)
+
+
 def pdf_to_md(path: str, is_ocr: bool = False) -> str:
     import pymupdf
     import pymupdf4llm
@@ -1203,6 +1251,7 @@ def pdf_to_md(path: str, is_ocr: bool = False) -> str:
         garbled: list[int] = []
         why: dict[str, int] = {}
         _pdf_page_count = doc.page_count
+        eq = None if is_ocr else _equations_session(doc, chunks, name)
 
         def _take_heavy(upto: int) -> None:
             """Emit the skipped heavy pages numbered below `upto`, in page order, from the text layer."""
@@ -1230,6 +1279,11 @@ def pdf_to_md(path: str, is_ocr: bool = False) -> str:
                 continue
             _take_heavy(pno)
             layer, got = _nonws_len(doc[pno].get_text("text")), _nonws_len(text)
+            chunk_text = text
+            if eq is not None:
+                got += eq.recovered_chars(
+                    pno, ch, text
+                )  # written below: they count as kept
             total += layer
             kept += got
             # 2026-10-06: a page the engine turned into glyph garbage is repaired like a dropped one
@@ -1280,8 +1334,12 @@ def pdf_to_md(path: str, is_ocr: bool = False) -> str:
                     text = fixed
                     repaired += 1
                     regained += layer
+            if eq is not None and text is chunk_text:
+                text = eq.apply(pno, ch, text)
             out.append(text)
         _take_heavy(doc.page_count)
+        if eq is not None and eq.stats["boxes"]:
+            print(f"[build_corpus] EQUATIONS {name}: {eq.summary()}", flush=True)
         doc.close()
         md = "".join(out)
         if (
@@ -1335,6 +1393,8 @@ def pdf_to_md(path: str, is_ocr: bool = False) -> str:
                 flush=True,
             )
         return clean_md(md)
+    except VlmDeferred:
+        raise  # a scheduling decision for convert(), not an extractor failure
     except MemoryError:
         raise  # the worker's memory ceiling (see _init): OCR would only repeat the blow-up
     except Exception as e:
@@ -1392,7 +1452,10 @@ def ocr_too_thin(text: str, pages: int) -> str:
 # numbers are dropped from transcribed pages (2026-10-19). `--ocr-vlm off` disables all of it, and the route is
 # active only when CFG carries ocr_vlm == "auto" (main() sets it): a test that builds CFG by hand never reaches a
 # server -- on 2026-10-07 the old tests transcribed their synthetic PDFs through the live alias on :18000.
-OCR_VLM_LOCAL_URL = os.environ.get("OCR_VLM_LOCAL_URL", "http://127.0.0.1:19530")
+# :19530 was the embedding front's on the reference deployment (embed_failover.py, EMB_FO_PORT) from 2026-11-03: the OCR
+# server moved to :19531. `ocr_server.sh start` is given the port of this URL as OCR_PORT (_vlm_endpoint).
+OCR_VLM_LOCAL_URL = os.environ.get("OCR_VLM_LOCAL_URL", "http://127.0.0.1:19531")
+OCR_VLM_BUSY_WAIT_S = 240  # a local server that is up but silent (one OCR page: 131-169 s) is waited for, not skipped
 OCR_VLM_REMOTE_URL = os.environ.get("OCR_VLM_REMOTE_URL", "http://127.0.0.1:18000")
 OCR_VLM_MODEL = os.environ.get("OCR_VLM_MODEL", "pepperocr-vl")
 OCR_VLM_REMOTE_QUIET = os.environ.get(
@@ -1451,6 +1514,24 @@ class VlmPageUnreadable(RuntimeError):
     """The model answered but could not transcribe the page: it looped, ran to max_tokens or said nothing."""
 
 
+class VlmDeferred(Exception):
+    """No OCR lane can serve this document now: nothing is written for it, and a later build converts it (2026-11-05:
+    a document with formula boxes waits for the lane rather than being written with its equations as text-layer lines)."""
+
+
+def _vlm_lane_down(e: Exception) -> bool:
+    """The lane could not serve at all -- a 5xx, a refused or dropped connection, a stream cut off mid-answer -- as
+    opposed to a crop the model could not transcribe (finish_reason, empty text, a 4xx, a read timeout)."""
+    import http.client
+    import urllib.error
+
+    if isinstance(e, urllib.error.HTTPError):
+        return e.code >= 500
+    return isinstance(
+        e, (urllib.error.URLError, ConnectionError, http.client.IncompleteRead)
+    )
+
+
 def _vlm_quiet(now=None) -> bool:
     """True inside OCR_VLM_REMOTE_QUIET ("HH:MM-HH:MM", may wrap midnight)."""
     spec = OCR_VLM_REMOTE_QUIET
@@ -1467,8 +1548,11 @@ def _vlm_quiet(now=None) -> bool:
     return lo <= t < hi if lo <= hi else (t >= lo or t < hi)
 
 
-def _vlm_alive(base: str, timeout: float = 3.0) -> bool:
-    """The server at `base` lists OCR_VLM_MODEL (llama-swap or a llama-server started with -a)."""
+def _vlm_probe(base: str, timeout: float = 3.0) -> str:
+    """What `base`/v1/models says: "model" (it lists OCR_VLM_MODEL), "other" (something answered without it: another
+    service holds the port, or a model that is not the OCR one), "busy" (a listener that stayed silent for `timeout` or
+    answered 5xx: a single-slot server in the middle of a page) or "down" (refused, unreachable)."""
+    import urllib.error
     import urllib.request
 
     try:
@@ -1476,9 +1560,40 @@ def _vlm_alive(base: str, timeout: float = 3.0) -> bool:
             base.rstrip("/") + "/v1/models", timeout=timeout
         ) as r:
             ids = {m.get("id") for m in (json.load(r).get("data") or [])}
-        return OCR_VLM_MODEL in ids
+        return "model" if OCR_VLM_MODEL in ids else "other"
+    except urllib.error.HTTPError as e:
+        return "busy" if e.code >= 500 else "other"
+    except urllib.error.URLError as e:
+        return "busy" if isinstance(e.reason, TimeoutError) else "down"
+    except TimeoutError:
+        return "busy"
+    except ValueError:
+        return "other"
     except Exception:
-        return False
+        return "down"
+
+
+def _vlm_alive(base: str, timeout: float = 3.0) -> bool:
+    """The server at `base` lists OCR_VLM_MODEL (llama-swap or a llama-server started with -a)."""
+    return _vlm_probe(base, timeout) == "model"
+
+
+def _vlm_wait(base: str, budget: float, step: float = 10.0) -> str:
+    """_vlm_probe until it answers anything but "busy", for at most `budget` s: a server working on another page
+    answers late, not never."""
+    end = time.time() + budget
+    while True:
+        t = time.time()
+        st = _vlm_probe(base, step)
+        if st != "busy" or time.time() >= end:
+            return st
+        time.sleep(max(0.0, min(step - (time.time() - t), end - time.time())))
+
+
+def _vlm_local_port() -> str:
+    from urllib.parse import urlparse
+
+    return str(urlparse(OCR_VLM_LOCAL_URL).port or "")
 
 
 def _vlm_endpoint():
@@ -1493,22 +1608,46 @@ def _vlm_endpoint():
         found = ("local", OCR_VLM_LOCAL_URL)
     elif OCR_VLM_REMOTE_URL and not _vlm_quiet() and _vlm_alive(OCR_VLM_REMOTE_URL):
         found = ("remote", OCR_VLM_REMOTE_URL)
-    elif OCR_VLM_LOCAL_START and os.access(OCR_VLM_LOCAL_START, os.X_OK):
-        try:
-            _run_child(
-                [OCR_VLM_LOCAL_START, "start", "--for-build"],
-                check=True,
-                timeout=900,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            if _vlm_alive(OCR_VLM_LOCAL_URL, 10.0):
-                found = ("local", OCR_VLM_LOCAL_URL)
-        except Exception as e:
+    else:
+        # Why it is not alive decides what to do: a listener that is only busy is waited for; one that answers without
+        # the model is another service on the port, which `ocr_server.sh start` would take for its own server
+        # ("already serving": its test is any {"status":"ok"}), so it is never started.
+        st = _vlm_probe(OCR_VLM_LOCAL_URL)
+        if st == "busy":
+            st = _vlm_wait(OCR_VLM_LOCAL_URL, OCR_VLM_BUSY_WAIT_S)
+        if st == "model":
+            found = ("local", OCR_VLM_LOCAL_URL)
+        elif st == "other":
             print(
-                f"[build_corpus] WARN: could not start the local OCR server ({type(e).__name__}: {str(e)[:80]})",
+                f"[build_corpus] WARN: {OCR_VLM_LOCAL_URL} answers but does not list {OCR_VLM_MODEL} "
+                "(another service holds the port); not starting the local OCR server",
                 flush=True,
             )
+        elif (
+            st == "down"
+            and OCR_VLM_LOCAL_START
+            and os.access(OCR_VLM_LOCAL_START, os.X_OK)
+        ):
+            try:
+                port = _vlm_local_port()
+                _run_child(
+                    [OCR_VLM_LOCAL_START, "start", "--for-build"],
+                    check=True,
+                    timeout=900,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    env=dict(os.environ, **({"OCR_PORT": port} if port else {})),
+                )
+                if (
+                    _vlm_alive(OCR_VLM_LOCAL_URL, 10.0)
+                    or _vlm_wait(OCR_VLM_LOCAL_URL, 60.0) == "model"
+                ):
+                    found = ("local", OCR_VLM_LOCAL_URL)
+            except Exception as e:
+                print(
+                    f"[build_corpus] WARN: could not start the local OCR server ({type(e).__name__}: {str(e)[:80]})",
+                    flush=True,
+                )
     _vlm_endpoint_cache = found
     return found
 
@@ -1740,11 +1879,16 @@ def _html_table_as_pipes(m) -> str:
     return "\n\n" + "\n".join(lines) + "\n\n"
 
 
+_BR_KEEP = "\x1d"  # a <br> inside a pipe row between _tables_md and the end of clean_md (the tag passes would break the row)
+
+
 def _tables_md(md: str) -> str:
     """Tables before clean_md's tag and <br> passes (2026-10-19). A table of numbers -- native pymupdf4llm or pandoc,
     or VLM -- becomes _drop_numeric_tables' marker; an HTML table that stays becomes a pipe table, since the tag pass
-    ran its cells together (a row "-8.9 | 5 | -0.3" read "-8.95-0.3"); a <br> inside a pipe row becomes a space
-    instead of splitting the row."""
+    ran its cells together (a row "-8.9 | 5 | -0.3" read "-8.95-0.3"). A pipe row that pymupdf4llm filled with
+    several lines per cell (`<br>`) is split into one row per label when the counts match (pdf_equations.
+    split_pipe_tables); every other `<br>` inside a pipe row stays, as _BR_KEEP, until clean_md's last step
+    (2026-11-05; the 2026-10-19 version turned it into a space, which ran labels and values together)."""
     md, n = _drop_numeric_tables(md)
     if n:
         print(
@@ -1752,8 +1896,14 @@ def _tables_md(md: str) -> str:
             flush=True,
         )
     md = _html_table_re.sub(_html_table_as_pipes, md)
+    md, split, merged = _eq.split_pipe_tables(md)
+    if split:
+        print(
+            f"[build_corpus] TABLE-ROWS {_ref_doc or '-'}: {split} merged row(s) split by order, {merged} left with <br>",
+            flush=True,
+        )
     return "\n".join(
-        re.sub(r"<br\s*/?>", " ", ln, flags=re.I)
+        re.sub(r"<br\s*/?>", _BR_KEEP, ln, flags=re.I)
         if ln.strip().startswith("|") and ln.strip().endswith("|")
         else ln
         for ln in md.split("\n")
@@ -2490,6 +2640,12 @@ def convert(key: str):
                 body, method = html_to_md(src), kind
         else:
             body = txt_to_md(src)
+    except VlmDeferred as e:
+        print(
+            f"[build_corpus] VLM-OCR deferred {os.path.basename(src)}: {e} -> nothing written; a later build converts it",
+            flush=True,
+        )
+        return (key, f"vlm_deferred:{e}", "", 0)
     except Exception as e:
         return (key, f"error:{type(e).__name__}", "", 0)
 

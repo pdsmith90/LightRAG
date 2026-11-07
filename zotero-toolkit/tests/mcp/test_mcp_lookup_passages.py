@@ -120,7 +120,7 @@ def test_tools_return_text_without_structured_output(load_server, items):
         return tools, result
 
     tools, result = anyio.run(main)
-    assert len(tools) == 5
+    assert len(tools) == 7
     assert all(t.output_schema is None for t in tools)
     assert result.structured_content is None
     assert result.content[0].text.startswith("200:")

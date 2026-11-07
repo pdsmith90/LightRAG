@@ -13,6 +13,8 @@ into real bibliographic citations using Zotero metadata. The LLM never writes th
 | `search_library(query, mode="mix", top_k=10, answer=False, include_graph=False, passages=8)` | Compiled citations **first**, then the retrieved passages as plain text, each headed `[n] Family Year · section` (see [Retrieved passages](#retrieved-passages)). No answer is generated, so it is faster. `passages` sets how many are retrieved. `include_graph=True` appends the knowledge-graph entities and relations. |
 | `search_library(..., answer=True)` | The server's synthesized answer. Any reference section the model wrote is stripped, and a `### Sources (compiled from retrieval)` list is appended. |
 | `paper_passages(paper, question)` | Up to 3 passages of **one** paper ranked against `question`, under that paper's citation and, when this host has it, the path of the paper's file in Zotero's storage folder. `paper` is a Zotero key, a DOI, or words that must all occur in the title, authors or year. If no indexed paper, several, or only near matches fit, it lists them instead of querying. |
+| `paper_equation(paper, number, page=0)` | One numbered display equation of **one** paper as `$…$` LaTeX with its printed number as `\tag{N}`, read from the paper's own PDF (see [Equations and tables from the PDF](#equations-and-tables-from-the-pdf)), with the PDF's text layer for the same box, the page and the sentence that cites it. Without an OCR model the answer is the text layer, labelled as such. |
+| `paper_table(paper, number)` | One numbered table of **one** paper as a Markdown table with its caption and page, read from the PDF's text layer by the layout converter. No OCR model. |
 | `find_paper(paper)` | A lookup with the same `paper` forms: the matching papers that are indexed, then the Zotero items that match but are not, then near matches when nothing has every word. No retrieval and no LLM. |
 | `add_note(text, description="")` | Inserts a text note into the knowledge base (`POST /documents/text`) under a unique document name (see below). |
 | `health()` | The server's `/health` status, or `unreachable at <url>: <error>`. |
@@ -150,13 +152,31 @@ stock LightRAG Server the route answers 404 and the index status is reported as 
 `paper_passages` resolves `paper` the same way and never queries for a near match. With
 one indexed paper it sends `POST /graph/papers/passages` with all of the paper's keys (the
 copy with a DOI, else the longest title, first), the bare question and `top_n` 3, and
-renders each passage, best first, as `[1] Family Year · section · chunk i of n` (n is the chunk count of the paper's longest copy). Under the citation it names the paper's file, `Local file: <ZOTERO_STORAGE>/<key>/<filename>`, when that file exists on the host, because the index lacks what the corpus builder's text-layer converter drops from born-digital PDFs: display equations (only references such as "eq. (5)" remain) and often a table's layout. The tool's description tells the agent to read that file with `pdftotext -layout` for them. On a
+renders each passage, best first, as `[1] Family Year · section · chunk i of n` (n is the chunk count of the paper's longest copy). Under the citation it names the paper's file, `Local file: <ZOTERO_STORAGE>/<key>/<filename>`, when that file exists on the host, because the index lacks what the corpus builder's text-layer converter drops from born-digital PDFs: display equations (only references such as "eq. (5)" remain) and often a table's layout. The tool's description sends the agent to `paper_equation` and `paper_table` for them. On a
 server without that route (404) it falls back to a `naive` context-only `/query` led by the first author
 and year (plus up to 3 title words when the metadata holds another work by that author in
 that year), keeps only the chunks of the paper's keys, and lists at most 5 other papers
 the question matched as `KEY · Family Year · title`. On a stock server it resolves `paper`
 from the metadata alone. A server that caps chunks per document (the fork's
 `MAX_CHUNKS_PER_DOC`) returns at most that many passages of the paper per fallback call.
+
+### Equations and tables from the PDF
+
+`paper_equation` and `paper_table` resolve `paper` as `paper_passages` does (an indexed paper, or the one Zotero item that fits) and read the paper's file from `ZOTERO_STORAGE`; a paper with no PDF on the host is reported as such. The PDF work is done by `paper_pdf_tools.py`, which the proxy runs as a subprocess with `-I` under `LIGHTRAG_MCP_PDF_PYTHON` (default `../.venv/bin/python` if that exists, else the proxy's own interpreter), so the proxy's interpreter never imports PyMuPDF. That interpreter needs `pymupdf` and `pymupdf4llm` (with its layout package). The helper prints one JSON object; the proxy words it.
+
+- **Equation.** Pages that have a text line ending `(N)` are run through PyMuPDF's layout model, one page at a time. The `formula` box that holds the number is cropped at 300 dpi and transcribed to LaTeX by an OCR model on a CPU-only `llama-server` that is started for the call and stopped after it (`--device none -ngl 0`, GPUs hidden by environment, killed with its caller). The number comes from the text layer, as `\tag{N}`; the model leaves numbers out. A box that holds several numbered equations is paired with them by order when the counts match. The answer also gives the box's text layer (to check digits; numbers it has that the LaTeX lacks are listed), the page, and the sentence that cites the equation ("according to eqs (6) and (7)…"). When no OCR model is configured, it fails, it times out or the transcription does not finish, the answer is the box's text layer and says so in capitals. On a scanned page the text layer is an OCR layer and the answer says that too. Layout results, each page's word count, equation-number positions, caption blocks and text, and the OCR text are cached per file (the OCR text also by the model file's size and date), saved every few seconds and on SIGTERM, so the equations beside one already read are instant and a call that timed out continues from the pages it had read when asked again.
+- **Table.** The `Table N` caption (the number may be Arabic or Roman, `A1`, `S2`) is matched to the nearest `table` box and to the pipe table the layout converter wrote for it. Cell line breaks stay as `<br>`. A row that the converter merged into several lines per cell is split into rows only when its first cell holds as many labels (wrapped and unit lines joined to the label above) as every other cell has lines; otherwise the lines stay joined by `<br>` and the answer says so. Superscripts become Unicode (`10⁻⁶`), the converter's emphasis marks go, and a dropped `fl`/`fi` ligature is restored from the text layer. No OCR model: a model that transcribes the page image follows the page's geometry, and a confident wrong table is worse than a missing one.
+- **Guards.** A page the layout model cannot take (more than 3,500 text spans or 30 MB of content stream: it holds some 25 N×N matrices) is not given to it, the helper's address space is capped (`LIGHTRAG_MCP_PDF_MEM_GIB`, default 7) and it asks the kernel to kill it first. One OCR server runs at a time, whatever the number of callers. A call that outlives the proxy's time limit gets SIGTERM first (so the helper saves its cache and stops its OCR server), SIGKILL ten seconds later; the helper also asks the kernel for a SIGTERM if the proxy dies, and the OCR server for a SIGKILL if the helper does.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `LIGHTRAG_MCP_PDF_PYTHON` | `../.venv/bin/python`, else the proxy's interpreter | Interpreter with PyMuPDF for the helper. |
+| `LIGHTRAG_MCP_PDF_HELPER` | `paper_pdf_tools.py` beside the proxy | The helper script. |
+| `LIGHTRAG_MCP_OCR_TIMEOUT` | `120` | Seconds for the OCR server's start and one transcription. The proxy stops the helper `120` s after that. |
+| `LIGHTRAG_MCP_OCR` | *(on)* | `off` skips the OCR model: equations come back as text layer. |
+| `LIGHTRAG_MCP_OCR_LLAMA_SERVER`, `LIGHTRAG_MCP_OCR_MODEL`, `LIGHTRAG_MCP_OCR_MMPROJ` | `llama-server` on `PATH`; none; none | The OCR model: any vision model that answers an image with LaTeX for a prompt like the one in the helper. Without a model and projector the OCR step is unavailable. |
+| `LIGHTRAG_MCP_OCR_THREADS` | `8` | CPU threads of the OCR server. |
+| `LIGHTRAG_MCP_CACHE` | `~/.cache/lightrag-mcp-pdf` | Layout and OCR cache. |
 
 ### Answer mode (`answer=True`)
 
@@ -203,7 +223,8 @@ python3 -m venv ~/.venvs/zotero-lightrag-mcp
 ~/.venvs/zotero-lightrag-mcp/bin/pip install -r mcp/requirements.txt
 ```
 
-Dependencies are `mcp` 2.x and `httpx`. The server uses `mcp.server.mcpserver.MCPServer`,
+Dependencies are `mcp` 2.x and `httpx`. `paper_equation` and `paper_table` also need
+`pymupdf` and `pymupdf4llm` in the interpreter named by `LIGHTRAG_MCP_PDF_PYTHON`. The server uses `mcp.server.mcpserver.MCPServer`,
 which replaced `mcp.server.fastmcp` in mcp 2.0; mcp 1.x does not have it.
 
 ## Configuration
@@ -310,7 +331,12 @@ does), folding and the paper lookup (key confirmation, cache, ranking, cut lists
 matches), both `paper_passages` paths and their local file line, the header strip
 (checked against `corpus/build_corpus.py` when it imports), the section-heading cleanup,
 duplicate passages, and the stdio tool listing
-with text-only results.
+with text-only results. `test_mcp_paper_tools.py` covers `paper_equation` and `paper_table`
+(which paper and file, the helper's failures, the wording of every answer, stdio) against a
+stand-in helper; `test_mcp_pdf_tools.py` covers the helper (numbers, LaTeX pairing, citing
+sentences, table cells and the order split, and both commands on invented PDFs with a
+stand-in `llama-server`, including a hung or dead server and the server's death with its
+caller). The PDF-level tests are skipped without PyMuPDF.
 
 Do not add an `__init__.py` to `tests/mcp/`. A test package named `mcp` would shadow the
 `mcp` SDK.
