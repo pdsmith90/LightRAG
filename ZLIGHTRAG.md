@@ -35,6 +35,7 @@ starting with [README.md](./README.md), applies as written.
 | [Paper lookup that forgives typography, and one paper's passages](#paper-lookup-that-forgives-typography-and-one-papers-passages) | none | always active |
 | [PostgreSQL edge removal in plain SQL](#postgresql-edge-removal-in-plain-sql) | none | always active |
 | [Resume purge keeps a failed document retryable](#resume-purge-keeps-a-failed-document-retryable) | none | always active |
+| [A rebuild reads a shared extraction through every chunk that lists it](#a-rebuild-reads-a-shared-extraction-through-every-chunk-that-lists-it) | none | always active |
 | [One unusable multimodal analysis degrades its item](#one-unusable-multimodal-analysis-degrades-its-item) | none | always active |
 | [Changed text of a processed document](#changed-text-of-a-processed-document) | `SCAN_DIVERT_CHANGED_PROCESSED` | `false` |
 | WebUI query defaults for new browser profiles: `top_k` 10, `chunk_top_k` 12, entity/relation tokens 1500, total tokens 7000 (`lightrag_webui/src/stores/querySettings.ts`) | none | always active |
@@ -425,6 +426,25 @@ chunk-embed timeout, left no anchors, no journal and no proof. And when the resu
 purge itself raises, the stored `kg_purge` journal is copied back into the in-memory
 status before the FAILED write, which upstream let erase it. See
 [docs/design/PurgeRecoveryContract.md](./docs/design/PurgeRecoveryContract.md).
+
+### A rebuild reads a shared extraction through every chunk that lists it
+
+An extraction cache row is keyed on its prompt, so chunks with identical text (two
+copies of a paper, say) share one row, and the row's `chunk_id` names only the chunk
+that wrote it first; a later chunk's cache hit adds the key to its own
+`llm_cache_list` and leaves the row alone. Upstream's `_get_cached_extraction_results`
+kept a row only when that `chunk_id` was among the surviving chunks, so deleting the
+copy that wrote the rows dropped the survivor's whole cached extraction: the rebuild
+found no cache and, under the default policy, left the shared entities and relations
+untouched, still naming the deleted chunks. On this branch the rows are grouped by the
+surviving chunk whose `llm_cache_list` names them, and a row two surviving chunks share
+counts for each, as at insert time. The same function feeds the document-delete
+rebuild (with or without `keep_summaries`), the re-ingest rebuild of kept summaries,
+the rollback purge and the `lightrag-repair-chunk-tracking` tool, which now also
+attributes a chunk from rows another chunk wrote. Existing data is read correctly at
+once; nothing is rewritten. `adelete_by_doc_id(delete_llm_cache=True)` still deletes
+the shared rows after its rebuild, so the surviving copy's next rebuild finds them
+gone. Tests: `tests/pipeline/test_rebuild_shared_cache_rows.py`.
 
 ### One unusable multimodal analysis degrades its item
 
