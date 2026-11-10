@@ -158,6 +158,20 @@ The generation is bumped before the bulk rather than from its reported success c
 
 **What this trades.** A commit no longer publishes *another* process's unrefreshed writes as a side effect. That incidental guarantee is not lost where it mattered, because a reader-side refresh publishes the index, not this process's share of it — so both search-based readers now see every process's writes, which the commit-side refresh only did by luck of timing. What is genuinely given up is the sub-second convergence a busy namespace got for free everywhere else, and LightRAG sets no `index.refresh_interval`, so the server's own periodic refresh covers that. `_refresh_for_search` is best effort by contract: a failure is logged and the caller reads the pre-refresh view, which is what it got unconditionally before.
 
+### A cache delete keeps rows another document lists
+
+`adelete_by_doc_id(delete_llm_cache=True)` deletes only the keys no chunk outside the document still lists; the rest are kept and counted in its log line and result message. That closes, for document deletion on `JsonKVStorage` and `PGKVStorage`, the dangling reference named in the paragraph after the residue table above. The rules a change here must keep:
+
+* **After the purge, never before.** The split runs at the cache-delete step, once `_purge_kg_contributions` has rebuilt the shared entities and relations from the surviving chunks' rows and deleted the document's own chunk rows. Its chunk ids are excluded as well, so a chunk row the purge left behind cannot keep a row alive.
+* **Asked again on every attempt.** The persisted `deletion_llm_cache_ids` stay the full set; a retry re-splits them, so a row whose other copy was deleted in between is deleted then. In a batch delete each document's chunks are gone before the next document's split, so the last document to list a row deletes it. Two deletes run concurrently (an SDK caller joining a batch delete) can each still see the other's chunks and both keep a row: a leaked row, never a dangling reference.
+* **The custom-chunk rollback** splits its staged chunks' keys the same way, excluding the staged chunks: a staged chunk's hit shares the row with the chunk that wrote it, and that chunk survives the rollback.
+* **A storage that cannot answer deletes everything**, as upstream did, and says so in a warning. `cache_ids_listed_by_other_chunks` exists on `JsonKVStorage` (a scan of the shared dict under its lock) and `PGKVStorage` (one `?|` statement over the workspace's chunks); Redis, MongoDB and OpenSearch fall back. Keeping every key there instead would turn `delete_llm_cache=True` into a no-op on those backends, and enumerating chunks through `doc_status.chunks_list` would read every chunk body per delete and still miss chunk rows no status lists yet.
+* **A lookup failure fails the cache step**, like a failed delete: the document stays, the stage is recorded, and the retry asks again.
+
+The race left open is a cache hit that records its reference between the lookup and the delete. Within one deployment it cannot happen: extraction runs only under the pipeline `busy` reservation the delete holds, and other processes write only query-cache rows, which no chunk lists. Two deployments writing one workspace are not fenced by that reservation; there the hit's reference dangles exactly as it did before this change, and the chunk's next reprocess re-extracts it. References already left dangling by earlier deletes are not repaired: such a chunk misses on its next reprocess, calls the LLM and writes the row again.
+
+Smart-heading rows ride document metadata rather than a chunk list, so no lookup can see another document sharing one; they are still deleted with the document.
+
 ### Not closed by the ordering
 
 A resume purge deletes a document's chunk rows — and with them every reference to its cache rows — before re-chunking, and deliberately does not touch `llm_response_cache`. Re-extraction hits those rows and the cache-hit branch re-attaches them to the freshly written chunk rows, so the loop closes on its own; a run that dies in between leaves them unreferenced until the next attempt.

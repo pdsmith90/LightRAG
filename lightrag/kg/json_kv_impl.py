@@ -311,6 +311,34 @@ class JsonKVStorage(BaseKVStorage):
         async with self._storage_lock:
             return set(keys) - set(self._data.keys())
 
+    async def cache_ids_listed_by_other_chunks(
+        self, cache_ids: list[str], exclude_chunk_ids: list[str]
+    ) -> set[str]:
+        """The ``cache_ids`` a chunk outside ``exclude_chunk_ids`` still lists
+        in its ``llm_cache_list`` (fork; text-chunk namespace).
+
+        A document delete keeps those cache rows: they are keyed on the prompt,
+        so a chunk of another document with the same text shares them. Scans
+        every row in memory.
+        """
+        wanted = set(cache_ids)
+        if not wanted:
+            return set()
+        excluded = set(exclude_chunk_ids)
+        found: set[str] = set()
+        async with self._storage_lock:
+            for i, (chunk_id, row) in enumerate(list(self._data.items()), start=1):
+                if chunk_id not in excluded and isinstance(row, dict):
+                    listed = row.get("llm_cache_list")
+                    if isinstance(listed, list):
+                        found.update(
+                            key
+                            for key in listed
+                            if isinstance(key, str) and key in wanted
+                        )
+                await _cooperative_yield(i)
+        return found
+
     async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
         """Insert or update KV records in shared memory; mark all processes dirty.
 

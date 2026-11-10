@@ -3762,7 +3762,13 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             )
 
         if cache_ids and self.llm_response_cache:
-            await self.llm_response_cache.delete(cache_ids)
+            # Fork: a staged chunk's cache hit shares the row with the chunk
+            # that wrote it, which may survive this rollback.
+            cache_ids, _kept = await self._split_shared_llm_cache_ids(
+                cache_ids, staged_chunk_ids
+            )
+            if cache_ids:
+                await self.llm_response_cache.delete(cache_ids)
             # text_chunks joins the flush so the pair is ordered and fenced:
             # publishing this namespace publishes every buffered extract row,
             # not only the ids deleted above.
@@ -5746,6 +5752,36 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             if record is not None
         ]
 
+    async def _split_shared_llm_cache_ids(
+        self, cache_ids: list[str], owner_chunk_ids: list[str]
+    ) -> tuple[list[str], list[str]]:
+        """Fork: split cache ids into (deletable, kept) for a cache delete.
+
+        An extract or multimodal-analysis cache row is keyed on its prompt, so
+        chunks of different documents with identical text share one row and
+        each lists its key in its own ``llm_cache_list``. A row a chunk outside
+        ``owner_chunk_ids`` still lists is kept: deleting it leaves that
+        chunk's reference dangling, and its next rebuild or re-ingest finds no
+        cached extraction. A text-chunk storage without
+        ``cache_ids_listed_by_other_chunks`` (only JSON and PostgreSQL have
+        it) cannot say, so every id stays deletable, as upstream had it.
+        """
+        if not cache_ids or self.text_chunks is None:
+            return list(cache_ids), []
+        lookup = getattr(self.text_chunks, "cache_ids_listed_by_other_chunks", None)
+        if lookup is None:
+            logger.warning(
+                "%s cannot report which LLM cache rows other chunks still list; "
+                "deleting all %d, including any another document shares",
+                type(self.text_chunks).__name__,
+                len(cache_ids),
+            )
+            return list(cache_ids), []
+        listed = await lookup(cache_ids, owner_chunk_ids)
+        deletable = [cache_id for cache_id in cache_ids if cache_id not in listed]
+        kept = [cache_id for cache_id in cache_ids if cache_id in listed]
+        return deletable, kept
+
     async def aclear_cache(self) -> None:
         """Drop every row of the LLM response cache storage.
 
@@ -7429,18 +7465,29 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                         raise Exception(no_cache_msg)
                     try:
                         deletion_stage = "delete_llm_cache"
-                        await self.llm_response_cache.delete(metadata_cache_ids)
+                        # Fork: keep rows a chunk of another document still lists.
+                        (
+                            deletable_cache_ids,
+                            kept_cache_ids,
+                        ) = await self._split_shared_llm_cache_ids(
+                            metadata_cache_ids, chunk_ids
+                        )
+                        if deletable_cache_ids:
+                            await self.llm_response_cache.delete(deletable_cache_ids)
                         remaining_cache_ids = await self._get_existing_llm_cache_ids(
-                            metadata_cache_ids
+                            deletable_cache_ids
                         )
                         if remaining_cache_ids:
                             raise Exception(
                                 f"{len(remaining_cache_ids)} LLM cache entries still exist after delete"
                             )
                         logger.info(
-                            "Cleaned up %d LLM cache entries from prior attempt for document %s",
-                            len(metadata_cache_ids),
+                            "Cleaned up %d LLM cache entries from prior attempt for "
+                            "document %s; kept %d that chunks of other documents "
+                            "still list",
+                            len(deletable_cache_ids),
                             doc_id,
+                            len(kept_cache_ids),
                         )
                     except Exception as cache_err:
                         raise Exception(
@@ -7610,19 +7657,33 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                     raise Exception(log_message)
                 try:
                     deletion_stage = "delete_llm_cache"
-                    await self.llm_response_cache.delete(doc_llm_cache_ids)
+                    # Fork: after the purge, so its rebuild still read every row,
+                    # and the document's own chunk rows are gone by now.
+                    (
+                        deletable_cache_ids,
+                        kept_cache_ids,
+                    ) = await self._split_shared_llm_cache_ids(
+                        doc_llm_cache_ids, chunk_ids
+                    )
+                    if deletable_cache_ids:
+                        await self.llm_response_cache.delete(deletable_cache_ids)
                     # Some storage implementations do not raise on delete errors and
                     # instead only log internally, so confirm the cache entries are
                     # actually gone before deleting the document/status records.
                     remaining_cache_ids = await self._get_existing_llm_cache_ids(
-                        doc_llm_cache_ids
+                        deletable_cache_ids
                     )
                     if remaining_cache_ids:
                         doc_llm_cache_ids = remaining_cache_ids
                         raise Exception(
                             f"{len(remaining_cache_ids)} LLM cache entries still exist after delete"
                         )
-                    cache_log_message = f"Successfully deleted {len(doc_llm_cache_ids)} LLM cache entries for document {doc_id}"
+                    cache_log_message = f"Successfully deleted {len(deletable_cache_ids)} LLM cache entries for document {doc_id}"
+                    if kept_cache_ids:
+                        cache_log_message += (
+                            f"; kept {len(kept_cache_ids)} that chunks of other "
+                            "documents still list"
+                        )
                     logger.info(cache_log_message)
                     async with pipeline_status_lock:
                         pipeline_status["latest_message"] = cache_log_message
