@@ -7,6 +7,7 @@ pauses when its quiet window begins, one whose lane goes down mid-book is deferr
 first page not done.
 Synthetic PDFs via pymupdf; pymupdf4llm, the HTTP calls, Tesseract and ocrmypdf replaced by fakes; text invented."""
 
+import contextlib
 import json
 import os
 import sys
@@ -181,9 +182,10 @@ def test_a_local_lane_never_pauses_for_the_remote_quiet_window():
     )
 
 
-def test_a_lane_that_fails_the_first_page_a_pass_asks_for_abandons_as_before():
-    """A page that takes the server down every time must not keep its document unwritten for good: the pass that
-    resumes on it and fails at once goes to ocrmypdf, as does a fresh document whose first page is refused."""
+def test_passes_that_keep_no_new_page_defer_a_few_times_then_go_to_ocrmypdf():
+    """A page that takes the server down every time: the pass that resumes on it fails at once, and so does each one
+    after. OCR_VLM_MAX_STALLS such passes in a row defer; the next abandons and drops the cache."""
+    top = bc.OCR_VLM_MAX_STALLS
     state, page_fn = counter(down_after=2)
     with (
         tempfile.TemporaryDirectory() as td,
@@ -191,30 +193,110 @@ def test_a_lane_that_fails_the_first_page_a_pass_asks_for_abandons_as_before():
         fake_llm([OCRMYPDF_LINE * 20]),
         fake_ocrmypdf(available=True) as runs,
     ):
+        for k in range(top + 2):
+            with (
+                vlm(kind="remote", page_fn=page_fn),
+                patched(bc, "OCR_VLM_PAGE_CACHE", cache_dir),
+            ):
+                method, body, log = run_convert(td, keep if k else five_pages)
+            if k == 0:
+                assert "went down after 2 page(s)" in method, method
+                assert "pass(es) in a row" not in method, method
+            elif k <= top:
+                assert method.startswith("vlm_deferred:") and not runs, (k, method)
+                assert "resumes at page 3" in method, method
+                assert f"; {k} of {top} pass(es) in a row with no new page" in method, (
+                    method
+                )
+        assert method == "pdf+ocr" and runs, (method, runs)
+        assert f"{top + 1} pass(es) in a row with no new page kept" in log, log
+        assert "VLM OCR abandoned on scan.pdf after 2 page(s)" in log, log
+        assert not os.listdir(cache_dir), os.listdir(cache_dir)
+    state, page_fn = counter(
+        down_after=0
+    )  # a fresh document whose first page is refused
+    with (
+        tempfile.TemporaryDirectory() as td,
+        tempfile.TemporaryDirectory() as cache_dir,
+        fake_llm([]),
+        fake_ocrmypdf(available=True) as runs,
+    ):
         with (
             vlm(kind="remote", page_fn=page_fn),
             patched(bc, "OCR_VLM_PAGE_CACHE", cache_dir),
         ):
             method, body, log = run_convert(td, five_pages)
-        assert method.startswith("vlm_deferred:") and not runs, (method, runs)
-        with (
-            vlm(kind="remote", page_fn=page_fn) as calls,
-            patched(bc, "OCR_VLM_PAGE_CACHE", cache_dir),
-        ):
-            method, body, log = run_convert(td, keep)
-        assert method == "pdf+ocr" and runs and len(calls) == 1, (method, runs, calls)
-        assert "VLM OCR abandoned on scan.pdf after 2 page(s)" in log, log
-        assert not os.listdir(cache_dir), os.listdir(cache_dir)
-    state, page_fn = counter(down_after=0)
+    assert method.startswith("vlm_deferred:") and not runs, (method, runs)
+    assert f"resumes at page 1; 1 of {top} pass(es)" in method, method
+
+
+def test_a_pass_that_keeps_a_page_starts_the_count_over():
+    top = bc.OCR_VLM_MAX_STALLS
+    state, page_fn = counter(down_after=1)
     with (
         tempfile.TemporaryDirectory() as td,
-        fake_llm([OCRMYPDF_LINE * 20]),
+        tempfile.TemporaryDirectory() as cache_dir,
+        fake_llm([]),
         fake_ocrmypdf(available=True) as runs,
     ):
-        with vlm(kind="remote", page_fn=page_fn):
-            method, body, log = run_convert(td, five_pages)
-    assert method == "pdf+ocr" and runs, (method, runs)
-    assert "VLM OCR abandoned on scan.pdf after 0 page(s)" in log, log
+
+        def one_pass(builder=keep, quiet=None):
+            with contextlib.ExitStack() as st:
+                st.enter_context(vlm(kind="remote", page_fn=page_fn))
+                st.enter_context(patched(bc, "OCR_VLM_PAGE_CACHE", cache_dir))
+                if quiet is not None:
+                    st.enter_context(quiet_after(quiet))
+                method, body, log = run_convert(td, builder)
+            return method, body
+
+        def counted():
+            return [f for f in os.listdir(cache_dir) if f.endswith(".stalls")]
+
+        assert "pass(es) in a row" not in one_pass(five_pages)[0]
+        assert f"; 1 of {top} pass(es)" in one_pass()[0]
+        assert f"; 2 of {top} pass(es)" in one_pass()[0] and counted()
+        state["down_after"] = (
+            2  # page 2 is kept, then the lane goes down: the count starts over
+        )
+        method = one_pass()[0]
+        assert "resumes at page 3" in method and "pass(es) in a row" not in method, (
+            method
+        )
+        assert not counted()
+        assert f"; 1 of {top} pass(es)" in one_pass()[0] and counted()
+        state["down_after"] = (
+            None  # page 3 is kept, then the quiet window: a pause starts it over too
+        )
+        method = one_pass(quiet=1)[0]
+        assert "paused" in method and "resumes at page 4" in method, method
+        assert not counted()
+        method, body = one_pass()
+        assert method == "pdf+vlmocr" and in_order(body, 5) and not runs, (method, runs)
+        assert not os.listdir(cache_dir), os.listdir(cache_dir)
+
+
+def test_a_replaced_file_does_not_inherit_the_count():
+    state, page_fn = counter(down_after=0)
+
+    def replaced(p):
+        five_pages(p)
+        st = os.stat(p)
+        os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns + 10**10))
+
+    with (
+        tempfile.TemporaryDirectory() as td,
+        tempfile.TemporaryDirectory() as cache_dir,
+        fake_llm([]),
+        fake_ocrmypdf(available=True),
+    ):
+        methods = []
+        for builder in (five_pages, replaced):
+            with (
+                vlm(kind="remote", page_fn=page_fn),
+                patched(bc, "OCR_VLM_PAGE_CACHE", cache_dir),
+            ):
+                methods.append(run_convert(td, builder)[0])
+    assert all("; 1 of" in m for m in methods), methods
 
 
 def test_a_build_with_no_lane_drops_the_cache_and_takes_the_old_route():
