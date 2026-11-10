@@ -144,6 +144,36 @@ python3 corpus/edition_gate.py --zotero ~/Zotero --denylist dupe_denylist.txt --
 | `--denylist FILE` | required | Denylist the superseded attachment keys are appended to. Keys already listed are skipped, so a rerun adds nothing. Pass the same file to `build_corpus.py` and `quarantine_junk.py`. |
 | `--dry-run` | off | Print the entries without writing them. |
 
+### trash_gate.py — a trashed attachment never enters the corpus
+
+Zotero keeps a trashed item, and its file, until the trash is emptied, and a synced
+library downloads the files of trashed attachments like any other. `build_corpus.py`
+walks the storage folders without looking at the trash, so a trashed attachment would
+be converted and ingested. The usual case is a PDF renamed by replacement: the old
+attachment goes to the trash and the same file is attached again under a new key.
+
+`trash_gate.py` keeps one line per trashed attachment (the attachment itself, or its
+parent item, in the trash) in the denylist, tagged `# trash-sync`. An attachment
+restored from the trash loses its line; one erased from the library keeps it, so a
+leftover storage folder is still skipped. A key the file already lists gets no second
+line, and lines without the tag are never touched. Run it after `build_metadata.py`
+and before `build_corpus.py`:
+
+```bash
+python3 corpus/trash_gate.py --zotero ~/Zotero --denylist dupe_denylist.txt --dry-run
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--zotero DIR` | `~/Zotero` | Zotero data directory (contains `zotero.sqlite`, opened read-only). |
+| `--denylist FILE` | required | Denylist the trash lines are kept in; rewritten atomically. Pass the same file to `build_corpus.py` and `quarantine_junk.py`. |
+| `--dry-run` | off | Print the changes without writing them. |
+
+Like `edition_gate.py`, this keeps an attachment out of the corpus. A document already
+ingested stays in the index until it is deleted there, and a live copy that a
+duplicate gate blocked as a copy of the trashed one stays blocked until that gate's
+line is removed.
+
 Like `quarantine_junk.py`, this keeps an edition out of the corpus. An older edition
 LightRAG has already ingested stays in the index until its document is deleted there.
 
