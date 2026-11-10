@@ -468,9 +468,10 @@ counts for each, as at insert time. The same function feeds the document-delete
 rebuild (with or without `keep_summaries`), the re-ingest rebuild of kept summaries,
 the rollback purge and the `lightrag-repair-chunk-tracking` tool, which now also
 attributes a chunk from rows another chunk wrote. Existing data is read correctly at
-once; nothing is rewritten. `adelete_by_doc_id(delete_llm_cache=True)` still deletes
-the shared rows after its rebuild, so the surviving copy's next rebuild finds them
-gone. Tests: `tests/pipeline/test_rebuild_shared_cache_rows.py`.
+once; nothing is rewritten. A delete with `delete_llm_cache=True` keeps the rows a
+surviving copy lists (see "A document delete keeps cache rows another document
+lists"), so its next rebuild still finds them. Tests:
+`tests/pipeline/test_rebuild_shared_cache_rows.py`.
 
 ### One unusable multimodal analysis degrades its item
 
