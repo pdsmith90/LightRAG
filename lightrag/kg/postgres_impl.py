@@ -3756,6 +3756,41 @@ class PGKVStorage(BaseKVStorage):
         )
         return [row["id"] for row in rows or []]
 
+    async def cache_ids_listed_by_other_chunks(
+        self, cache_ids: list[str], exclude_chunk_ids: list[str]
+    ) -> set[str]:
+        """The ``cache_ids`` a chunk outside ``exclude_chunk_ids`` still lists
+        in its ``llm_cache_list`` (fork; text-chunk namespace only).
+
+        A document delete keeps those cache rows: they are keyed on the prompt,
+        so a chunk of another document with the same text shares them. One
+        statement per call; ``?|`` can use a GIN index on ``llm_cache_list``
+        (none is created) and is otherwise one scan of the workspace's chunks.
+        """
+        wanted = {key for key in cache_ids if isinstance(key, str) and key}
+        if not wanted:
+            return set()
+        if not is_namespace(self.namespace, NameSpace.KV_STORE_TEXT_CHUNKS):
+            return set()
+        rows = await self.db.query(
+            SQL_TEMPLATES["cache_ids_listed_by_other_chunks_text_chunks"],
+            [self.workspace, sorted(wanted), list(exclude_chunk_ids)],
+            multirows=True,
+        )
+        found: set[str] = set()
+        for row in rows or []:
+            listed = row.get("llm_cache_list")
+            if isinstance(listed, str):
+                try:
+                    listed = json.loads(listed)
+                except json.JSONDecodeError:
+                    continue
+            if isinstance(listed, list):
+                found.update(
+                    key for key in listed if isinstance(key, str) and key in wanted
+                )
+        return found
+
     async def filter_keys(self, keys: set[str]) -> set[str]:
         """Filter out duplicated content"""
         if not keys:
@@ -10333,6 +10368,14 @@ SQL_TEMPLATES = {
                 WHERE q.tq IS NOT NULL AND c.tsv @@ q.tq
                 ORDER BY ts_rank(c.tsv, q.tq) DESC, c.chunk_order_index
                 LIMIT $4
+            """,
+    # Chunks outside $3 whose llm_cache_list names one of the keys $2
+    # (PGKVStorage.cache_ids_listed_by_other_chunks); jsonb ?| matches array elements.
+    "cache_ids_listed_by_other_chunks_text_chunks": """SELECT llm_cache_list
+                FROM LIGHTRAG_DOC_CHUNKS
+                WHERE workspace = $1
+                  AND llm_cache_list ?| $2::text[]
+                  AND NOT (id = ANY($3::text[]))
             """,
     # The GIN index lexical_search_text_chunks needs; matched by definition, not name.
     "lexical_index_text_chunks": """SELECT 1 FROM pg_indexes

@@ -34,7 +34,9 @@ starting with [README.md](./README.md), applies as written.
 | [Paper filter in the graph view](#paper-filter-in-the-graph-view) | none; reference lists via `ZOTERO_REFERENCES` | always active |
 | [Paper lookup that forgives typography, and one paper's passages](#paper-lookup-that-forgives-typography-and-one-papers-passages) | none | always active |
 | [PostgreSQL edge removal in plain SQL](#postgresql-edge-removal-in-plain-sql) | none | always active |
+| [A document delete keeps cache rows another document lists](#a-document-delete-keeps-cache-rows-another-document-lists) | none | always active |
 | [Resume purge keeps a failed document retryable](#resume-purge-keeps-a-failed-document-retryable) | none | always active |
+| [A rebuild reads a shared extraction through every chunk that lists it](#a-rebuild-reads-a-shared-extraction-through-every-chunk-that-lists-it) | none | always active |
 | [One unusable multimodal analysis degrades its item](#one-unusable-multimodal-analysis-degrades-its-item) | none | always active |
 | [Changed text of a processed document](#changed-text-of-a-processed-document) | `SCAN_DIVERT_CHANGED_PROCESSED` | `false` |
 | WebUI query defaults for new browser profiles: `top_k` 10, `chunk_top_k` 12, entity/relation tokens 1500, total tokens 7000 (`lightrag_webui/src/stores/querySettings.ts`) | none | always active |
@@ -413,6 +415,31 @@ edge. Below Apache AGE 1.8.0 every Cypher `DELETE` scans each edge label table, 
 the old path slowed as the graph grew. What is removed is unchanged: every edge
 between each pair, of any label and in either direction, with the vertices kept.
 
+### A document delete keeps cache rows another document lists
+
+An extraction or multimodal-analysis cache row is keyed on its prompt, so a chunk of
+another document with the same text shares it: its cache hit lists the key in its own
+`llm_cache_list`. Upstream's `adelete_by_doc_id(delete_llm_cache=True)` deleted every
+key the document's chunks listed, so the surviving copy's references dangled and its
+next rebuild or re-ingest found nothing cached. On this branch the delete keeps any
+row a chunk outside the document still lists, and reports how many it kept ("kept N
+that chunks of other documents still list"); the last document to list a row deletes
+it. The lookup runs after the purge, so the rebuild still reads every row, and it
+covers the retry of a delete whose chunks were already removed and the custom-chunk
+rollback. It is `cache_ids_listed_by_other_chunks` on the text-chunk storage:
+`JsonKVStorage` scans its rows in memory, and `PGKVStorage` runs one
+`llm_cache_list ?| keys` statement per delete, a scan of the workspace's chunks unless
+a GIN index exists on `llm_cache_list` (none is created; a comparable read-only lookup
+took 1.1 s over about 296,000 chunks, and this statement has not been run against a
+live database). Redis, MongoDB and OpenSearch lack the method and delete
+every key, as upstream did, with a warning. A reference an earlier delete left
+dangling is not repaired; its chunk re-extracts on its next reprocess. Because the kept rows still answer the
+shared prompts, re-ingesting a deleted copy no longer re-extracts its shared chunks.
+Smart-heading rows ride document metadata, not a chunk list, and are still deleted
+whatever another document shares. See
+[docs/design/PurgeRecoveryContract.md](./docs/design/PurgeRecoveryContract.md). Tests:
+`tests/pipeline/test_delete_keeps_shared_cache_rows.py`.
+
 ### Resume purge keeps a failed document retryable
 
 Two gaps in upstream's fail-closed purge could leave a reprocessed document that every
@@ -425,6 +452,25 @@ chunk-embed timeout, left no anchors, no journal and no proof. And when the resu
 purge itself raises, the stored `kg_purge` journal is copied back into the in-memory
 status before the FAILED write, which upstream let erase it. See
 [docs/design/PurgeRecoveryContract.md](./docs/design/PurgeRecoveryContract.md).
+
+### A rebuild reads a shared extraction through every chunk that lists it
+
+An extraction cache row is keyed on its prompt, so chunks with identical text (two
+copies of a paper, say) share one row, and the row's `chunk_id` names only the chunk
+that wrote it first; a later chunk's cache hit adds the key to its own
+`llm_cache_list` and leaves the row alone. Upstream's `_get_cached_extraction_results`
+kept a row only when that `chunk_id` was among the surviving chunks, so deleting the
+copy that wrote the rows dropped the survivor's whole cached extraction: the rebuild
+found no cache and, under the default policy, left the shared entities and relations
+untouched, still naming the deleted chunks. On this branch the rows are grouped by the
+surviving chunk whose `llm_cache_list` names them, and a row two surviving chunks share
+counts for each, as at insert time. The same function feeds the document-delete
+rebuild (with or without `keep_summaries`), the re-ingest rebuild of kept summaries,
+the rollback purge and the `lightrag-repair-chunk-tracking` tool, which now also
+attributes a chunk from rows another chunk wrote. Existing data is read correctly at
+once; nothing is rewritten. `adelete_by_doc_id(delete_llm_cache=True)` still deletes
+the shared rows after its rebuild, so the surviving copy's next rebuild finds them
+gone. Tests: `tests/pipeline/test_rebuild_shared_cache_rows.py`.
 
 ### One unusable multimodal analysis degrades its item
 

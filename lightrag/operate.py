@@ -1638,6 +1638,8 @@ async def _get_cached_extraction_results(
 
     # Collect all LLM cache IDs from chunks
     all_cache_ids = set()
+    # Fork: each chunk's own llm_cache_list says which rows are its extraction
+    cache_ids_by_chunk: dict[str, list[str]] = {}
 
     # Read from storage
     requested_chunk_ids = list(chunk_ids)
@@ -1648,6 +1650,7 @@ async def _get_cached_extraction_results(
             llm_cache_list = chunk_data.get("llm_cache_list", [])
             if llm_cache_list:
                 all_cache_ids.update(llm_cache_list)
+                cache_ids_by_chunk[chunk_id] = list(dict.fromkeys(llm_cache_list))
         else:
             logger.warning(f"Chunk data is invalid or None: {chunk_data}")
 
@@ -1656,18 +1659,26 @@ async def _get_cached_extraction_results(
         return cached_results, chunk_data_by_id
 
     # Batch get LLM cache entries
-    cache_data_list = await llm_response_cache.get_by_ids(list(all_cache_ids))
+    requested_cache_ids = list(all_cache_ids)
+    cache_data_list = await llm_response_cache.get_by_ids(requested_cache_ids)
+    cache_entry_by_id = dict(zip(requested_cache_ids, cache_data_list))
 
-    # Process cache entries and group by chunk_id
+    # Fork: group by the REFERENCING chunk, not the row's ``chunk_id``. A row is
+    # keyed on the prompt, so chunks with identical text share it, and its
+    # ``chunk_id`` names only the chunk that wrote it first; a later chunk's
+    # cache hit records the key in its own list and leaves the row alone.
+    # Filtering on that column dropped a survivor's whole extraction once the
+    # writer's document was deleted. A row two requested chunks share counts
+    # for each, as it did when both were inserted.
     valid_entries = 0
-    for cache_entry in cache_data_list:
-        if (
-            cache_entry is not None
-            and isinstance(cache_entry, dict)
-            and cache_entry.get("cache_type") == "extract"
-            and cache_entry.get("chunk_id") in chunk_ids
-        ):
-            chunk_id = cache_entry["chunk_id"]
+    for chunk_id, cache_ids in cache_ids_by_chunk.items():
+        for cache_id in cache_ids:
+            cache_entry = cache_entry_by_id.get(cache_id)
+            if not (
+                isinstance(cache_entry, dict)
+                and cache_entry.get("cache_type") == "extract"
+            ):
+                continue
             extraction_result = cache_entry["return"]
             create_time = cache_entry.get(
                 "create_time", 0
