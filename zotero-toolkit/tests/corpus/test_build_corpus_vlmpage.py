@@ -184,7 +184,8 @@ def test_tesseract_failure_abandons_the_vlm():
 
 
 def test_lane_down_after_a_blank_first_page_is_not_a_refusal():
-    """The lane served page 1 (the model looped on it), so a 5xx on page 2 is a failure mid-document: ocrmypdf."""
+    """The lane served page 1 (the model looped on it), so a 5xx on page 2 is a lane that went down mid-document: it
+    defers, keeping page 1 for the next pass (2026-11-10; it went to ocrmypdf before)."""
     seen = []
 
     def page_fn(base, png):
@@ -208,8 +209,11 @@ def test_lane_down_after_a_blank_first_page_is_not_a_refusal():
         fake_ocrmypdf(available=True) as runs,
     ):
         method, body, log = run_convert(td, image_only_pdf)
-    assert method == "pdf+ocr" and runs, (method, runs)
-    assert "abandoned on scan.pdf after 1 page(s)" in log, log
+    assert method.startswith("vlm_deferred:") and not runs, (method, runs)
+    assert "went down after 1 page(s)" in method and "abandoned" not in log, (
+        method,
+        log,
+    )
 
 
 def test_page_call_classifies_unreadable_answers():

@@ -25,6 +25,7 @@ rag_corpus/
 .manifest.jsonl
 dangling_refs_plan.json
 dangling_refs_plan.json.done
+ocr_vlm_pages/
 
 # Logs
 *.log

@@ -1496,6 +1496,14 @@ OCR_VLM_BLANK_WORDS = (
 # importing; only pure number grids). Row labels count: 0.95 keeps a named row of up to 18 numbers and forgives a
 # footnoted or N/A cell in 20.
 NUMERIC_TABLE_SHARE = 0.95
+# 2026-11-10 (a 988-page scan that needs more hours than the remote lane is open in a day): every page the VLM
+# finishes is appended to a per-document cache. A document on the remote lane pauses when its quiet window begins,
+# and one whose lane goes down after this pass kept a page in the cache is deferred too (VlmDeferred: nothing is
+# written and a later build converts it); that build, or one after a killed worker, resumes at the first page not
+# done. The cache goes when the document is written or the VLM is abandoned for ocrmypdf.
+OCR_VLM_PAGE_CACHE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "ocr_vlm_pages"
+)
 OCR_VLM_PROMPT = (  # the model card's instruction, verbatim; the model was tuned on it
     "You are an advanced hybrid OCR engine capable of processing multilingual text mixed with mathematical "
     "notation. Your goal is to transcribe the content with high fidelity.Strict Rules: 1. Multilingual Precision: "
@@ -1530,6 +1538,113 @@ def _vlm_lane_down(e: Exception) -> bool:
     return isinstance(
         e, (urllib.error.URLError, ConnectionError, http.client.IncompleteRead)
     )
+
+
+def _vlm_cache_path(path: str) -> str:
+    import hashlib
+
+    ap = os.path.abspath(path)
+    return os.path.join(
+        OCR_VLM_PAGE_CACHE,
+        f"{os.path.basename(os.path.dirname(ap))}-{hashlib.sha1(ap.encode()).hexdigest()[:10]}.jsonl",
+    )
+
+
+def _vlm_cache_ident(path: str, n: int) -> dict:
+    """What a cached page depends on besides the code: bump "v" when a change alters what a page reads as."""
+    st = os.stat(path)
+    return {
+        "v": 1,
+        "path": os.path.abspath(path),
+        "size": st.st_size,
+        "mtime_ns": st.st_mtime_ns,
+        "pages": n,
+        "dpi": OCR_VLM_DPI,
+        "max_side": OCR_VLM_MAX_SIDE,
+        "tess_dpi": OCR_VLM_TESSERACT_DPI,
+        "model": OCR_VLM_MODEL,
+    }
+
+
+def _vlm_cache_load(path: str, n: int) -> list:
+    """The pages an earlier pass finished for this very file, in order from page 1, as {i, text, tess, unreadable,
+    numeric} -- [] when there are none, or when the file or the settings in its header changed since. Records are
+    written as ASCII JSON (a lone surrogate in a page's text, which UTF-8 cannot encode, and U+2028 / U+0085, at which
+    splitlines would cut, are all escaped) and split on b"\\n" only, so a line a killed worker left unfinished ends
+    the pages read without voiding the ones before it."""
+    try:
+        with open(_vlm_cache_path(path), "rb") as f:
+            lines = f.read().split(b"\n")
+        if json.loads(lines[0]) != _vlm_cache_ident(path, n):
+            return []
+    except (OSError, ValueError):
+        return []
+    done = []
+    for ln in lines[1:]:
+        try:
+            rec = json.loads(ln)
+        except ValueError:
+            break  # the end, or the line a killed worker was writing: that page is done again
+        if not isinstance(rec, dict) or rec.get("i") != len(done):
+            break
+        done.append(rec)
+    return done
+
+
+def _vlm_cache_open(path: str, n: int, done: list):
+    """The cache rewritten as its header plus `done` (a torn last line, or another file's pages, go), open for
+    appending one page per line -- unbuffered, so closing it has nothing left to fail on -- or None when it cannot
+    be written. Best effort: a cache that cannot be written only costs the resume, never the OCR."""
+    cp = _vlm_cache_path(path)
+    try:
+        os.makedirs(os.path.dirname(cp), exist_ok=True)
+        with open(cp + ".tmp", "w", encoding="utf-8") as f:
+            for rec in [_vlm_cache_ident(path, n)] + done:
+                f.write(json.dumps(rec) + "\n")
+        os.replace(cp + ".tmp", cp)
+        return open(cp, "ab", buffering=0)
+    except OSError as e:
+        print(
+            f"[build_corpus] WARN: VLM-OCR page cache {cp} not writable ({e}); this pass cannot be resumed",
+            flush=True,
+        )
+        return None
+
+
+def _vlm_cache_add(
+    cache,
+    i: int,
+    text: str,
+    tess: bool = False,
+    unreadable: bool = False,
+    numeric: int = 0,
+) -> bool:
+    """Append page i to the cache; True when the whole record was written."""
+    if cache is None:
+        return False
+    rec = json.dumps(
+        {
+            "i": i,
+            "text": text,
+            "tess": tess,
+            "unreadable": unreadable,
+            "numeric": numeric,
+        }
+    )
+    try:
+        data = (rec + "\n").encode()
+        return cache.write(data) == len(data)
+    except OSError as e:  # a full disk: the pages after this one are redone on a resume
+        print(
+            f"[build_corpus] WARN: VLM-OCR page cache: page {i + 1} not saved ({e})",
+            flush=True,
+        )
+        return False
+
+
+def _vlm_cache_drop(path: str) -> None:
+    with contextlib.suppress(OSError):
+        os.remove(_vlm_cache_path(path))
 
 
 def _vlm_quiet(now=None) -> bool:
@@ -1914,10 +2029,14 @@ def vlm_ocr_pdf_to_md(path: str) -> str:
     """Whole-document OCR through the VLM: every page rendered at OCR_VLM_DPI and transcribed in order; a page the
     model cannot transcribe, or whose prose Tesseract does not read on it, is read by Tesseract instead. "" when no
     server is usable, a page fails otherwise, or more than OCR_VLM_MAX_UNREADABLE_SHARE of the pages with text are
-    unreadable (the caller falls back to ocrmypdf)."""
+    unreadable (the caller falls back to ocrmypdf); raises VlmDeferred when the remote lane's quiet window begins or
+    the lane goes down after this pass kept a page in the page cache (OCR_VLM_PAGE_CACHE) -- the next pass resumes
+    after the pages kept there."""
     global _ocr_backend
     kind, base = _vlm_endpoint()
     if not base:
+        # ocrmypdf writes the document now: pages an earlier pass kept are of no more use
+        _vlm_cache_drop(path)
         return ""
     import pymupdf
 
@@ -1931,11 +2050,32 @@ def vlm_ocr_pdf_to_md(path: str) -> str:
     ] = []  # 1-based pages Tesseract read instead (blank ones included)
     unchecked = False
     numeric = 0  # tables of numbers dropped from transcribed pages
+    done: list[dict] = []  # the pages an earlier pass finished, from the page cache
+    saved = 0  # pages this pass wrote to the cache
     t0 = time.time()
     try:
-        with pymupdf.open(path) as doc:
+        with contextlib.ExitStack() as stack:
+            doc = stack.enter_context(pymupdf.open(path))
             n = doc.page_count
-            for i in range(n):
+            done = _vlm_cache_load(path, n)
+            parts += [r["text"] for r in done]
+            unreadable += [r["i"] + 1 for r in done if r.get("unreadable")]
+            by_tess += [r["i"] + 1 for r in done if r.get("tess")]
+            numeric += sum(r.get("numeric", 0) for r in done)
+            if done:
+                print(
+                    f"[build_corpus] VLM-OCR {name}: resuming at page {len(done) + 1} of {n} ({kind})",
+                    flush=True,
+                )
+            cache = _vlm_cache_open(path, n, done)
+            if cache is not None:
+                stack.enter_context(cache)
+            for i in range(len(done), n):
+                if kind == "remote" and _vlm_quiet():
+                    raise VlmDeferred(
+                        f"{n} page(s), {i} done; paused as the remote lane's quiet window "
+                        f"({OCR_VLM_REMOTE_QUIET}) began, resumes at page {i + 1}"
+                    )
                 page = doc[i]
                 dpi = OCR_VLM_DPI
                 side = max(page.rect.width, page.rect.height) * dpi / 72.0
@@ -1978,10 +2118,15 @@ def vlm_ocr_pdf_to_md(path: str) -> str:
                     text, k = _drop_numeric_tables(text)
                     numeric += k
                     parts.append(text)
+                    if _vlm_cache_add(cache, i, text, numeric=k):
+                        saved += 1
+                    else:
+                        cache = None  # a page missing from the cache ends what a resume reads back
                     continue
                 if tess is None:
                     raise terr
-                if len(re.findall(r"[A-Za-z]{3,}", tess)) >= OCR_VLM_BLANK_WORDS:
+                counted = len(re.findall(r"[A-Za-z]{3,}", tess)) >= OCR_VLM_BLANK_WORDS
+                if counted:
                     # A model that keeps failing on pages with text is not reading this document: abandon, as
                     # before. Blank pages do not count -- a one-sided scan is half blank pages.
                     unreadable.append(i + 1)
@@ -1995,13 +2140,31 @@ def vlm_ocr_pdf_to_md(path: str) -> str:
                     flush=True,
                 )
                 parts.append(tess)
+                if _vlm_cache_add(cache, i, tess, tess=True, unreadable=counted):
+                    saved += 1
+                else:
+                    cache = None
+    except VlmDeferred:
+        raise  # paused at the quiet window: the cache keeps the pages done
     except Exception as e:
+        if _vlm_lane_down(e) and saved:
+            # 2026-11-10: a lane that goes down mid-book (a reload evicts the OCR server, the remote host goes away)
+            # no longer costs the pages done: the document waits for a later build, which resumes after them. A pass
+            # that kept no new page in the cache -- the lane failed the first page it asked for, or the cache cannot
+            # be written -- still abandons, as before: a page that takes the server down every time must not keep
+            # its document unwritten for good.
+            raise VlmDeferred(
+                f"{n} page(s); the {kind} lane went down after {len(parts)} page(s) "
+                f"({type(e).__name__}: {str(e)[:100]}), resumes at page {len(done) + saved + 1}"
+            )
+        _vlm_cache_drop(path)
         print(
             f"[build_corpus] WARN: VLM OCR abandoned on {name} after {len(parts)} page(s) "
             f"({type(e).__name__}: {str(e)[:120]}) -> ocrmypdf",
             flush=True,
         )
         return ""
+    _vlm_cache_drop(path)
     _ocr_backend = "vlm:" + kind
     tail = (
         f"; {len(by_tess)} page(s) by tesseract ({', '.join(map(str, by_tess))})"
@@ -2009,6 +2172,7 @@ def vlm_ocr_pdf_to_md(path: str) -> str:
         else ""
     )
     tail += f"; {numeric} numeric table(s) dropped" if numeric else ""
+    tail += f"; resumed at page {len(done) + 1}" if done else ""
     print(
         f"[build_corpus] VLM-OCR {name}: {n} page(s) via {OCR_VLM_MODEL} ({kind}) in {time.time() - t0:.0f} s{tail}",
         flush=True,

@@ -93,7 +93,8 @@ def layer_font(path):
 @contextlib.contextmanager
 def vlm(kind="local", page_fn=None):
     """A usable VLM endpoint whose per-page call is `page_fn(base, png)`; records the calls. Tesseract's reading of
-    each page (the grounding check, 2026-10-19) is faked as VLM_PAGE, so a VLM_PAGE answer counts as backed by it."""
+    each page (the grounding check, 2026-10-19) is faked as VLM_PAGE, so a VLM_PAGE answer counts as backed by it.
+    The remote lane's quiet window never begins and the page cache (2026-11-10) lives in a temporary directory."""
     calls = []
 
     def page(base, png):
@@ -101,10 +102,13 @@ def vlm(kind="local", page_fn=None):
         return (page_fn or (lambda b, p: VLM_PAGE))(base, png)
 
     with (
+        tempfile.TemporaryDirectory() as cache_dir,
         patched(bc, "_vlm_endpoint_cache", None),
         patched(bc, "_vlm_endpoint", lambda: (kind, "http://127.0.0.1:1")),
         patched(bc, "_vlm_ocr_page", page),
         patched(bc, "_tesseract_png", lambda png: VLM_PAGE),
+        patched(bc, "_vlm_quiet", lambda now=None: False),
+        patched(bc, "OCR_VLM_PAGE_CACHE", cache_dir),
     ):
         yield calls
 
@@ -433,6 +437,7 @@ def test_vlm_ocr_sends_a_dense_page_whole_as_png():
 
         with (
             patched(bc, "_vlm_endpoint", lambda: ("local", "http://127.0.0.1:1")),
+            patched(bc, "OCR_VLM_PAGE_CACHE", td),
             patched(bc, "_vlm_ocr_page", fake_page),
             patched(
                 bc, "_tesseract_png", lambda png: ""
