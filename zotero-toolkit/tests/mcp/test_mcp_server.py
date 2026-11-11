@@ -685,7 +685,8 @@ def test_api_key_travels_in_header_never_in_url(fake_lightrag, load_server, api_
     srv.find_paper("Vaswani 2017")
     srv.paper_passages("AAAA0001", "q")
     srv.add_note("text")
-    assert srv.health().startswith("200:")
+    assert srv.health().startswith("200 healthy")
+    assert srv.health(verbose=True).startswith("200:")
     paths = {r["path"] for r in fake_lightrag.requests}
     assert paths == {
         "/query",

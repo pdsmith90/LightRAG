@@ -123,7 +123,7 @@ def test_tools_return_text_without_structured_output(load_server, items):
     assert len(tools) == 7
     assert all(t.output_schema is None for t in tools)
     assert result.structured_content is None
-    assert result.content[0].text.startswith("200:")
+    assert result.content[0].text.startswith("200 healthy")
 
 
 # --- FOLD and word matching ------------------------------------------------------

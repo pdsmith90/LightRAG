@@ -12,13 +12,15 @@ It's a thin, self-contained proxy over the LightRAG Server REST API. Seven tools
     paper_passages(paper, question)    -> up to 3 passages of ONE paper, ranked
                                           against a question
     find_paper(paper)                  -> lookup: is a paper indexed, only in
-                                          Zotero, or in neither?
+                                          Zotero, or in neither? (one lookup per
+                                          line: up to 40 in one call)
     paper_equation(paper, number)      -> one numbered display equation of ONE paper,
                                           as LaTeX read from the paper's PDF
     paper_table(paper, number)         -> one table of ONE paper, as rows, from the PDF
     add_note(text, description)        -> insert a note/snippet into the KB under
                                           a unique document name
-    health()                           -> is the LightRAG server up?
+    health(verbose=False)              -> is the LightRAG server up? (a few lines;
+                                          verbose: the server's whole report)
 
 Citations are compiled from the `references` array that stock LightRAG returns
 (one {reference_id, file_path} per retrieved document): corpus files named
@@ -80,7 +82,7 @@ import sys
 import threading
 import time
 import unicodedata
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 
 import httpx
 
@@ -113,6 +115,15 @@ LIST_ROWS = 10
 CONFIRM_MAX = 100
 CONFIRM_BATCH = 50
 CONFIRM_THREADS = 4
+# A find_paper call with several lines looks each one up: at most BATCH_MAX distinct
+# lines, BATCH_THREADS at a time, so the server sees no more requests at once than four
+# ordinary lookups send.
+BATCH_MAX = 40
+BATCH_THREADS = 4
+# A batch answers within BATCH_BUDGET seconds of wall-clock time: a lookup still
+# unanswered by then is reported as such (one request alone may wait QUERY_TIMEOUT, and
+# BATCH_MAX of them, BATCH_THREADS at a time, many times that).
+BATCH_BUDGET = 120.0
 
 # Zotero metadata for deterministic citations. Answering LLMs fabricate the
 # "### References" block (placeholder titles, wrong years), so we strip that and
@@ -138,6 +149,9 @@ PDF_PYTHON = os.environ.get("LIGHTRAG_MCP_PDF_PYTHON") or (
 PDF_TIMEOUT = float(os.environ.get("LIGHTRAG_MCP_OCR_TIMEOUT") or "120") + 120.0
 _META_SIGNATURE = None
 _BAD_SIGNATURE = None
+# Batch lookups call _metadata() and _rows() from several threads: the reload below and
+# the row table's rebuild are each done by one thread at a time.
+_META_LOCK = threading.Lock()
 
 
 def _signature(stat):
@@ -168,24 +182,63 @@ def _metadata() -> dict:
         signature = _signature(os.stat(META_PATH))
     except OSError:
         return _META
+    # no lock on the unchanged file: the reload below assigns _META before _META_SIGNATURE,
+    # so a thread that sees the new signature also sees the new dict
     if signature == _META_SIGNATURE:
         return _META
-    try:
-        with open(META_PATH, encoding="utf-8") as source:
-            updated = json.load(source)
-            if not isinstance(updated, dict):
-                raise ValueError("metadata must be a JSON object")
-            signature = _signature(os.fstat(source.fileno()))
-    except (OSError, ValueError) as exc:
-        if signature != _BAD_SIGNATURE:
-            print(
-                f"lightrag_mcp_server: cannot refresh {META_PATH}: {exc}",
-                file=sys.stderr,
-            )
-            _BAD_SIGNATURE = signature
+    with _META_LOCK:
+        # another thread may have reloaded it while this one waited for the lock
+        if signature == _META_SIGNATURE:
+            return _META
+        try:
+            with open(META_PATH, encoding="utf-8") as source:
+                updated = json.load(source)
+                if not isinstance(updated, dict):
+                    raise ValueError("metadata must be a JSON object")
+                signature = _signature(os.fstat(source.fileno()))
+        except (OSError, ValueError) as exc:
+            if signature != _BAD_SIGNATURE:
+                print(
+                    f"lightrag_mcp_server: cannot refresh {META_PATH}: {exc}",
+                    file=sys.stderr,
+                )
+                _BAD_SIGNATURE = signature
+            return _META
+        _META, _META_SIGNATURE, _BAD_SIGNATURE = updated, signature, None
         return _META
-    _META, _META_SIGNATURE, _BAD_SIGNATURE = updated, signature, None
-    return _META
+
+
+def _meta_age_note() -> str:
+    """When the Zotero item list (META_PATH) was built, in local time, and its age: in
+    hours under 48 h, in days after; '' when the file cannot be read. A lookup that
+    finds nothing says it, because an item added to Zotero after the list was built is
+    not in it yet, and without the age the answer cannot tell which case it is. The
+    time is the file's modification time, so a copy of the list must keep it
+    (scp -p, rsync -t, cp -p)."""
+    try:
+        os.stat(META_PATH)
+    except OSError:
+        return ""
+    # try a reload first, so the time below is that of the list the lookups use
+    _metadata()
+    if _META_SIGNATURE is None:
+        return ""
+    # the mtime of the loaded copy, not of whatever is on disk now
+    built = _META_SIGNATURE[1] / 1e9
+    hours = (time.time() - built) / 3600
+    if hours < 0:
+        age, rebuilt = "time in the future: clock skew", " and is rebuilt once a day"
+    elif hours < 48:
+        age, rebuilt = f"{int(hours)} h ago", " and is rebuilt once a day"
+    else:
+        age, rebuilt = (
+            f"{int(hours // 24)} d ago",
+            "; it should be rebuilt daily and is overdue",
+        )
+    return (
+        f"The Zotero item list was built {time.strftime('%Y-%m-%d %H:%M', time.localtime(built))} "
+        f"({age}){rebuilt}: an item added to Zotero after that is not in it yet."
+    )
 
 
 mcp = MCPServer("zotero-lightrag")
@@ -745,12 +798,20 @@ def _terms(q: str) -> tuple[list[str], list[str], str]:
 
 
 _ROWS: dict = {"meta": None, "rows": {}}
+# Held while the table is rebuilt: batch threads that all find it stale build it once,
+# and the (metadata, rows) pair is read as one.
+_ROWS_LOCK = threading.Lock()
 
 
 def _rows() -> tuple[dict, dict]:
     """(metadata, key -> folded haystacks of its entry), rebuilt when the
     metadata is."""
     meta = _metadata()
+    with _ROWS_LOCK:
+        return _rows_locked(meta)
+
+
+def _rows_locked(meta: dict) -> tuple[dict, dict]:
     if _ROWS["meta"] is not meta:
         rows = {}
         for key, m in meta.items():
@@ -1073,21 +1134,35 @@ def _listing(lines: list[str]) -> list[str]:
     ]
 
 
+def _near_line(k: str, m: dict, p) -> str:
+    status = {True: "indexed", None: "Zotero only", "?": "index status unknown"}
+    return f"{_zotero_line(k, m)} · {status[True if isinstance(p, dict) else p]}"
+
+
 def _near_text(near) -> list[str]:
     if not near:
         return []
-    status = {True: "indexed", None: "Zotero only", "?": "index status unknown"}
     return [
         "\nNo item has every word. Near matches (NOT exact — check before citing):",
-        *(
-            f"{_zotero_line(k, m)} · {status[True if isinstance(p, dict) else p]}"
-            for k, m, p in near
-        ),
+        *(_near_line(k, m, p) for k, m, p in near),
     ]
 
 
+def _indexed_row(p: dict) -> str:
+    return (
+        f"- {', '.join(p.get('keys') or [])} · {p.get('citation') or p.get('title') or p.get('paper')}"
+        + (f" · doi:{p['doi']}" if p.get("doi") else "")
+    )
+
+
 def _lookup_text(
-    paper: str, indexed, rest, truncated: bool, near=(), unchecked=()
+    paper: str,
+    indexed,
+    rest,
+    truncated: bool,
+    near=(),
+    unchecked=(),
+    age_note: str = "",
 ) -> str:
     out = [
         f'Lookup of "{paper}" (a Zotero key, a DOI, or words that must all occur in '
@@ -1103,11 +1178,7 @@ def _lookup_text(
             *_near_text(near),
         ]
         return "\n".join(out)
-    rows = [
-        f"- {', '.join(p.get('keys') or [])} · {p.get('citation') or p.get('title') or p.get('paper')}"
-        + (f" · doi:{p['doi']}" if p.get("doi") else "")
-        for p in indexed
-    ]
+    rows = [_indexed_row(p) for p in indexed]
     out += [f"\nIndexed, so its text is searchable ({len(rows)}):", *_listing(rows)]
     if truncated:
         out.append(
@@ -1141,9 +1212,107 @@ def _lookup_text(
                     if _norm_doi(paper)
                     else "Try the DOI, the Zotero key, or 'Author Year' alone."
                 )
+                + (f" {age_note}" if age_note else "")
             )
         out += _near_text(near)
     return "\n".join(out)
+
+
+def _batch_line(q: str, indexed, rest, truncated: bool, near=(), unchecked=()) -> str:
+    """One line of a batch answer: the lookup, then what _lookup_text lists for it
+    reduced to its first row and the counts."""
+    head = f'"{q}" → '
+    if indexed is None:
+        if rest:
+            return f"{head}INDEX STATUS UNKNOWN (this server has no paper lookup): {_zotero_line(*rest[0])}"
+        out = f"{head}INDEX STATUS UNKNOWN (this server has no paper lookup)"
+    elif truncated:
+        return (
+            f"{head}{PAPER_SEARCH_LIMIT} OR MORE INDEXED PAPERS MATCH: add title words"
+        )
+    elif indexed:
+        out = f"{head}INDEXED ({len(indexed)}): {_indexed_row(indexed[0])}"
+        if len(indexed) > 1:
+            out += f" [+{len(indexed) - 1} more indexed: look it up alone]"
+        if rest:
+            out += f"; also {len(rest)} in Zotero not indexed"
+        if unchecked:
+            out += f"; also {len(unchecked)} in Zotero, index status not checked"
+        return out
+    elif rest:
+        out = f"{head}IN ZOTERO, NOT INDEXED ({len(rest)}): {_zotero_line(*rest[0])}"
+        if unchecked:
+            out += f"; also {len(unchecked)} in Zotero, index status not checked"
+        return out
+    elif unchecked:
+        return f"{head}IN ZOTERO, INDEX STATUS NOT CHECKED ({len(unchecked)}): {_zotero_line(*unchecked[0])}"
+    else:
+        out = f"{head}NO ITEM HAS EVERY WORD"
+    if near:
+        out += f"; near match, not exact: {_near_line(*near[0])}"
+    return out
+
+
+def _batch_one(q: str) -> str:
+    try:
+        return _batch_line(q, *_lookup(q))
+    except Exception as e:  # one failed lookup must not take the other answers with it
+        return f'"{q}" → lookup failed: {" ".join(str(e).split()) or type(e).__name__}'
+
+
+def _batch_text(lines: list[str]) -> str:
+    """Answer for several non-empty lines of find_paper: the distinct lookups, at most
+    BATCH_MAX of them, run BATCH_THREADS at a time, one numbered line each in input order."""
+    distinct = list(dict.fromkeys(lines))
+    run, left = distinct[:BATCH_MAX], distinct[BATCH_MAX:]
+    # not a with-block: its exit would wait for the stalled lookups
+    pool = ThreadPoolExecutor(BATCH_THREADS)
+    futures = [pool.submit(_batch_one, q) for q in run]
+    done, _ = wait(futures, timeout=BATCH_BUDGET)
+    # lookups not started are dropped; those already running finish alone
+    pool.shutdown(wait=False, cancel_futures=True)
+    answers = [
+        f"{n}. "
+        + (
+            f.result()
+            if f in done
+            else f'"{q}" → not answered within {BATCH_BUDGET:g} s (server slow; this is not absence): look it up alone'
+        )
+        for n, (q, f) in enumerate(zip(run, futures), 1)
+    ]
+    head = (
+        f"Batch lookup of {len(run)} (a Zotero key, a DOI, or words that must all occur in "
+        "the title, authors or year), one line of answer each."
+    )
+    if len(lines) > len(distinct):
+        head += f" {len(lines) - len(distinct)} repeated line(s) were looked up once."
+    if left:
+        head += (
+            f" {len(left)} more NOT looked up: one call looks up at most {BATCH_MAX}, so "
+            "they need a second call."
+        )
+    age = _meta_age_note()
+    foot = (
+        "A NO ITEM line does not show the paper is missing: a wrong year, a name spelled "
+        "differently from the metadata, a topic word that is not in the title, and the "
+        "BibTeX keys of web pages, reports and books all give it. "
+        + (age + " " if age else "")
+        + "Look one item up alone for its full listing."
+    )
+    # 200 characters are kept for the line saying how many were cut
+    room = MAX_CHARS - len(head) - len(foot) - 200
+    kept, used = [], 0
+    for a in answers:
+        used += len(a) + 1
+        if used > room:
+            break
+        kept.append(a)
+    if len(kept) < len(answers):
+        kept.append(
+            f"… {len(answers) - len(kept)} more lines cut to keep the answer under "
+            f"{MAX_CHARS} characters: look those up in a second call."
+        )
+    return "\n".join([head, *kept, foot])
 
 
 def _lead_key(keys: list[str]) -> str:
@@ -1791,8 +1960,17 @@ def find_paper(paper: str) -> str:
     list does not show absence. An empty answer means only that no item has
     every word; a wrong year or a topic word missing from the title gives it
     too, so it does not show the paper is missing. About 1-3 s alone, longer
-    while searches run; no retrieval and no LLM."""
-    return _lookup_text(paper, *_lookup(paper))
+    while searches run; no retrieval and no LLM.
+
+    Several lookups at once: put one per line (up to 40; repeated lines are looked up
+    once). The answer is one line per lookup (first match and counts); look one up alone
+    for its full listing."""
+    # only \n, \r\n and \r break a line: str.splitlines() also breaks at U+2028, form feed
+    # and the like, which text copied from a PDF carries inside one title
+    lines = [s.strip() for s in re.split(r"\r\n|\r|\n", paper) if s.strip()]
+    if len(lines) > 1:
+        return _batch_text(lines)
+    return _lookup_text(paper, *_lookup(paper), age_note=_meta_age_note())
 
 
 @mcp.tool(structured_output=False)
@@ -1818,14 +1996,90 @@ def add_note(text: str, description: str = "") -> str:
     return str(data)
 
 
+def _dict(x) -> dict:
+    return x if isinstance(x, dict) else {}
+
+
+def _s(x) -> str:
+    """A field of the health summary as text, at most 80 characters."""
+    return str(x)[:80]
+
+
+def _health_summary(code: int, text: str) -> str:
+    """The server's /health report in about 600 characters instead of the several KB of
+    configuration it carries: status, versions, pipeline, the queues (queued/running)
+    and the models. Every field is read with .get, so one the server drops or renames is
+    left out; anything that is not a 200 with a JSON object is shown as it came."""
+    try:
+        body = json.loads(text)
+    except (ValueError, RecursionError):  # RecursionError: a deeply nested body
+        body = None
+    if code != 200 or not isinstance(body, dict):
+        return f"{code}: {text[:300]}"
+    first = f"{code} {_s(body['status'])}" if body.get("status") else str(code)
+    if body.get("core_version"):
+        first += f" · LightRAG core {_s(body['core_version'])}"
+        first += f" (api {_s(body['api_version'])})" if body.get("api_version") else ""
+    elif body.get("api_version"):
+        first += f" · LightRAG api {_s(body['api_version'])}"
+    if "pipeline_busy" in body:
+        first += " · pipeline " + ("busy" if body["pipeline_busy"] else "idle")
+        first += ", scanning" if body.get("pipeline_scanning") else ""
+        first += (
+            ", destructive job running" if body.get("pipeline_destructive_busy") else ""
+        )
+    if body.get("pipeline_pending_enqueues") is not None:
+        first += f" · {_s(body['pipeline_pending_enqueues'])} pending enqueues"
+    llm = _dict(body.get("llm_queue_status"))
+    queues = [
+        (n, llm.get(n)) for n in ("extract", "keyword", "query", "vlm") if n in llm
+    ]
+    queues += [(n, body.get(f"{n}_queue_status")) for n in ("embedding", "rerank")]
+    shown = []
+    for name, q in queues:
+        if not isinstance(q, dict):
+            continue
+        item = f"{name} {_s(q.get('queued', '?'))}/{_s(q.get('running', '?'))}"
+        failed = q.get("failed_total")
+        if (
+            isinstance(failed, (int, float))
+            and not isinstance(failed, bool)
+            and failed > 0
+        ):
+            item += f", failed {_s(failed)}"
+        shown.append(item + (" UNAVAILABLE" if q.get("available") is False else ""))
+    cfg = _dict(body.get("configuration"))
+    extract = _dict(_dict(cfg.get("role_llm_config")).get("extract")).get("model")
+    models = [
+        f"{label} {_s(cfg[key])}"
+        for label, key in (
+            ("llm", "llm_model"),
+            ("embedding", "embedding_model"),
+            ("rerank", "rerank_model"),
+        )
+        if cfg.get(key)
+    ] + ([f"extract {_s(extract)}"] if extract else [])
+    return "\n".join(
+        [first]
+        + (["queues (queued/running): " + "; ".join(shown)] if shown else [])
+        + (["models: " + ", ".join(models)] if models else [])
+        + ["verbose=True returns the full server report (several KB of configuration)."]
+    )
+
+
 @mcp.tool(structured_output=False)
-def health() -> str:
-    """Check that the LightRAG server is reachable and report its status."""
+def health(verbose: bool = False) -> str:
+    """Check that the LightRAG server is reachable and report its status: a few lines
+    (version, pipeline, queues, models); verbose=True returns the server's whole report."""
     try:
         r = httpx.get(f"{BASE}/health", headers=HEADERS, timeout=HEALTH_TIMEOUT)
-        return f"{r.status_code}: {r.text}"
     except Exception as e:
         return f"unreachable at {BASE}: {e}"
+    return (
+        f"{r.status_code}: {r.text}"
+        if verbose
+        else _health_summary(r.status_code, r.text)
+    )
 
 
 if __name__ == "__main__":

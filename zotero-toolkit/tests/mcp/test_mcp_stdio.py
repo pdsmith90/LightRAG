@@ -83,7 +83,7 @@ def test_stdio_lists_tools_and_compiles_citations(
     )
     assert "[zotero://select/library/items/AAAA0001]" in text
     assert text.endswith("\n\nRAW CONTEXT")
-    assert health.content[0].text.startswith("200:")
+    assert health.content[0].text.startswith("200 healthy")
     # An HTTP error from the server surfaces as a tool error, not an empty result.
     assert failed.is_error
     assert "500" in failed.content[0].text

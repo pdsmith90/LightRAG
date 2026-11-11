@@ -15,9 +15,9 @@ into real bibliographic citations using Zotero metadata. The LLM never writes th
 | `paper_passages(paper, question)` | Up to 3 passages of **one** paper ranked against `question`, under that paper's citation and, when this host has it, the path of the paper's file in Zotero's storage folder. `paper` is a Zotero key, a DOI, or words that must all occur in the title, authors or year. If no indexed paper, several, or only near matches fit, it lists them instead of querying. |
 | `paper_equation(paper, number, page=0)` | One numbered display equation of **one** paper as `$…$` LaTeX with its printed number as `\tag{N}`, read from the paper's own PDF (see [Equations and tables from the PDF](#equations-and-tables-from-the-pdf)), with the PDF's text layer for the same box, the page and the sentence that cites it. Without an OCR model the answer is the text layer, labelled as such. |
 | `paper_table(paper, number)` | One numbered table of **one** paper as a Markdown table with its caption and page, read from the PDF's text layer by the layout converter. No OCR model. |
-| `find_paper(paper)` | A lookup with the same `paper` forms: the matching papers that are indexed, then the Zotero items that match but are not, then near matches when nothing has every word. No retrieval and no LLM. |
+| `find_paper(paper)` | A lookup with the same `paper` forms: the matching papers that are indexed, then the Zotero items that match but are not, then near matches when nothing has every word. A lookup that finds nothing also says how old the Zotero item list is. With one lookup per line (up to 40) it answers one line per lookup instead: its first match and the counts (see [One paper's passages and the paper lookup](#one-papers-passages-and-the-paper-lookup)). No retrieval and no LLM. |
 | `add_note(text, description="")` | Inserts a text note into the knowledge base (`POST /documents/text`) under a unique document name (see below). |
-| `health()` | The server's `/health` status, or `unreachable at <url>: <error>`. |
+| `health(verbose=False)` | A few lines from the server's `/health` report: status, versions, pipeline state, the queues (queued/running) and the models, or `unreachable at <url>: <error>`. A status other than 200, or a body that is not a JSON object, is shown as it came (the first 300 characters). `verbose=True` returns the whole report as `<status code>: <body>`. |
 
 `mode` is one of `mix` (default: knowledge graph + vectors), `hybrid`, `local`, `global` or
 `naive`. Any other value, including LightRAG's `bypass`, falls back to `mix`. `top_k` is
@@ -149,6 +149,27 @@ off by one, then entries whose author family name is the query's surname (the Bi
 family, else its first non-numeric word), within a year of a year the query gives. On a
 stock LightRAG Server the route answers 404 and the index status is reported as unknown.
 
+When no item has every word, the answer also says when the Zotero item list was built (the
+modification time of `zotero_metadata.json`, in local time) and how old that is, in hours
+under 48 and in days after, because an item added to Zotero after the build is not in the
+list yet. The age note reads the item list's modification time, so a copy of the list must
+preserve it (`scp -p`, `rsync -t`, `cp -p`), or it shows the time of the copy. The note is
+left out when the file cannot be read.
+
+**Several lookups in one call.** `paper` with more than one non-empty line is a batch: each
+line, stripped, is one lookup (only `\n`, `\r\n` and `\r` end a line), exact repeats are
+looked up once, and the first 40 distinct lines are looked up, four at a time. The answer is
+a header, then one numbered line per lookup in input order (`INDEXED (k)`, `IN ZOTERO, NOT
+INDEXED (j)`, `IN ZOTERO, INDEX STATUS NOT CHECKED (j)`, `NO ITEM HAS EVERY WORD` with its
+first near match, `INDEX STATUS UNKNOWN`, or `100 OR MORE INDEXED PAPERS MATCH`, each with
+the first match), and a footer that says a `NO ITEM` line does not show the paper is
+missing and carries the age note once. Lines beyond 40 are named by count in the header and
+need a second call. A lookup that raises answers `lookup failed: <error>` on its own line.
+A batch answers within 120 seconds (`BATCH_BUDGET`): a lookup still waiting then reads `not
+answered within 120 s (server slow; this is not absence)`, and lookups not yet started are
+dropped. The answer stays under `LIGHTRAG_MCP_MAX_CHARS`; lines cut for it are counted. One
+line is looked up exactly as before.
+
 `paper_passages` resolves `paper` the same way and never queries for a near match. With
 one indexed paper it sends `POST /graph/papers/passages` with all of the paper's keys (the
 copy with a DOI, else the longest title, first), the bare question and `top_n` 3, and
@@ -241,7 +262,7 @@ Every setting is an environment variable, set in the MCP client's server entry.
 | `LIGHTRAG_MCP_REF_FALLBACK_TIMEOUT` | `90` | Seconds allowed for the `/query/data` reference fallback in answer mode. |
 | `LIGHTRAG_MCP_HEALTH_TIMEOUT` | `15` | Seconds allowed for `health()`. |
 | `LIGHTRAG_MCP_MAX_TOP_K` | `40` | Upper bound for `top_k`. Requests above it are lowered to it, and values below 1 are raised to 1 (the server rejects them). |
-| `LIGHTRAG_MCP_MAX_CHARS` | `48000` | Longest retrieved-passages result, in characters. Claude Code saves a tool result over 50,000 characters to a file and shows the agent a 2 KB preview, so the default keeps results inline there. |
+| `LIGHTRAG_MCP_MAX_CHARS` | `48000` | Longest retrieved-passages result, and longest `find_paper` batch answer, in characters. Claude Code saves a tool result over 50,000 characters to a file and shows the agent a 2 KB preview, so the default keeps results inline there. |
 
 **Choosing `LIGHTRAG_MCP_MAX_TOP_K`.** The default equals LightRAG's own default `TOP_K`, so
 a stock server sees nothing it would not use anyway. On a server with a trimmed token
@@ -328,7 +349,9 @@ of error`), mode validation, the `top_k` clamp and `passages`, the `X-API-Key` h
 `/query/data` fallback and its timeout, error propagation with the server's explanation,
 unique note names for `add_note` (the fake refuses a repeated name with 409, as LightRAG
 does), folding and the paper lookup (key confirmation, cache, ranking, cut lists, near
-matches), both `paper_passages` paths and their local file line, the header strip
+matches), the batch lookup (statuses, order, the 40-line limit, a failing or stalled lookup,
+the age note, the locks around the shared metadata), the short `health` answer, both
+`paper_passages` paths and their local file line, the header strip
 (checked against `corpus/build_corpus.py` when it imports), the section-heading cleanup,
 duplicate passages, and the stdio tool listing
 with text-only results. `test_mcp_paper_tools.py` covers `paper_equation` and `paper_table`
