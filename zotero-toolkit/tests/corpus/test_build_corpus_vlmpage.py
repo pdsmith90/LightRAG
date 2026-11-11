@@ -234,7 +234,8 @@ def test_page_call_classifies_unreadable_answers():
         assert (
             bc._vlm_ocr_page("http://127.0.0.1:1", b"\x89PNG") == "## A page\n\nText."
         )
-    for finish, content in (("length", "loop " * 50), ("stop", "   "), (None, "")):
+    # (None, "") -- no text and no finish_reason -- is VlmLaneError now (test_build_corpus_vlmreserve)
+    for finish, content in (("length", "loop " * 50), ("stop", "   ")):
         with patched(urllib.request, "urlopen", answer(finish, content)):
             try:
                 bc._vlm_ocr_page("http://127.0.0.1:1", b"\x89PNG")

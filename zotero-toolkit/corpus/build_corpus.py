@@ -1168,6 +1168,11 @@ def _equations_session(doc, chunks, name: str):
             else:
 
                 def client(png: bytes) -> str:
+                    held = _vlm_reserved() if kind == "remote" else ""
+                    if held:  # reserved since the lane was chosen: no crop goes to it
+                        raise VlmDeferred(
+                            f"{n} formula box(es); the remote lane is reserved until {held}"
+                        )
                     try:
                         return _vlm_ocr_page(base, png)
                     except Exception as e:
@@ -1461,6 +1466,11 @@ OCR_VLM_MODEL = os.environ.get("OCR_VLM_MODEL", "pepperocr-vl")
 OCR_VLM_REMOTE_QUIET = os.environ.get(
     "OCR_VLM_REMOTE_QUIET", "01:30-08:45"
 )  # the remote GPU's cron night (llm_failover.py's window)
+# Unscheduled work that needs the remote GPU (a benchmark, a manual job) writes an epoch second into this file
+# ("reserved until"), as for llm_failover.py's LLM_FO_RESERVED_FILE (one file can serve both); until then the remote
+# lane is closed to OCR like its quiet window. A missing or unreadable file, or a moment already past, is no
+# reservation. "" (default) disables.
+OCR_VLM_REMOTE_RESERVED_FILE = os.environ.get("OCR_VLM_REMOTE_RESERVED_FILE", "")
 OCR_VLM_LOCAL_START = os.environ.get(
     "OCR_VLM_LOCAL_START",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "ocr_server.sh"),
@@ -1497,10 +1507,11 @@ OCR_VLM_BLANK_WORDS = (
 # footnoted or N/A cell in 20.
 NUMERIC_TABLE_SHARE = 0.95
 # 2026-11-10 (a 988-page scan that needs more hours than the remote lane is open in a day): every page the VLM
-# finishes is appended to a per-document cache. A document on the remote lane pauses when its quiet window begins,
-# and one whose lane goes down is deferred too (VlmDeferred: nothing is written and a later build converts it; at most
-# OCR_VLM_MAX_STALLS passes in a row that keep no new page); that build, or one after a killed worker, resumes at the
-# first page not done. The cache goes when the document is written or the VLM is abandoned for ocrmypdf.
+# finishes is appended to a per-document cache. A document on the remote lane pauses when its quiet window or a
+# reservation (OCR_VLM_REMOTE_RESERVED_FILE) begins, and one whose lane goes down is deferred too (VlmDeferred:
+# nothing is written and a later build converts it; at most OCR_VLM_MAX_STALLS passes in a row that keep no new page);
+# that build, or one after a killed worker, resumes at the first page not done. The cache goes when the document is
+# written or the VLM is abandoned for ocrmypdf.
 OCR_VLM_PAGE_CACHE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "ocr_vlm_pages"
 )
@@ -1525,21 +1536,32 @@ class VlmPageUnreadable(RuntimeError):
     """The model answered but could not transcribe the page: it looped, ran to max_tokens or said nothing."""
 
 
+class VlmLaneError(RuntimeError):
+    """The lane did not serve the page at all: its stream carried an error event, or ended with no answer."""
+
+
 class VlmDeferred(Exception):
     """No OCR lane can serve this document now: nothing is written for it, and a later build converts it (2026-11-05:
     a document with formula boxes waits for the lane rather than being written with its equations as text-layer lines)."""
 
 
 def _vlm_lane_down(e: Exception) -> bool:
-    """The lane could not serve at all -- a 5xx, a refused or dropped connection, a stream cut off mid-answer -- as
-    opposed to a crop the model could not transcribe (finish_reason, empty text, a 4xx, a read timeout)."""
+    """The lane could not serve at all -- a 5xx, a refused or dropped connection, a stream cut off mid-answer, an error
+    event or no answer at all in the stream (VlmLaneError) -- as opposed to a crop the model could not transcribe
+    (finish_reason, empty text, a 4xx, a read timeout)."""
     import http.client
     import urllib.error
 
     if isinstance(e, urllib.error.HTTPError):
         return e.code >= 500
     return isinstance(
-        e, (urllib.error.URLError, ConnectionError, http.client.IncompleteRead)
+        e,
+        (
+            urllib.error.URLError,
+            ConnectionError,
+            http.client.IncompleteRead,
+            VlmLaneError,
+        ),
     )
 
 
@@ -1700,6 +1722,23 @@ def _vlm_quiet(now=None) -> bool:
     return lo <= t < hi if lo <= hi else (t >= lo or t < hi)
 
 
+def _vlm_reserved_until() -> int:
+    """Epoch second the remote lane is reserved until (0 = none), read as llm_failover.py reads its file."""
+    if not OCR_VLM_REMOTE_RESERVED_FILE:
+        return 0
+    try:
+        with open(OCR_VLM_REMOTE_RESERVED_FILE) as f:
+            return int(float(f.read().strip().split()[0]))
+    except (OSError, ValueError, IndexError, OverflowError):
+        return 0
+
+
+def _vlm_reserved() -> str:
+    """ "HH:MM" the reservation ends while OCR_VLM_REMOTE_RESERVED_FILE names a moment still in the future, else ""."""
+    until = _vlm_reserved_until()
+    return time.strftime("%H:%M", time.localtime(until)) if time.time() < until else ""
+
+
 def _vlm_probe(base: str, timeout: float = 3.0) -> str:
     """What `base`/v1/models says: "model" (it lists OCR_VLM_MODEL), "other" (something answered without it: another
     service holds the port, or a model that is not the OCR one), "busy" (a listener that stayed silent for `timeout` or
@@ -1750,15 +1789,20 @@ def _vlm_local_port() -> str:
 
 def _vlm_endpoint():
     """(kind, base_url) of a usable OCR server, cached per process: the local one, the remote one outside its
-    quiet window, or the local one after starting it (ocr_server.sh start --for-build, which supplants the RAG
-    model). ("", "") when none."""
+    quiet window and while it is not reserved (OCR_VLM_REMOTE_RESERVED_FILE), or the local one after starting it
+    (ocr_server.sh start --for-build, which supplants the RAG model). ("", "") when none."""
     global _vlm_endpoint_cache
     if _vlm_endpoint_cache is not None:
         return _vlm_endpoint_cache
     found = ("", "")
     if _vlm_alive(OCR_VLM_LOCAL_URL):
         found = ("local", OCR_VLM_LOCAL_URL)
-    elif OCR_VLM_REMOTE_URL and not _vlm_quiet() and _vlm_alive(OCR_VLM_REMOTE_URL):
+    elif (
+        OCR_VLM_REMOTE_URL
+        and not _vlm_quiet()
+        and not _vlm_reserved()
+        and _vlm_alive(OCR_VLM_REMOTE_URL)
+    ):
         found = ("remote", OCR_VLM_REMOTE_URL)
     else:
         # Why it is not alive decides what to do: a listener that is only busy is waited for; one that answers without
@@ -1826,9 +1870,12 @@ def _vlm_looping(text: str) -> str:
 
 def _vlm_ocr_page(base: str, img_bytes: bytes) -> str:
     """One page image -> Markdown, streamed. Raises VlmPageUnreadable when the model's answer is unusable -- it
-    loops (cut off as soon as _vlm_looping sees it), runs to max_tokens or says nothing -- else on any non-success
-    (the caller abandons the VLM for the document). The timeout applies to each read, so a long page never times
-    out while it streams; it still bounds a queue wait or a stalled server."""
+    loops (cut off as soon as _vlm_looping sees it), runs to max_tokens or says nothing -- and VlmLaneError when the
+    lane did not serve at all: an error event in the stream, or a stream that ends with no text and no finish_reason
+    (llama-swap with sendLoadingState answers a streamed request whose model fails to launch with HTTP 200 and says
+    so in the stream; unstreamed, the same request gets a 5xx). Else it raises on any non-success (the caller
+    abandons the VLM for the document). The timeout applies to each read, so a long page never times out while it
+    streams; it still bounds a queue wait or a stalled server."""
     import base64
     import urllib.request
 
@@ -1874,7 +1921,14 @@ def _vlm_ocr_page(base: str, img_bytes: bytes) -> str:
             data = line[5:].strip()
             if data == b"[DONE]":
                 break
-            ch = (json.loads(data).get("choices") or [{}])[0]
+            ev = json.loads(data)
+            # an error event, e.g. llama-swap's when the model's launcher refused: the lane did not serve
+            if "error" in ev and "choices" not in ev:
+                err = ev["error"]
+                raise VlmLaneError(
+                    str(err.get("message", err) if isinstance(err, dict) else err)[:200]
+                )
+            ch = (ev.get("choices") or [{}])[0]
             text += (ch.get("delta") or {}).get("content") or ""
             finish = ch.get("finish_reason") or finish
             if len(text) - checked >= 64:
@@ -1885,6 +1939,8 @@ def _vlm_ocr_page(base: str, img_bytes: bytes) -> str:
                         f"loop on {unit[:24]!r} after {len(text)} chars"
                     )
     text = text.strip()
+    if finish is None and not text:
+        raise VlmLaneError("no answer: the stream ended without a completion")
     if finish != "stop" or not text:
         raise VlmPageUnreadable(f"finish_reason={finish} chars={len(text)}")
     return text
@@ -2066,9 +2122,9 @@ def vlm_ocr_pdf_to_md(path: str) -> str:
     """Whole-document OCR through the VLM: every page rendered at OCR_VLM_DPI and transcribed in order; a page the
     model cannot transcribe, or whose prose Tesseract does not read on it, is read by Tesseract instead. "" when no
     server is usable, a page fails otherwise, or more than OCR_VLM_MAX_UNREADABLE_SHARE of the pages with text are
-    unreadable (the caller falls back to ocrmypdf); raises VlmDeferred when the remote lane's quiet window begins or
-    the lane goes down (at most OCR_VLM_MAX_STALLS passes in a row that keep no new page) -- the next pass resumes
-    after the pages kept in the page cache (OCR_VLM_PAGE_CACHE)."""
+    unreadable (the caller falls back to ocrmypdf); raises VlmDeferred when the remote lane's quiet window begins, it
+    is reserved (OCR_VLM_REMOTE_RESERVED_FILE) or the lane goes down (at most OCR_VLM_MAX_STALLS passes in a row that
+    keep no new page) -- the next pass resumes after the pages kept in the page cache (OCR_VLM_PAGE_CACHE)."""
     global _ocr_backend
     kind, base = _vlm_endpoint()
     if not base:
@@ -2112,6 +2168,12 @@ def vlm_ocr_pdf_to_md(path: str) -> str:
                     raise VlmDeferred(
                         f"{n} page(s), {i} done; paused as the remote lane's quiet window "
                         f"({OCR_VLM_REMOTE_QUIET}) began, resumes at page {i + 1}"
+                    )
+                held = _vlm_reserved() if kind == "remote" else ""
+                if held:  # the lane choice is cached per build: a reservation can begin after it
+                    raise VlmDeferred(
+                        f"{n} page(s), {i} done; paused as the remote lane is reserved until {held}, "
+                        f"resumes at page {i + 1}"
                     )
                 page = doc[i]
                 dpi = OCR_VLM_DPI

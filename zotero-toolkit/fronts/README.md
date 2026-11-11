@@ -177,7 +177,11 @@ each stays off until its own variable is set.
 - **Reservation file.** This covers unscheduled work, such as a benchmark or a manual job:
   `date -d '+2 hours' +%s > "$LLM_FO_RESERVED_FILE"` reserves the primary, and `rm` releases it.
   A missing file, an unreadable file or a time already past means no reservation. Use an
-  absolute path; the launcher runs the front from `fronts/`.
+  absolute path; the launcher runs the front from `fronts/`. The corpus converter's remote
+  OCR lane reads the same kind of file from `OCR_VLM_REMOTE_RESERVED_FILE` (off when unset):
+  while it is reserved no page or formula crop is sent there, and a document in progress
+  pauses and resumes from its page cache on a later build. Point both variables at one file
+  to reserve the primary for both.
 - **Gap file.** Scheduled jobs leave idle gaps inside their window. A scheduler that knows
   when its next job starts can unload its own idle model and write an epoch second, a few
   minutes before that job, into `LLM_FO_GAP_FILE`. Until then guarded requests use the
