@@ -706,7 +706,12 @@ class _Zotero:
 
     def find_by_doi(self, doi: str, title: str) -> dict | None:
         """Top-level item with this DOI. The API cannot search the DOI field, so
-        it searches the title and filters the hits on the DOI."""
+        it searches the title and filters the hits on the DOI.
+
+        A hit in the trash is skipped here rather than relied on the search to
+        leave out, and a hit whose only PDF is a trashed attachment counts as
+        having no PDF (``pdf_children`` skips those too).
+        """
         if not title:
             return None
         r = self.request(
@@ -717,7 +722,8 @@ class _Zotero:
         if r.status_code != 200:
             raise ZoteroUploadError(f"title search -> {r.status_code}")
         for hit in r.json():
-            if normalize_doi(hit["data"].get("DOI")) == doi:
+            data = hit["data"]
+            if not data.get("deleted") and normalize_doi(data.get("DOI")) == doi:
                 return hit
         return None
 

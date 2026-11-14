@@ -167,6 +167,7 @@ class World:
         self.fail_delete = False
         self.fail_get: str | None = None  # item key whose GET answers 500
         self.calls: list[tuple[str, str]] = []
+        self.top_shows_trash = False  # set to return trashed items from /items/top
 
     # ---- helpers
     def add_item(self, data: dict) -> str:
@@ -180,11 +181,13 @@ class World:
         return [i for i in self.items.values() if i["data"].get("parentItem") == parent]
 
     def top(self) -> list[dict]:
-        # the real /items/top does not return items that are in the trash
+        # the real /items/top does not return items that are in the trash, but a
+        # test can force it to so the caller's own filter is exercised
         return [
             i
             for i in self.items.values()
-            if not i["data"].get("parentItem") and not i["data"].get("deleted")
+            if not i["data"].get("parentItem")
+            and (self.top_shows_trash or not i["data"].get("deleted"))
         ]
 
     def drop(self, key: str) -> None:
@@ -627,6 +630,31 @@ def test_doi_ledger_hit_is_refused_when_the_check_itself_fails(world, cfg, tmp_p
     assert exc.value.status_code == 409 and first.item_key in str(exc.value)
     assert "added by an earlier upload" in str(exc.value)
     assert json.load(open(cfg.ledger_path))["by_doi"][DOI]["item_key"] == first.item_key
+
+
+def test_doi_search_ignores_a_trashed_item(world, cfg, tmp_path):
+    """A trashed item is no duplicate even if the search hands it back."""
+    world.crossref_works[DOI] = crossref_record()
+    old = world.add_item({"itemType": "journalArticle", "title": TITLE, "DOI": DOI})
+    world.trash(old)
+    world.top_shows_trash = True
+
+    result = run(cfg, world, write_pdf(tmp_path, paper_lines()))
+
+    assert (result.outcome, result.doi) == ("created", DOI)
+    assert result.item_key != old
+    assert not world.items[result.item_key]["data"].get("deleted")
+    assert [i["key"] for i in world.top()] == [old, result.item_key]
+
+
+def test_doi_search_still_matches_a_live_item(world, cfg, tmp_path):
+    world.crossref_works[DOI] = crossref_record()
+    parent = world.add_item({"itemType": "journalArticle", "title": TITLE, "DOI": DOI})
+    world.top_shows_trash = True
+
+    result = run(cfg, world, write_pdf(tmp_path, paper_lines()))
+
+    assert (result.outcome, result.item_key) == ("attached", parent)
 
 
 def test_doi_already_holding_a_pdf_is_refused_and_creates_nothing(world, cfg, tmp_path):
