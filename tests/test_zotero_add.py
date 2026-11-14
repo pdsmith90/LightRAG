@@ -165,6 +165,7 @@ class World:
         self.fail_put: str | None = None  # suffix of the PUT that answers 500
         self.fail_patch = False
         self.fail_delete = False
+        self.fail_get: str | None = None  # item key whose GET answers 500
         self.calls: list[tuple[str, str]] = []
 
     # ---- helpers
@@ -179,7 +180,23 @@ class World:
         return [i for i in self.items.values() if i["data"].get("parentItem") == parent]
 
     def top(self) -> list[dict]:
-        return [i for i in self.items.values() if not i["data"].get("parentItem")]
+        # the real /items/top does not return items that are in the trash
+        return [
+            i
+            for i in self.items.values()
+            if not i["data"].get("parentItem") and not i["data"].get("deleted")
+        ]
+
+    def drop(self, key: str) -> None:
+        """Delete an item and its children, as emptying the trash would."""
+        for child in self.children(key):
+            del self.items[child["key"]]
+        del self.items[key]
+
+    def trash(self, key: str) -> None:
+        """Mark an item and its children deleted, as Zotero's trash does."""
+        for item in [self.items[key], *self.children(key)]:
+            item["data"]["deleted"] = 1
 
     # ---- transport
     def handler(self, request: httpx.Request) -> httpx.Response:
@@ -228,6 +245,8 @@ class World:
                 return httpx.Response(200, json=self.children(key))
             item = self.items.get(key)
             if m == "GET":
+                if self.fail_get == key:
+                    return httpx.Response(500, text="boom")
                 return httpx.Response(200, json=item) if item else httpx.Response(404)
             assert request.headers["If-Unmodified-Since-Version"] == str(
                 item["version"]
@@ -325,7 +344,7 @@ def run(cfg, world, path, name="paper.pdf"):
     )
 
 
-def paper_lines(doi=True):
+def paper_lines(doi=True, extra=""):
     lines = [
         TITLE,
         "Anna Lindqvist and Ben Okafor",
@@ -333,6 +352,8 @@ def paper_lines(doi=True):
     ]
     if doi:
         lines.append(f"https://doi.org/{DOI}")
+    if extra:
+        lines.append(extra)
     return lines
 
 
@@ -493,6 +514,119 @@ def test_same_file_twice_is_refused_the_second_time(world, cfg, tmp_path):
         run(cfg, world, path, name="renamed.pdf")
     assert exc.value.status_code == 409 and first.item_key in str(exc.value)
     assert len(world.items) == n_items
+
+
+def test_md5_ledger_hit_whose_item_was_deleted_uploads_again(world, cfg, tmp_path):
+    path = write_pdf(tmp_path, ["scanned notes"])
+    first = run(cfg, world, path)
+    world.drop(
+        first.item_key
+    )  # the item and its attachment were deleted in Zotero, outside LightRAG
+
+    again = run(cfg, world, path, name="renamed.pdf")
+
+    assert again.outcome == "created" and again.item_key != first.item_key
+    assert again.item_key in world.items
+    ledger = json.load(open(cfg.ledger_path))
+    assert ledger["by_md5"][again.md5]["item_key"] == again.item_key
+    assert ledger["by_md5"][again.md5]["attachment_key"] == again.attachment_key
+
+
+def test_md5_ledger_hit_in_the_trash_uploads_again(world, cfg, tmp_path):
+    path = write_pdf(tmp_path, ["scanned notes"])
+    first = run(cfg, world, path)
+    world.trash(first.item_key)
+
+    again = run(cfg, world, path)
+
+    assert again.outcome == "created" and again.item_key != first.item_key
+    ledger = json.load(open(cfg.ledger_path))
+    assert ledger["by_md5"][again.md5]["item_key"] == again.item_key
+
+
+def test_md5_ledger_hit_still_in_the_library_is_still_refused(world, cfg, tmp_path):
+    path = write_pdf(tmp_path, ["scanned notes"])
+    first = run(cfg, world, path)
+    n_items = len(world.items)
+
+    with pytest.raises(za.ZoteroUploadError) as exc:
+        run(cfg, world, path)
+
+    assert exc.value.status_code == 409 and first.item_key in str(exc.value)
+    assert len(world.items) == n_items
+    assert json.load(open(cfg.ledger_path))["by_md5"][first.md5] == {
+        "item_key": first.item_key,
+        "attachment_key": first.attachment_key,
+        "filename": "paper.pdf",
+    }
+
+
+def test_md5_ledger_hit_is_refused_when_the_check_itself_fails(world, cfg, tmp_path):
+    path = write_pdf(tmp_path, ["scanned notes"])
+    first = run(cfg, world, path)
+    world.fail_get = first.attachment_key  # the API answers 500 for the check
+
+    with pytest.raises(za.ZoteroUploadError) as exc:
+        run(cfg, world, path)
+
+    assert exc.value.status_code == 409 and first.item_key in str(exc.value)
+    assert "This exact file is already" in str(exc.value)
+    # nothing is forgotten on a failed check
+    assert (
+        json.load(open(cfg.ledger_path))["by_md5"][first.md5]["item_key"]
+        == first.item_key
+    )
+
+
+def test_doi_ledger_hit_whose_item_was_deleted_uploads_again(world, cfg, tmp_path):
+    world.crossref_works[DOI] = crossref_record()
+    first = run(cfg, world, write_pdf(tmp_path, paper_lines(), name="v1.pdf"))
+    assert first.doi == DOI
+    world.drop(first.item_key)
+
+    again = run(cfg, world, write_pdf(tmp_path, paper_lines(extra="v2"), name="v2.pdf"))
+
+    assert (again.outcome, again.doi) == ("created", DOI)
+    assert again.item_key != first.item_key and again.item_key in world.items
+    assert json.load(open(cfg.ledger_path))["by_doi"][DOI]["item_key"] == again.item_key
+
+
+def test_doi_ledger_hit_in_the_trash_uploads_again(world, cfg, tmp_path):
+    world.crossref_works[DOI] = crossref_record()
+    first = run(cfg, world, write_pdf(tmp_path, paper_lines(), name="v1.pdf"))
+    world.trash(first.item_key)
+
+    again = run(cfg, world, write_pdf(tmp_path, paper_lines(extra="v2"), name="v2.pdf"))
+
+    assert (again.outcome, again.doi) == ("created", DOI)
+    assert json.load(open(cfg.ledger_path))["by_doi"][DOI]["item_key"] == again.item_key
+
+
+def test_doi_ledger_hit_still_in_the_library_is_still_refused(world, cfg, tmp_path):
+    world.crossref_works[DOI] = crossref_record()
+    first = run(cfg, world, write_pdf(tmp_path, paper_lines(), name="v1.pdf"))
+    n_items = len(world.items)
+
+    with pytest.raises(za.ZoteroUploadError) as exc:
+        run(cfg, world, write_pdf(tmp_path, paper_lines(extra="v2"), name="v2.pdf"))
+
+    assert exc.value.status_code == 409 and first.item_key in str(exc.value)
+    assert "added by an earlier upload" in str(exc.value)
+    assert len(world.items) == n_items
+    assert json.load(open(cfg.ledger_path))["by_doi"][DOI]["item_key"] == first.item_key
+
+
+def test_doi_ledger_hit_is_refused_when_the_check_itself_fails(world, cfg, tmp_path):
+    world.crossref_works[DOI] = crossref_record()
+    first = run(cfg, world, write_pdf(tmp_path, paper_lines(), name="v1.pdf"))
+    world.fail_get = first.item_key
+
+    with pytest.raises(za.ZoteroUploadError) as exc:
+        run(cfg, world, write_pdf(tmp_path, paper_lines(extra="v2"), name="v2.pdf"))
+
+    assert exc.value.status_code == 409 and first.item_key in str(exc.value)
+    assert "added by an earlier upload" in str(exc.value)
+    assert json.load(open(cfg.ledger_path))["by_doi"][DOI]["item_key"] == first.item_key
 
 
 def test_doi_already_holding_a_pdf_is_refused_and_creates_nothing(world, cfg, tmp_path):

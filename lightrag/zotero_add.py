@@ -12,7 +12,9 @@ key; nothing is written to the input directory. A configured
 Order of operations, with the failure each step reports (never silently):
 
 1. md5 of the file against the upload ledger and, if configured, the local
-   ``zotero.sqlite`` (``ZOTERO_SQLITE``): a known file is refused (409).
+   ``zotero.sqlite`` (``ZOTERO_SQLITE``): a known file is refused (409). A ledger
+   hit is first confirmed with the Zotero API; a key Zotero no longer has (deleted
+   or in the trash) is dropped from the ledger and the upload goes ahead.
 2. DOI (PDF metadata, first pages) and a title query are looked up on CrossRef;
    a candidate is accepted only when its title is found in the PDF's own text.
    CrossRef trouble is not an error: the item becomes a titled stub.
@@ -394,6 +396,42 @@ def _ledger_write(cfg: ZoteroUploadConfig, data: dict) -> None:
     os.replace(tmp, cfg.ledger_path)
 
 
+def _forget_ledger_key(cfg: ZoteroUploadConfig, ledger: dict, key: str) -> None:
+    """Drop every ledger entry that records ``key`` (as parent or attachment)."""
+    for table in ("by_md5", "by_doi"):
+        for seen, entry in list(ledger[table].items()):
+            if key in (entry.get("item_key"), entry.get("attachment_key")):
+                del ledger[table][seen]
+    try:
+        _ledger_write(cfg, ledger)
+    except OSError as e:
+        logger.warning(
+            f"zotero_add: the stale ledger entry for {key} could not be removed "
+            f"({e.strerror}); the upload goes ahead"
+        )
+
+
+def _ledger_hit_live(zot: _Zotero, ledger: dict, key: str) -> bool:
+    """Whether a ledger hit recorded under ``key`` still exists in Zotero.
+
+    A key the library has dropped (404, or in its trash) no longer describes this
+    library, so the entries naming it are forgotten and the caller uploads again.
+    A key that is still there, or a check that could not be made, keeps the
+    duplicate refusal — the ledger is never discarded on a guess.
+    """
+    state = zot.item_state(key)
+    if state == "gone":
+        logger.info(f"zotero_add: ledger key {key} is gone from Zotero")
+        _forget_ledger_key(zot.cfg, ledger, key)
+        return False
+    if state == "unknown":
+        logger.warning(
+            f"zotero_add: the Zotero API could not confirm ledger key {key}; "
+            "the duplicate refusal stands"
+        )
+    return True
+
+
 def _sqlite_has_md5(cfg: ZoteroUploadConfig, md5: str) -> str:
     """Key of a live attachment with this storage hash in zotero.sqlite, else ''."""
     if not cfg.sqlite_path:
@@ -620,6 +658,26 @@ class _Zotero:
     def get_item(self, key: str) -> dict | None:
         r = self.request("GET", f"{self.cfg.library}/items/{key}")
         return r.json() if r.status_code == 200 else None
+
+    def item_state(self, key: str) -> str:
+        """``live``, ``gone`` (404, or Zotero holds it in the trash), or ``unknown``.
+
+        ``unknown`` is any answer that is not Zotero's verdict on existence — an
+        unreachable API, a 5xx, a 403 — and must never be read as ``gone``.
+        """
+        try:
+            r = self.request("GET", f"{self.cfg.library}/items/{key}")
+        except ZoteroUploadError:
+            return "unknown"
+        if r.status_code == 404:
+            return "gone"
+        if r.status_code != 200:
+            return "unknown"
+        try:
+            data = (r.json() or {}).get("data") or {}
+        except ValueError:
+            return "unknown"
+        return "gone" if data.get("deleted") else "live"
 
     def delete(self, key: str) -> None:
         item = self.get_item(key)
@@ -856,6 +914,8 @@ def _check_doi_duplicate(
     """``None`` when the DOI is new; ``(parent key, empty attachment key)`` to
     attach to an item that has no PDF yet; raises 409 when a PDF is already there."""
     seen = ledger["by_doi"].get(doi)
+    if seen and not _ledger_hit_live(zot, ledger, seen["item_key"]):
+        seen = None
     if seen:
         raise _refuse(
             f"Already in the Zotero library: item {seen['item_key']} (DOI {doi}), "
@@ -903,13 +963,18 @@ def add_pdf_to_zotero(
 
     with _ledger_lock(cfg), httpx.Client(transport=transport) as http:
         ledger = _ledger_read(cfg)
+        zot, dav = _Zotero(cfg, http), _WebDAV(cfg, http)
         known = ledger["by_md5"].get(md5)
+        if known:
+            # the ledger records the attachment too; the file is what this md5 names
+            att = known.get("attachment_key") or known["item_key"]
+            if not _ledger_hit_live(zot, ledger, att):
+                known = None
         key = known["item_key"] if known else _sqlite_has_md5(cfg, md5)
         if key:
             raise _refuse(
                 f"This exact file is already in the Zotero library ({key}); nothing added."
             )
-        zot, dav = _Zotero(cfg, http), _WebDAV(cfg, http)
         info = read_pdf_info(pdf_path)
         rec, candidate, warns = lookup_crossref(http, cfg, info)
         doi = normalize_doi(rec.get("DOI")) if rec else ""
