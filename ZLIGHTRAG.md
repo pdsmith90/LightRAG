@@ -39,6 +39,7 @@ starting with [README.md](./README.md), applies as written.
 | [A rebuild reads a shared extraction through every chunk that lists it](#a-rebuild-reads-a-shared-extraction-through-every-chunk-that-lists-it) | none | always active |
 | [One unusable multimodal analysis degrades its item](#one-unusable-multimodal-analysis-degrades-its-item) | none | always active |
 | [Changed text of a processed document](#changed-text-of-a-processed-document) | `SCAN_DIVERT_CHANGED_PROCESSED` | `false` |
+| [Upload to Zotero](#upload-to-zotero) | `ZOTERO_UPLOAD` (settings: `ZOTERO_*`, see `env.example`) | `false` |
 | WebUI query defaults for new browser profiles: `top_k` 10, `chunk_top_k` 12, entity/relation tokens 1500, total tokens 7000 (`lightrag_webui/src/stores/querySettings.ts`) | none | always active |
 
 ### Reference lists compiled from Zotero metadata
@@ -504,6 +505,58 @@ different -- is moved to `<input_dir>/__changed__/` with a scan warning instead.
 stored document is never touched: delete it and move the file back to replace it. Off,
 the scan does no extra I/O. Reported in the `/health` configuration. Code:
 `_content_materially_changed` in `lightrag/api/routers/document_routes.py`.
+
+### Upload to Zotero
+
+With `ZOTERO_UPLOAD=true`, the WebUI's Upload button (`POST /documents/upload`) adds
+the file to a Zotero library instead of indexing it, and the document reaches
+LightRAG through the existing Zotero corpus build under its Zotero key
+(`KEY__slug.md`). Nothing is written to the input directory, so the upload cannot
+create a second copy of what the corpus build later produces. Only PDFs are
+accepted, up to `MAX_UPLOAD_SIZE`; `GET /documents/supported_file_types` then lists
+`.pdf` alone and `/health` reports `zotero_upload: true`, which is what makes the
+WebUI say "Add to Zotero". Unset, the route is upstream's, unchanged. With the
+switch on but a setting missing, the upload answers 503 naming it; it never falls
+back to indexing.
+
+Order of operations, in `lightrag/zotero_add.py`:
+
+1. The file's md5 is looked up in the upload ledger (`ZOTERO_UPLOAD_LEDGER`) and,
+   when `ZOTERO_SQLITE` names a `zotero.sqlite`, in its live attachments: a known
+   file is refused with 409.
+2. The first pages and the PDF metadata yield DOI candidates and a title; CrossRef
+   (`api.crossref.org`, polite pool through `ZOTERO_CROSSREF_MAILTO`) is asked for
+   the DOI, then for the title. A record counts only when its title is found in
+   the PDF's own text (a cited paper's DOI does not), and for a title search its
+   first author's surname too. No match, or CrossRef unreachable, gives a stub
+   item `Uploaded: <file name>` tagged `unmatched-upload`, carrying an unverified
+   DOI candidate in `extra`; the response says which happened.
+3. A DOI already in the library (the local metadata file, the ledger, then a title
+   search of the Zotero API filtered on the DOI, since the API cannot search that
+   field) is refused with 409 when the item holds a PDF. When the item has none,
+   as with the library's reference stubs, the PDF is attached to it, filling an
+   empty attachment row if there is one; no second item is created. If the API
+   check itself fails the upload goes on and the response carries a warning.
+4. The parent item (item template from the API, filled from the CrossRef record;
+   `DOI` goes into `extra` for types without that field), the attachment row, the
+   WebDAV files `<KEY>.zip` and `<KEY>.prop` (the layout the Zotero client reads,
+   `.prop` removed first and written last), then `md5` and `mtime` onto the
+   attachment row. A failure from the attachment row on deletes what the call
+   created in Zotero and on WebDAV and answers 502 saying so, or naming what could
+   not be removed. An upload holds a file lock for these steps, so two uploads of
+   one file cannot both pass the checks.
+5. With `ZOTERO_SYNC_COMMAND` set, the command is launched detached (no shell,
+   output to `ZOTERO_SYNC_LOG` or discarded). Nothing starts while a command this
+   process launched is alive or `ZOTERO_SYNC_LOCK_FILE` is held; the command itself
+   should take that lock without waiting (`flock -n -o`), which settles two
+   workers racing. The response says `started`, `already_running`,
+   `not_configured` or `failed` (`sync_triggered` is true only for the first). An
+   upload that arrives while a build is past its Zotero sync waits for the next run.
+
+Settings are documented in `env.example`; the Zotero library id, a write-enabled
+API key and a WebDAV store (`WEBDAV_ENABLED` must be 1 in a settings file) are
+required. Files are read on every upload, so a rotated key needs no restart.
+Tests: `tests/test_zotero_add.py`, `tests/api/routes/test_zotero_upload_route.py`.
 
 ### Tests
 

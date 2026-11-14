@@ -106,6 +106,17 @@
         "success": "Файли успішно завантажено",
         "error": "Деякі файли не вдалося завантажити"
       },
+      "zotero": {
+        "button": "Add to Zotero",
+        "tooltip": "Add documents to the Zotero library",
+        "title": "Add to Zotero",
+        "description": "Drag and drop PDF files here or click to browse. Each file is added to the Zotero library and reaches the knowledge base after the next Zotero sync.",
+        "batch": {
+          "uploading": "Adding files to Zotero...",
+          "success": "Added to Zotero",
+          "error": "Some files could not be added to Zotero"
+        }
+      },
       "generalError": "Завантаження не вдалося\n{{error}}",
       "fileTypes": "Підтримувані типи: {{types}}",
       "fileUploader": {

@@ -21,6 +21,7 @@ import {
 } from '@/lib/fileTypes'
 import { errorMessage } from '@/lib/utils'
 import { getSupportedFileTypes, uploadDocument } from '@/api/lightrag'
+import { useBackendState } from '@/stores/state'
 
 import { UploadIcon } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
@@ -40,6 +41,9 @@ export default function UploadDocumentsDialog({
   onUploadBatchAccepted
 }: UploadDocumentsDialogProps) {
   const { t } = useTranslation()
+  // The server adds uploads to the Zotero library instead of indexing them.
+  const zotero = useBackendState.use.status()?.configuration?.zotero_upload === true
+  const text = zotero ? 'documentPanel.uploadDocuments.zotero' : 'documentPanel.uploadDocuments'
   const [open, setOpen] = useState(false)
   const [isUploading, setIsUploading] = useState(false)
   const [progresses, setProgresses] = useState<Record<string, number>>({})
@@ -111,12 +115,13 @@ export default function UploadDocumentsDialog({
       });
 
       // Show uploading toast
-      const toastId = toast.loading(t('documentPanel.uploadDocuments.batch.uploading'))
+      const toastId = toast.loading(t(`${text}.batch.uploading`))
 
       try {
         // Track errors locally to ensure we have the final state
         const uploadErrors: Record<string, string> = {}
         let batchProbeTriggered = false
+        const zoteroNotes: string[] = []
 
         // Create a collator that supports Chinese sorting
         const collator = new Intl.Collator(['zh-CN', 'en'], {
@@ -151,9 +156,17 @@ export default function UploadDocumentsDialog({
                 [file.name]: result.message
               }))
             } else {
-              // Mark that we had at least one successful upload
-              hasSuccessfulUpload = true
-              if (!batchProbeTriggered) {
+              if (zotero) {
+                // Nothing is queued in the pipeline: there is no activity to
+                // probe and no document list to refresh yet. The message says
+                // what was added, where its metadata came from and whether a
+                // sync was started, so it is shown rather than dropped.
+                zoteroNotes.push(`${file.name}: ${result.message}`)
+              } else {
+                // Mark that we had at least one successful upload
+                hasSuccessfulUpload = true
+              }
+              if (!zotero && !batchProbeTriggered) {
                 batchProbeTriggered = true
                 onUploadBatchAccepted?.()
               }
@@ -185,12 +198,14 @@ export default function UploadDocumentsDialog({
                 } else {
                   errorMsg = detail || errorMsg
                 }
-              } else if (status === 400 || status === 413 || status === 429 || status === 503) {
+              } else if (status === 400 || status === 413 || status === 429 || status === 502 || status === 503) {
                 // 400 invalid request, 413 body/file too large, 429 pipeline at
                 // capacity (MAX_PENDING_DOCUMENTS — the detail carries how many
                 // documents are active, how many were requested, the capacity and
-                // a retry hint), 503 document storage unavailable. Each detail is
-                // written to be shown to a user verbatim.
+                // a retry hint), 502 Zotero or WebDAV failed (the detail says what
+                // was rolled back), 503 document storage unavailable or Zotero
+                // upload not configured. Each detail is written to be shown to a
+                // user verbatim.
                 errorMsg = detail || errorMsg
               }
 
@@ -215,9 +230,14 @@ export default function UploadDocumentsDialog({
 
         // Update toast status
         if (hasErrors) {
-          toast.error(t('documentPanel.uploadDocuments.batch.error'), { id: toastId })
+          toast.error(t(`${text}.batch.error`), { id: toastId })
         } else {
-          toast.success(t('documentPanel.uploadDocuments.batch.success'), { id: toastId })
+          toast.success(t(`${text}.batch.success`), {
+            id: toastId,
+            description: zoteroNotes.length ? (
+              <span className="whitespace-pre-line">{zoteroNotes.join('\n')}</span>
+            ) : undefined
+          })
         }
 
         // Only update if at least one file was uploaded successfully
@@ -236,7 +256,7 @@ export default function UploadDocumentsDialog({
         setIsUploading(false)
       }
     },
-    [setIsUploading, setProgresses, setFileErrors, t, onDocumentsUploaded, onUploadBatchAccepted]
+    [setIsUploading, setProgresses, setFileErrors, t, text, zotero, onDocumentsUploaded, onUploadBatchAccepted]
   )
 
   const uploaderInputs = deriveUploaderInputs(fileTypes)
@@ -262,15 +282,15 @@ export default function UploadDocumentsDialog({
       }}
     >
       <DialogTrigger asChild>
-        <Button variant="default" side="bottom" tooltip={t('documentPanel.uploadDocuments.tooltip')} size="sm">
-          <UploadIcon /> {t('documentPanel.uploadDocuments.button')}
+        <Button variant="default" side="bottom" tooltip={t(`${text}.tooltip`)} size="sm">
+          <UploadIcon /> {t(`${text}.button`)}
         </Button>
       </DialogTrigger>
       <DialogContent className="sm:max-w-xl" onCloseAutoFocus={(e) => e.preventDefault()}>
         <DialogHeader>
-          <DialogTitle>{t('documentPanel.uploadDocuments.title')}</DialogTitle>
+          <DialogTitle>{t(`${text}.title`)}</DialogTitle>
           <DialogDescription>
-            {t('documentPanel.uploadDocuments.description')}
+            {t(`${text}.description`)}
           </DialogDescription>
         </DialogHeader>
         <FileUploader

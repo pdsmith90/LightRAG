@@ -90,7 +90,7 @@ from lightrag.kg.shared_storage import (
     finalize_share_data,
     get_pipeline_ingress,
 )
-from lightrag import entity_name_fold, pipeline_metrics
+from lightrag import entity_name_fold, pipeline_metrics, zotero_add
 from lightrag.utils_pipeline import describe_doc_status_capabilities
 from fastapi.security import OAuth2PasswordRequestForm
 from lightrag.api.auth import auth_handler
@@ -3056,6 +3056,7 @@ def create_app(args):
                         "scan_divert_changed_processed": bool(
                             getattr(args, "scan_divert_changed_processed", False)
                         ),
+                        "zotero_upload": zotero_add.upload_enabled(),
                         "drop_bibliography_chunks": args.drop_bibliography_chunks,
                         "max_chunks_per_doc": args.max_chunks_per_doc,
                         "lexical_chunk_top_k": args.lexical_chunk_top_k,

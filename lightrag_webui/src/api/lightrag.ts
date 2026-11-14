@@ -103,6 +103,8 @@ export type LightragStatus = {
     cosine_threshold: number
     min_rerank_score: number
     related_chunk_number: number
+    /** True when uploads are added to the Zotero library instead of indexed. */
+    zotero_upload?: boolean
     role_llm_config?: Record<string, LightragRoleLLMConfig>
     vlm_process_enable?: boolean
     parser_routing?: string
@@ -268,6 +270,20 @@ export type DocActionResponse = {
   status: 'success' | 'partial_success' | 'failure'
   message: string
   track_id?: string
+}
+
+/** Response of POST /documents/upload while the server runs with ZOTERO_UPLOAD. */
+export type ZoteroUploadResponse = {
+  status: 'success'
+  message: string
+  item_key: string
+  attachment_key: string
+  title: string
+  doi: string
+  metadata: 'crossref' | 'stub' | 'existing'
+  sync_triggered: boolean
+  sync_message: string
+  sync_state: 'started' | 'already_running' | 'not_configured' | 'failed'
 }
 
 export type ScanResponse = {
@@ -1059,7 +1075,7 @@ export const insertTexts = async (texts: string[]): Promise<DocActionResponse> =
 export const uploadDocument = async (
   file: File,
   onUploadProgress?: (percentCompleted: number) => void
-): Promise<DocActionResponse> => {
+): Promise<DocActionResponse | ZoteroUploadResponse> => {
   const formData = new FormData()
   formData.append('file', file)
 
@@ -1082,7 +1098,7 @@ export const uploadDocument = async (
 export const batchUploadDocuments = async (
   files: File[],
   onUploadProgress?: (fileName: string, percentCompleted: number) => void
-): Promise<DocActionResponse[]> => {
+): Promise<(DocActionResponse | ZoteroUploadResponse)[]> => {
   return await Promise.all(
     files.map(async (file) => {
       return await uploadDocument(file, (percentCompleted) => {

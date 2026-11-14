@@ -50,6 +50,7 @@ from fastapi import (
     Response,
     UploadFile,
 )
+from fastapi.responses import JSONResponse
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -123,6 +124,7 @@ from lightrag.utils import (
 )
 from lightrag.kg.shared_storage import append_pipeline_history
 from lightrag.utils_pipeline import count_active_documents, read_source_file_basename
+from lightrag import zotero_add
 from lightrag.api.admission import adopt_admission_ticket
 from lightrag.api.utils_api import get_combined_auth_dependency
 from ..config import global_args
@@ -957,6 +959,38 @@ class InsertResponse(BaseModel):
             }
         }
     )
+
+
+class ZoteroUploadResponse(BaseModel):
+    """Response of ``POST /documents/upload`` while ``ZOTERO_UPLOAD`` is on
+
+    Attributes:
+        status: ``success`` once the PDF is in the Zotero library; failures
+            are HTTP errors (409 duplicate, 502 Zotero/WebDAV failure)
+        message: What was added, where the metadata came from, and whether a
+            sync was started
+        item_key: Zotero key of the parent item
+        attachment_key: Zotero key of the PDF attachment
+        title: Title of the item
+        doi: DOI the item carries, empty for a stub
+        metadata: ``crossref``, ``stub`` or ``existing`` (attached to an item
+            that was already in the library)
+        sync_triggered: Whether a server-side sync was started by this upload
+        sync_message: What was and was not done about the sync, in words
+        sync_state: ``started``, ``already_running``, ``not_configured`` or
+            ``failed``
+    """
+
+    status: Literal["success"] = Field(description="Status of the operation")
+    message: str = Field(description="Message describing the operation result")
+    item_key: str
+    attachment_key: str
+    title: str
+    doi: str
+    metadata: Literal["crossref", "stub", "existing"]
+    sync_triggered: bool
+    sync_message: str
+    sync_state: Literal["started", "already_running", "not_configured", "failed"]
 
 
 class ClearDocumentsResponse(BaseModel):
@@ -4609,6 +4643,68 @@ async def background_delete_documents(
                 logger.error(f"Error processing pending documents after deletion: {e}")
 
 
+async def _upload_to_zotero(file: UploadFile, max_upload_size: Optional[int]):
+    """Stream the upload to a temp file, add it to Zotero, then trigger the sync."""
+    try:
+        cfg = zotero_add.load_config()
+    except zotero_add.ZoteroUploadError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
+    filename = zotero_add.clean_filename(file.filename or "")
+    if not filename.lower().endswith(zotero_add.UPLOAD_EXTENSIONS):
+        raise HTTPException(
+            status_code=400,
+            detail="Only PDF files can be added to Zotero.",
+        )
+    limit = max_upload_size if max_upload_size and max_upload_size > 0 else None
+    declared = getattr(file, "size", None)
+    if limit and declared is not None and declared > limit:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large. Maximum size: {limit / 1024 / 1024:.1f}MB, uploaded: {declared / 1024 / 1024:.1f}MB",
+        )
+    tmp_dir = tempfile.mkdtemp(prefix="zotero_upload_")
+    try:
+        tmp_path = os.path.join(tmp_dir, "upload.pdf")
+        written = 0
+        async with aiofiles.open(tmp_path, "xb") as out:
+            while chunk := await file.read(1024 * 1024):
+                written += len(chunk)
+                if limit and written > limit:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"File too large. Maximum size: {limit / 1024 / 1024:.1f}MB, uploaded: {written / 1024 / 1024:.1f}MB",
+                    )
+                await out.write(chunk)
+        try:
+            result = await asyncio.to_thread(
+                zotero_add.add_pdf_to_zotero, cfg, tmp_path, filename
+            )
+        except zotero_add.ZoteroUploadError as e:
+            logger.error(f"Error /documents/upload (Zotero): {filename}: {e}")
+            raise HTTPException(status_code=e.status_code, detail=str(e))
+        sync = await asyncio.to_thread(zotero_add.trigger_sync, cfg)
+        logger.info(
+            f"Zotero upload: {filename} -> item {result.item_key} "
+            f"({result.metadata}), sync {sync.state}"
+        )
+        return JSONResponse(
+            ZoteroUploadResponse(
+                status="success",
+                message=f"{result.summary} {sync.message}",
+                item_key=result.item_key,
+                attachment_key=result.attachment_key,
+                title=result.title,
+                doi=result.doi,
+                metadata=result.metadata,
+                sync_triggered=sync.triggered,
+                sync_message=sync.message,
+                sync_state=sync.state,
+            ).model_dump()
+        )
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 def create_document_routes(
     rag: LightRAG, doc_manager: DocumentManager, api_key: Optional[str] = None
 ):
@@ -5347,6 +5443,9 @@ def create_document_routes(
         """
         Upload a file to the input directory and index it.
 
+        With ``ZOTERO_UPLOAD=true`` the endpoint instead adds a PDF to the Zotero
+        library and answers a ``ZoteroUploadResponse``; see ``zotero_add.py``.
+
         This API endpoint accepts a file through an HTTP POST request, checks if the
         uploaded file is of a supported type, saves it in the specified input directory,
         indexes it for retrieval, and returns a success status with relevant details.
@@ -5420,6 +5519,9 @@ def create_document_routes(
                 chunking configuration (an explicit ``C`` selector without a
                 custom ``LightRAG.chunking_func``), 500 other errors.
         """
+        if zotero_add.upload_enabled():
+            return await _upload_to_zotero(file, global_args.max_upload_size)
+
         from lightrag.kg.shared_storage import start_reserved_background_task
 
         enqueue_token, admission_adopted = _adopt_or_new_enqueue_token(http_request)
@@ -7046,6 +7148,13 @@ def create_document_routes(
         """
         response.headers["Cache-Control"] = "no-store"
         response.headers["Vary"] = "LIGHTRAG-WORKSPACE"
+        if zotero_add.upload_enabled():
+            # Uploads go to Zotero, which takes PDFs only; no parser engine
+            # is involved, so no hinted filename is valid.
+            return SupportedFileTypesResponse(
+                supported_extensions=list(zotero_add.UPLOAD_EXTENSIONS),
+                engines={},
+            )
         return SupportedFileTypesResponse(
             supported_extensions=list(doc_manager.supported_extensions),
             engines=doc_manager.engine_capabilities,

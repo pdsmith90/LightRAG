@@ -106,6 +106,17 @@
         "success": "Files uploaded successfully",
         "error": "Some files failed to upload"
       },
+      "zotero": {
+        "button": "Add to Zotero",
+        "tooltip": "Add documents to the Zotero library",
+        "title": "Add to Zotero",
+        "description": "Drag and drop PDF files here or click to browse. Each file is added to the Zotero library and reaches the knowledge base after the next Zotero sync.",
+        "batch": {
+          "uploading": "Adding files to Zotero...",
+          "success": "Added to Zotero",
+          "error": "Some files could not be added to Zotero"
+        }
+      },
       "generalError": "Upload Failed\n{{error}}",
       "fileTypes": "Supported types: {{types}}",
       "fileUploader": {
