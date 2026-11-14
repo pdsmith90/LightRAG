@@ -16,7 +16,6 @@ import { Card, CardHeader, CardTitle, CardContent, CardDescription } from '@/com
 import EmptyCard from '@/components/ui/EmptyCard'
 import Checkbox from '@/components/ui/Checkbox'
 import UploadDocumentsDialog from '@/components/documents/UploadDocumentsDialog'
-import ClearDocumentsDialog from '@/components/documents/ClearDocumentsDialog'
 import DeleteDocumentsDialog from '@/components/documents/DeleteDocumentsDialog'
 import PaginationControls from '@/components/ui/PaginationControls'
 import {
@@ -1199,11 +1198,6 @@ export default function DocumentManager() {
     });
   }, [buildQuerySnapshot, enqueueRefresh]);
 
-  // Legacy fetchDocuments function for backward compatibility
-  const fetchDocuments = useCallback(async () => {
-    await fetchPaginatedDocuments(pagination.page, pagination.page_size, statusFilter);
-  }, [fetchPaginatedDocuments, pagination.page, pagination.page_size, statusFilter]);
-
   // Function to clear current polling interval
   const clearPollingInterval = useCallback(() => {
     if (pollingIntervalRef.current) {
@@ -1397,40 +1391,6 @@ export default function DocumentManager() {
     startDeletionConfirmationProbe()
   }, [startDeletionConfirmationProbe])
 
-  // Handle documents cleared callback with proper interval reset
-  const handleDocumentsCleared = useCallback(async () => {
-    // Clear current polling interval
-    clearPollingInterval();
-
-    // Reset status counts to ensure proper state
-    setStatusCounts({
-      all: 0,
-      processed: 0,
-      preprocessed: 0,
-      parsing: 0,
-      analyzing: 0,
-      processing: 0,
-      pending: 0,
-      failed: 0
-    });
-
-    // Perform one immediate refresh to confirm clear operation
-    if (isMountedRef.current) {
-      try {
-        await fetchDocuments();
-      } catch (err) {
-        console.error('Error fetching documents after clear:', err);
-      }
-    }
-
-    // Set appropriate polling interval based on current state
-    // Since documents are cleared, use idle interval (30 seconds)
-    if (currentTab === 'documents' && health && isMountedRef.current) {
-      startPollingInterval(30000); // 30 seconds for idle state
-    }
-  }, [clearPollingInterval, setStatusCounts, fetchDocuments, currentTab, health, startPollingInterval])
-
-
   // Handle showFileName change - switch sort field if currently sorting by first column.
   // Render-time comparison avoids cascading renders flagged by react-hooks/set-state-in-effect.
   const [previousShowFileName, setPreviousShowFileName] = useState(showFileName)
@@ -1552,8 +1512,6 @@ export default function DocumentManager() {
                   </Button>
                 );
               })()
-            ) : !isSelectionMode ? (
-              <ClearDocumentsDialog onDocumentsCleared={handleDocumentsCleared} />
             ) : null}
             <UploadDocumentsDialog
               onUploadBatchAccepted={() => startActivityProbe('upload')}
