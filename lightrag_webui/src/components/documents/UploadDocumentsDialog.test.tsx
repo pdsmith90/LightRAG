@@ -4,8 +4,8 @@
  * pipeline activity probe, because nothing was queued. Without the flag the
  * dialog is the upstream one.
  *
- * The fake backend sits at the axios adapter seam (see ClearDocumentsDialog.test)
- * so the real `uploadDocument` runs and the request it sends is what is checked.
+ * The fake backend sits at the axios adapter seam, so the real `uploadDocument`
+ * runs and the request it sends is what is checked.
  */
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
 import { cleanup, screen, waitFor } from '@testing-library/react'
