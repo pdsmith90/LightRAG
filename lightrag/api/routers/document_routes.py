@@ -125,6 +125,7 @@ from lightrag.utils import (
 from lightrag.kg.shared_storage import append_pipeline_history
 from lightrag.utils_pipeline import count_active_documents, read_source_file_basename
 from lightrag import zotero_add
+from lightrag.zotero_ocr_progress import get_ocr_progress_lines
 from lightrag.api.admission import adopt_admission_ticket
 from lightrag.api.utils_api import get_combined_auth_dependency
 from ..config import global_args
@@ -6690,6 +6691,28 @@ def create_document_routes(
                 else:
                     # No truncation needed, return all messages
                     status_dict["history_messages"] = history_list
+
+            # Zotero corpus OCR progress: the nightly build converts scanned PDFs
+            # page by page and can run for hours on one document, so what it
+            # leaves on disk is projected into a few status lines here. The lines
+            # go into the per-request COPY built above — polling the dialog must
+            # never grow the shared Manager history list.
+            try:
+                ocr_lines = get_ocr_progress_lines()
+            except Exception as e:  # a helper bug must never break the endpoint
+                logger.debug(f"Zotero OCR progress lines skipped: {e}")
+                ocr_lines = []
+
+            if ocr_lines:
+                # History lines carry no timestamp prefix (see the append sites).
+                status_dict["history_messages"] = (
+                    list(status_dict.get("history_messages") or []) + ocr_lines
+                )
+                # Never hide an ingest message that is driving the dialog; the
+                # OCR lines still land in history either way.
+                busy = bool(status_dict.get("busy"))
+                if not busy or not status_dict.get("latest_message"):
+                    status_dict["latest_message"] = ocr_lines[-1]
 
             # Ensure job_start is properly formatted as a string with timezone information
             if "job_start" in status_dict and status_dict["job_start"]:
