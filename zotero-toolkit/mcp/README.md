@@ -67,10 +67,14 @@ by attachment key. The proxy reads only these fields of each entry:
     "authors": ["Ashish Vaswani", "Noam Shazeer"],
     "year": "2017",
     "publication": "Advances in Neural Information Processing Systems",
-    "doi": "10.48550/arXiv.1706.03762"
+    "doi": "10.48550/arXiv.1706.03762",
+    "item_key": "PPPP0001"
   }
 }
 ```
+
+`item_key`, the key of the Zotero item the file belongs to, is optional: with it the paper
+lookups take that key as well as the attachment key.
 
 The proxy checks the file for changes when compiling citations and reloads it without a
 restart. An atomic replacement takes effect on the next request. If the file becomes

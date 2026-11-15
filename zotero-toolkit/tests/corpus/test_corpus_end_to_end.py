@@ -62,6 +62,7 @@ SCHEMA_KEYS = {
     "tags",
     "abstract",
     "source",
+    "item_key",
 }
 
 

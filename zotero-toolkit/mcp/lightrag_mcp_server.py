@@ -839,6 +839,7 @@ def _rows_locked(meta: dict) -> tuple[dict, dict]:
                 "first": _fold(_first_family(m)),
                 "year": year,
                 "doi": doi,
+                "item": str(m.get("item_key") or "").upper(),
             }
         _ROWS.update(meta=meta, rows=rows)
     return _ROWS["meta"], _ROWS["rows"]
@@ -869,15 +870,18 @@ def _newest(row: dict) -> int:
 
 
 def _metadata_matches(q: str) -> list[tuple[str, dict]]:
-    """Corpus metadata entries matching q: an exact Zotero key or DOI, else every
-    word of q (folded) in the title, authors, year, DOI or key; most title words
-    first, then the newest."""
+    """Corpus metadata entries matching q: an exact Zotero key (the attachment's, or
+    the item's, which matches each of its files) or DOI, else every word of q
+    (folded) in the title, authors, year, DOI or key; most title words first, then
+    the newest."""
     key_q, doi_q = q.strip().upper(), _norm_doi(q)
     meta, rows = _rows()
     exact = [
         (k, meta[k])
         for k, r in rows.items()
-        if k == key_q or (doi_q and r["doi"] == doi_q)
+        if k == key_q
+        or (r["item"] and r["item"] == key_q)
+        or (doi_q and r["doi"] == doi_q)
     ]
     if exact:
         return exact

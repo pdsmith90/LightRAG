@@ -77,6 +77,7 @@ def test_build_maps_every_attachment_with_parent_or_own_metadata(tmp_path):
         "tags": ["neural networks", "review"],
         "abstract": LONG_ABSTRACT[:1500],
         "source": "parent",
+        "item_key": "TEST0001",
     }
     epub = idx["TEST0102"]  # every content type, not just PDF
     assert (
@@ -97,6 +98,14 @@ def test_build_maps_every_attachment_with_parent_or_own_metadata(tmp_path):
     )
     assert idx["TEST0105"]["filename"] == "" and idx["TEST0105"]["authors"] == []
     assert idx["TEST0105"]["creators"] == []
+    # item_key: the parent item's key, or the attachment's own for a standalone file
+    assert {k: v["item_key"] for k, v in idx.items()} == {
+        "TEST0101": "TEST0001",
+        "TEST0102": "TEST0002",
+        "TEST0103": "TEST0103",
+        "TEST0104": "TEST0104",
+        "TEST0105": "TEST0105",
+    }
 
 
 def test_missing_database_raises_and_creates_nothing(tmp_path):

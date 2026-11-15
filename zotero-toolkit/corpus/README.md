@@ -433,6 +433,7 @@ the `storage/<KEY>/` folder name and the `<KEY>` prefix of a corpus file.
     "tags": ["tag1", "tag2"],
     "abstract": "First 1500 characters of the abstract",
     "source": "parent",
+    "item_key": "WXYZ6789",
     "orphan": true
   }
 }
@@ -449,6 +450,7 @@ the `storage/<KEY>/` folder name and the `<KEY>` prefix of a corpus file.
 | `tags` | list of strings | Tag names. |
 | `abstract` | string | `abstractNote`, cut to 1500 characters. |
 | `source` | `"parent"` or `"standalone"` | Whether the metadata came from the parent item or from the attachment itself. |
+| `item_key` | string | The key of the Zotero item the file belongs to: the parent item's, or the attachment's own for a standalone file. The MCP lookups accept it as well as the attachment key. Entries carried forward from an older file may lack it. |
 | `orphan` | `true`, optional | Present only on entries carried forward from the previous file for keys that Zotero no longer has. |
 
 Every attachment type is included, not just PDFs. Metadata comes from the parent item

@@ -395,6 +395,36 @@ def test_find_paper_moves_items_the_exact_key_lookup_knows(fake_lightrag, load_s
     assert "- BBBB0002 · He, Kaiming" in indexed and "(none)" in zotero
 
 
+def test_find_paper_takes_the_zotero_item_key(
+    fake_lightrag, load_server, metadata_file
+):
+    meta = json.loads(metadata_file.read_text(encoding="utf-8"))
+    meta["AAAA0001"]["item_key"] = "PPPP0001"  # the Zotero item the PDF belongs to
+    meta["BBBB0002"]["item_key"] = "PPPP0002"
+    meta["DDDD0004"] = {  # a second file of the same item
+        **meta["BBBB0002"],
+        "filename": "He - 2016 - supplement.pdf",
+        "doi": "",
+    }
+    metadata_file.write_text(json.dumps(meta), encoding="utf-8")
+    fake_lightrag.routes[("GET", "/graph/papers/search")] = _papers_route(
+        [VASWANI_PAPER]
+    )
+    srv = load_server()
+    indexed, zotero = srv.find_paper("pppp0001").split("In Zotero but NOT indexed")
+    assert "- AAAA0001 · Vaswani, Ashish; Shazeer, Noam et al. (2017)." in indexed
+    assert "(none)" in zotero
+    # the server, which knows attachment keys only, was asked for the attachment's
+    asked = [r["params"] for r in fake_lightrag.calls("/graph/papers/search")]
+    assert {"q": "AAAA0001", "limit": "100"} in asked
+    _, zotero = srv.find_paper("PPPP0002").split("In Zotero but NOT indexed")
+    assert "- BBBB0002 · " in zotero and "- DDDD0004 · " in zotero
+
+
+def test_an_entry_without_an_item_key_never_matches_an_empty_key(load_server):
+    assert load_server()._metadata_matches("  ") == []  # METADATA has no item_key
+
+
 def test_find_paper_without_a_match_says_what_else_to_try(fake_lightrag, load_server):
     fake_lightrag.routes[("GET", "/graph/papers/search")] = lambda params: (200, [])
     out = load_server().find_paper("Nobody 2016")

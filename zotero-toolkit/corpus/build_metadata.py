@@ -5,6 +5,7 @@ build_metadata.py — (Re)generate zotero_metadata.json from zotero.sqlite.
 Maps every attachment's storage KEY -> its bibliographic metadata
 (title, authors, year, DOI, publication, tags, abstract), pulling from the
 attachment's PARENT item when present, else from the attachment itself.
+Each entry also names that item's key (item_key).
 
 Run this whenever your Zotero library changes, then re-run build_corpus.py.
 Zotero normally locks zotero.sqlite while it is running; if you get
@@ -80,12 +81,13 @@ def build(zotero_dir: str) -> dict:
     # a slug-derived citation (in one library a few percent of the documents,
     # mostly html, cited without authors/year/DOI).
     attachments = con.execute(
-        """SELECT ia.itemID, i.key, ia.parentItemID, ia.path
-           FROM itemAttachments ia JOIN items i ON i.itemID=ia.itemID"""
+        """SELECT ia.itemID, i.key, ia.parentItemID, ia.path, p.key
+           FROM itemAttachments ia JOIN items i ON i.itemID=ia.itemID
+           LEFT JOIN items p ON p.itemID=ia.parentItemID"""
     ).fetchall()
 
     index = {}
-    for iid, key, pid, path in attachments:
+    for iid, key, pid, path, parent_key in attachments:
         src = pid or iid
         fl = _fields(con, src)
         fn = (
@@ -112,6 +114,9 @@ def build(zotero_dir: str) -> dict:
             "tags": _tags(con, src),
             "abstract": (fl.get("abstractNote", "") or "")[:1500],
             "source": "parent" if pid else "standalone",
+            # the key of the Zotero item the file belongs to (its own for a standalone
+            # file): what Zotero and the upload route report, so lookups accept it too
+            "item_key": parent_key or key,
         }
     con.close()
     return index
