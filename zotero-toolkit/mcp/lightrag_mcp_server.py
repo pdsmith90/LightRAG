@@ -5,8 +5,8 @@ MCP client (Claude Code, Claude Desktop, other agents) over stdio.
 
 It's a thin, self-contained proxy over the LightRAG Server REST API. Seven tools:
 
-    search_library(query, mode, top_k, answer=False, include_graph=False,
-                   passages=8)         -> compiled citations, then the retrieved
+    search_library(query, mode="naive", top_k, answer=False, include_graph=False,
+                   passages=10)        -> compiled citations, then the retrieved
                                           passages (answer=True: the server's
                                           synthesized answer, with citations)
     paper_passages(paper, question)    -> up to 3 passages of ONE paper, ranked
@@ -101,9 +101,11 @@ MAX_TOP_K = max(1, int(os.environ.get("LIGHTRAG_MCP_MAX_TOP_K", "40")))
 MAX_CHARS = max(1000, int(os.environ.get("LIGHTRAG_MCP_MAX_CHARS", "48000")))
 # The server's paper lookup caps its answer at 100 papers.
 PAPER_SEARCH_LIMIT = 100
-# search_library's passages (the server's chunk_top_k), about 4 KB each.
-DEFAULT_PASSAGES = 8
-MAX_PASSAGES = 12
+# search_library's passages (the server's chunk_top_k), about 4 KB each. 10 fits comfortably
+# in MAX_CHARS (~35-40 KB) with the 2,000 tokens formerly allocated to KG entities/relations
+# reallocated to primary source passages (2026-11-16).
+DEFAULT_PASSAGES = 10
+MAX_PASSAGES = 14
 # Paper lookups are cached per request for PAPER_CACHE_TTL seconds.
 PAPER_CACHE_TTL = 120.0
 PAPER_CACHE_SIZE = 256
@@ -657,16 +659,16 @@ def _context(
     query: str, mode: str, top_k: int, passages: int, include_graph: bool = False
 ) -> str:
     """Retrieval only — no LLM answer."""
-    data = _post(
-        "/query",
-        {
-            "query": query,
-            "mode": mode,
-            "top_k": top_k,
-            "chunk_top_k": passages,
-            "only_need_context": True,
-        },
-    )
+    payload = {
+        "query": query,
+        "mode": mode,
+        "top_k": top_k,
+        "chunk_top_k": passages,
+        "only_need_context": True,
+        "max_entity_tokens": 1000 if include_graph else 1,
+        "max_relation_tokens": 1000 if include_graph else 1,
+    }
+    data = _post("/query", payload)
     return _render_context(data, include_graph)
 
 
@@ -1452,7 +1454,7 @@ def _paper_passages_text(lead_key: str, citation: str, data: dict) -> str:
 @mcp.tool(structured_output=False)
 def search_library(
     query: str,
-    mode: str = "mix",
+    mode: str = "naive",
     top_k: int = 10,
     answer: bool = False,
     include_graph: bool = False,
@@ -1482,12 +1484,12 @@ def search_library(
     search cannot show that a paper is absent. Display equations are not in the
     index (see paper_passages).
 
-    passages: how many passages to retrieve, default 8, 1 to 12. Each is about
-    4 KB, so the default result is about 30 KB. top_k does not change the result
+    passages: how many passages to retrieve, default 10, 1 to 14. Each is about
+    4 KB, so the default result is about 35-40 KB. top_k does not change the result
     size; passages does.
-    mode: 'mix' (default, KG + vectors — best), 'hybrid', 'local' (entity-centric),
-          'global' (theme/relationship-centric), or 'naive' (plain vector search).
-          Any other value falls back to 'mix'.
+    mode: 'naive' (default, fast vector search ~5 s — best for verification and claim checks),
+          'mix' (hybrid KG + lexical + vectors), 'hybrid', 'local' (entity-centric),
+          or 'global' (theme/relationship-centric). Any other value falls back to 'naive'.
     top_k: the knowledge-graph entities and relations retrieved, default 10,
     clamped to the proxy's configured maximum. Larger values fill the server's
     token budget with them and can starve document-chunk retrieval, leaving few or
@@ -1496,7 +1498,7 @@ def search_library(
     them they queue and can time out.
     Use this for questions about the *content* of the papers (methods, findings,
     who studied what, how concepts relate)."""
-    mode = mode if mode in VALID_MODES else "mix"
+    mode = mode if mode in VALID_MODES else "naive"
     top_k = _top_k(top_k)
     if not answer:
         passages = max(1, min(int(passages), MAX_PASSAGES))
@@ -1507,6 +1509,9 @@ def search_library(
             "query": query,
             "mode": mode,
             "top_k": top_k,
+            "chunk_top_k": passages,
+            "max_entity_tokens": 1000 if include_graph else 1,
+            "max_relation_tokens": 1000 if include_graph else 1,
             "user_prompt": "Do not generate a References section; "
             "references are appended programmatically.",
         },
