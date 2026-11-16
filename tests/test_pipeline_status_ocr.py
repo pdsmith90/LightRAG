@@ -3,14 +3,15 @@
 The nightly corpus build can spend hours on one scanned PDF and writes nothing to
 the pipeline until that document is done, so the endpoint folds what the build
 leaves on disk (via ``zotero_ocr_progress``) into the response: the lines are
-appended to ``history_messages`` and, when nothing else is driving the dialog,
-the newest one also becomes ``latest_message``.
+appended to ``history_messages`` only. ``latest_message`` is left exactly as the
+pipeline set it; the web UI renders ``history_messages`` alone.
 
 These tests pin the two things that make that safe:
 
 - the lines go into the per-request COPY of the status entry, never into the
   shared Manager history list (polling the dialog must not grow it), and
-- an active ingest message is not hidden behind an OCR line.
+- an active ingest message is not hidden behind an OCR line, because no OCR line
+  is ever promoted over ``latest_message``.
 
 Fixtures are a real (in-process) ``pipeline_status`` namespace and a fake
 ``get_ocr_progress_lines``; no Zotero, PDF, OCR service or bundle directory is
@@ -94,12 +95,15 @@ async def test_ocr_line_lands_in_history_and_never_in_the_shared_list(monkeypatc
     assert list(pipeline_status["history_messages"]) == [EXISTING_LINE]
 
 
-async def test_idle_pipeline_promotes_the_newest_ocr_line(monkeypatch):
-    response, _ = await _call_pipeline_status(
+async def test_idle_pipeline_does_not_override_latest_message(monkeypatch):
+    response, pipeline_status = await _call_pipeline_status(
         monkeypatch, busy=False, latest_message="", ocr_lines=[OCR_LINE]
     )
 
-    assert response.latest_message == OCR_LINE
+    # The OCR line lands in history only; nothing is promoted to latest_message.
+    assert response.history_messages == [EXISTING_LINE, OCR_LINE]
+    assert response.latest_message == ""
+    assert pipeline_status["latest_message"] == ""
 
 
 async def test_busy_pipeline_keeps_its_ingest_message_on_top(monkeypatch):

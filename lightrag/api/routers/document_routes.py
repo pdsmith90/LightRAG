@@ -6708,11 +6708,6 @@ def create_document_routes(
                 status_dict["history_messages"] = (
                     list(status_dict.get("history_messages") or []) + ocr_lines
                 )
-                # Never hide an ingest message that is driving the dialog; the
-                # OCR lines still land in history either way.
-                busy = bool(status_dict.get("busy"))
-                if not busy or not status_dict.get("latest_message"):
-                    status_dict["latest_message"] = ocr_lines[-1]
 
             # Ensure job_start is properly formatted as a string with timezone information
             if "job_start" in status_dict and status_dict["job_start"]:
