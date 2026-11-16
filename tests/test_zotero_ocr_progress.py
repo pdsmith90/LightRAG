@@ -10,6 +10,10 @@ flight the answer is an empty list.
 Best effort throughout: a missing, half-written, stale or unparseable page cache
 costs the line, never the call. Fixtures are invented; no Zotero, PDF or OCR
 service is involved.
+
+``ocr_line_to_append`` decides what the endpoint writes into the shared pipeline
+history: nothing while no document is in flight, the line once when it changes,
+and nothing on the next poll while it stays the same.
 """
 
 import json
@@ -18,13 +22,19 @@ import time
 
 import pytest
 
-from lightrag.zotero_ocr_progress import _clear_cache, get_ocr_progress_lines
+from lightrag.zotero_ocr_progress import (
+    OCR_LINE_PREFIX,
+    _clear_cache,
+    get_ocr_progress_lines,
+    ocr_line_to_append,
+)
 
 pytestmark = pytest.mark.offline
 
 NOW = 1_700_000_000.0
 
 INFLIGHT_LINE = "OCR in progress: scan.pdf: page 4 of 10 (40%)"
+EXISTING = "Starting document processing"
 
 
 @pytest.fixture(autouse=True)
@@ -197,3 +207,61 @@ def test_two_polls_within_five_seconds_serve_the_cached_answer(tmp_path):
 
     assert first == [INFLIGHT_LINE]
     assert second == first
+
+
+# ---------------------------------------------------------------------------
+# ocr_line_to_append: one history entry per change, in time order
+# ---------------------------------------------------------------------------
+
+
+def test_the_first_line_of_a_run_goes_into_an_empty_history():
+    assert ocr_line_to_append([INFLIGHT_LINE], []) == INFLIGHT_LINE
+
+
+def test_the_same_line_is_not_written_twice():
+    assert ocr_line_to_append([INFLIGHT_LINE], [INFLIGHT_LINE]) is None
+
+
+def test_pipeline_messages_below_the_line_do_not_make_it_write_again():
+    # The line is no longer the tail; the newest OCR entry alone decides.
+    history = [EXISTING, INFLIGHT_LINE, "Processing file 2/9: other.pdf"]
+    assert ocr_line_to_append([INFLIGHT_LINE], history) is None
+
+
+def test_a_changed_line_is_written_after_the_newest_entry():
+    history = [INFLIGHT_LINE, "Processing file 2/9: other.pdf"]
+    next_line = "OCR in progress: scan.pdf: page 5 of 10 (50%)"
+
+    assert ocr_line_to_append([next_line], history) == next_line
+
+
+def test_only_the_newest_ocr_entry_is_compared():
+    # A history that was cleared and reprinted leaves an older OCR entry above
+    # the current page; the current page is still a change.
+    history = [
+        INFLIGHT_LINE,
+        "Processing file 2/9: other.pdf",
+        "OCR in progress: scan.pdf: page 1 of 10 (10%)",
+    ]
+
+    assert ocr_line_to_append([INFLIGHT_LINE], history) == INFLIGHT_LINE
+
+
+def test_a_history_without_an_ocr_entry_gets_the_line():
+    assert ocr_line_to_append([INFLIGHT_LINE], [EXISTING]) == INFLIGHT_LINE
+
+
+def test_nothing_in_flight_writes_nothing():
+    assert ocr_line_to_append([], [INFLIGHT_LINE]) is None
+    assert ocr_line_to_append([], []) is None
+
+
+def test_every_line_carries_the_prefix_the_writer_looks_for(tmp_path):
+    # _inflight builds the text from OCR_LINE_PREFIX; if the two drift apart the
+    # writer stops recognising its own entries and re-appends the same line.
+    f = _page_cache(tmp_path, "papers-0123456789.jsonl", pages=10, done=4)
+    _age(f, NOW)
+    (line,) = get_ocr_progress_lines(tmp_path, now=NOW)
+
+    assert line.startswith(OCR_LINE_PREFIX)
+    assert ocr_line_to_append([line], [line]) is None

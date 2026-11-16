@@ -125,7 +125,7 @@ from lightrag.utils import (
 from lightrag.kg.shared_storage import append_pipeline_history
 from lightrag.utils_pipeline import count_active_documents, read_source_file_basename
 from lightrag import zotero_add
-from lightrag.zotero_ocr_progress import get_ocr_progress_lines
+from lightrag.zotero_ocr_progress import get_ocr_progress_lines, ocr_line_to_append
 from lightrag.api.admission import adopt_admission_ticket
 from lightrag.api.utils_api import get_combined_auth_dependency
 from ..config import global_args
@@ -6667,11 +6667,36 @@ def create_document_routes(
             status_dict["update_status"] = processed_update_status
 
             # Materialize history_messages to a regular list if it's a Manager
-            # ListProxy, then limit to latest 1000 with a truncation banner. A
-            # slice is one Manager RPC; list(proxy) walks the sequence protocol
-            # with one __getitem__ RPC per element (history can hold 10k lines).
+            # ListProxy. A slice is one Manager RPC; list(proxy) walks the
+            # sequence protocol with one __getitem__ RPC per element (history can
+            # hold 10k lines).
+            history_list = []
             if "history_messages" in status_dict:
                 history_list = status_dict["history_messages"][:]
+
+            # Zotero corpus OCR progress: the nightly build converts scanned PDFs
+            # page by page and can run for hours on one document, so what it
+            # leaves on disk is projected into one status line here. That line is
+            # written into the SHARED history list, once per change, so it takes
+            # its place in time order — later pipeline messages land below it,
+            # earlier ones above — instead of always sitting at the bottom of the
+            # response. An unchanged line (same document, same page) is already
+            # the newest OCR entry there and is not written again; nothing is
+            # written while no document is in flight.
+            try:
+                ocr_line = ocr_line_to_append(get_ocr_progress_lines(), history_list)
+            except Exception as e:  # a helper bug must never break the endpoint
+                logger.debug(f"Zotero OCR progress lines skipped: {e}")
+                ocr_line = None
+
+            if ocr_line:
+                append_pipeline_history(pipeline_status, ocr_line)
+                # The response shows it through the normal history path, once.
+                history_list.append(ocr_line)
+
+            # Limit the response to the latest 1000 messages, with a truncation
+            # banner. The shared list itself is already a bounded ring.
+            if "history_messages" in status_dict:
                 total_count = len(history_list)
 
                 if total_count > 1000:
@@ -6691,23 +6716,6 @@ def create_document_routes(
                 else:
                     # No truncation needed, return all messages
                     status_dict["history_messages"] = history_list
-
-            # Zotero corpus OCR progress: the nightly build converts scanned PDFs
-            # page by page and can run for hours on one document, so what it
-            # leaves on disk is projected into a few status lines here. The lines
-            # go into the per-request COPY built above — polling the dialog must
-            # never grow the shared Manager history list.
-            try:
-                ocr_lines = get_ocr_progress_lines()
-            except Exception as e:  # a helper bug must never break the endpoint
-                logger.debug(f"Zotero OCR progress lines skipped: {e}")
-                ocr_lines = []
-
-            if ocr_lines:
-                # History lines carry no timestamp prefix (see the append sites).
-                status_dict["history_messages"] = (
-                    list(status_dict.get("history_messages") or []) + ocr_lines
-                )
 
             # Ensure job_start is properly formatted as a string with timezone information
             if "job_start" in status_dict and status_dict["job_start"]:

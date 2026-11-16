@@ -11,6 +11,10 @@ deferred list stay on disk for days after a build, so they describe work that is
 not happening now and would sit in the dialog forever; with no document in
 flight the answer is an empty list.
 
+The line is also the one thing the dialog writes back: the endpoint appends it to
+the shared pipeline history once per change, so it takes its place in time order
+with the pipeline's own messages instead of always sitting at the bottom.
+
 Fork-local (no upstream counterpart), stdlib only, and best effort throughout: a
 missing, half-written, stale or unparseable file costs its own line, never the
 call. The bundle directory is the explicit argument when the caller has one, else
@@ -40,6 +44,10 @@ _cache: dict[str, tuple[float, list[str]]] = {}
 # A page cache not appended to for this long is not an in-flight document: a
 # killed worker leaves one behind, and the dialog must not show it forever.
 _INFLIGHT_MAX_AGE = 900.0
+
+# Every line this module returns starts with this, which is how the history
+# writer recognises the newest OCR entry already in the pipeline log.
+OCR_LINE_PREFIX = "OCR in progress:"
 
 
 def _clear_cache() -> None:
@@ -89,7 +97,7 @@ def _inflight(bundle: Path, now: float) -> list[str]:
     done = min(done, pages)
     pct = int(done * 100 / pages)
     return [
-        f"OCR in progress: {os.path.basename(path)}: page {done} of {pages} ({pct}%)"
+        f"{OCR_LINE_PREFIX} {os.path.basename(path)}: page {done} of {pages} ({pct}%)"
     ]
 
 
@@ -134,3 +142,27 @@ def get_ocr_progress_lines(
     with _lock:
         _cache[key] = (mono + _CACHE_INTERVAL, lines)
     return list(lines)
+
+
+def ocr_line_to_append(lines: list[str], history: list[str]) -> str | None:
+    """The OCR line to write into the shared pipeline history now, or ``None``.
+
+    The dialog polls this line, and each answer is appended to the pipeline's
+    history so it lands in time order with the pipeline's own messages. That
+    must happen once per change: an unchanged answer (same document, same page)
+    is already the newest OCR entry in the log and is skipped, and a poll with
+    nothing in flight writes nothing.
+
+    The newest OCR entry is found in `history` (oldest first) rather than
+    remembered in a module global: the server runs several worker processes over
+    one shared history list, so per-process state would write every change once
+    per worker. Reading the log also keeps the answer right after the pipeline
+    clears or trims its history.
+    """
+    line = " | ".join(lines)
+    if not line:
+        return None
+    for entry in reversed(history):
+        if isinstance(entry, str) and entry.startswith(OCR_LINE_PREFIX):
+            return None if entry == line else line
+    return line
