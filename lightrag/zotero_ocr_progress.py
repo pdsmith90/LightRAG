@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -48,6 +49,25 @@ _INFLIGHT_MAX_AGE = 900.0
 # Every line this module returns starts with this, which is how the history
 # writer recognises the newest OCR entry already in the pipeline log.
 OCR_LINE_PREFIX = "OCR in progress:"
+
+# Zotero names a file ``<Author> - <Year> - <Title>.pdf``; the year may carry a
+# letter suffix for several works by the same author in one year.
+_YEAR_RE = re.compile(r"^\d{4}[a-z]?$")
+
+
+def _short_name(basename: str) -> str:
+    """``<Author> <Year>`` from a Zotero ``<Author> - <Year> - <Title>.pdf`` name.
+
+    The dialog is narrow and the title is what pushes the line past its width,
+    so only author and year are kept. A name that is not that shape is reported
+    with its extension dropped and nothing else changed: an unrecognised name is
+    better than a guessed one.
+    """
+    name = basename[:-4] if basename.lower().endswith(".pdf") else basename
+    parts = name.split(" - ", 2)
+    if len(parts) == 3 and _YEAR_RE.fullmatch(parts[1].strip()):
+        return f"{parts[0].strip()} {parts[1].strip()}"
+    return name
 
 
 def _clear_cache() -> None:
@@ -97,7 +117,8 @@ def _inflight(bundle: Path, now: float) -> list[str]:
     done = min(done, pages)
     pct = int(done * 100 / pages)
     return [
-        f"{OCR_LINE_PREFIX} {os.path.basename(path)}: page {done} of {pages} ({pct}%)"
+        f"{OCR_LINE_PREFIX} {_short_name(os.path.basename(path))}: "
+        f"page {done} of {pages} ({pct}%)"
     ]
 
 

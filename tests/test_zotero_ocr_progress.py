@@ -25,6 +25,7 @@ import pytest
 from lightrag.zotero_ocr_progress import (
     OCR_LINE_PREFIX,
     _clear_cache,
+    _short_name,
     get_ocr_progress_lines,
     ocr_line_to_append,
 )
@@ -33,7 +34,7 @@ pytestmark = pytest.mark.offline
 
 NOW = 1_700_000_000.0
 
-INFLIGHT_LINE = "OCR in progress: scan.pdf: page 4 of 10 (40%)"
+INFLIGHT_LINE = "OCR in progress: scan: page 4 of 10 (40%)"
 EXISTING = "Starting document processing"
 
 
@@ -106,7 +107,7 @@ def test_in_flight_progress_never_exceeds_all_the_pages(tmp_path):
     _age(f, NOW)
 
     assert get_ocr_progress_lines(tmp_path, now=NOW) == [
-        "OCR in progress: scan.pdf: page 3 of 3 (100%)"
+        "OCR in progress: scan: page 3 of 3 (100%)"
     ]
 
 
@@ -129,7 +130,7 @@ def test_newest_page_cache_is_the_one_in_flight(tmp_path):
 
     lines = get_ocr_progress_lines(tmp_path, now=NOW)
 
-    assert lines == ["OCR in progress: new.pdf: page 3 of 5 (60%)"]
+    assert lines == ["OCR in progress: new: page 3 of 5 (60%)"]
 
 
 def test_equation_pass_cache_is_not_a_document(tmp_path):
@@ -230,7 +231,7 @@ def test_pipeline_messages_below_the_line_do_not_make_it_write_again():
 
 def test_a_changed_line_is_written_after_the_newest_entry():
     history = [INFLIGHT_LINE, "Processing file 2/9: other.pdf"]
-    next_line = "OCR in progress: scan.pdf: page 5 of 10 (50%)"
+    next_line = "OCR in progress: scan: page 5 of 10 (50%)"
 
     assert ocr_line_to_append([next_line], history) == next_line
 
@@ -241,7 +242,7 @@ def test_only_the_newest_ocr_entry_is_compared():
     history = [
         INFLIGHT_LINE,
         "Processing file 2/9: other.pdf",
-        "OCR in progress: scan.pdf: page 1 of 10 (10%)",
+        "OCR in progress: scan: page 1 of 10 (10%)",
     ]
 
     assert ocr_line_to_append([INFLIGHT_LINE], history) == INFLIGHT_LINE
@@ -265,3 +266,43 @@ def test_every_line_carries_the_prefix_the_writer_looks_for(tmp_path):
 
     assert line.startswith(OCR_LINE_PREFIX)
     assert ocr_line_to_append([line], [line]) is None
+
+
+# ---------------------------------------------------------------------------
+# _short_name: author and year, not the title
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "basename, expected",
+    [
+        # The shape Zotero writes, and the reason the title is dropped: it would
+        # push the dialog's one line past its width.
+        (
+            "Backus et al. - 2005 - Foundations of Geomagnetism.pdf",
+            "Backus et al. 2005",
+        ),
+        # A title may itself contain ' - ' and ':', which must not be mistaken
+        # for the separators, and never reaches the answer anyway.
+        ("Smith - 2019 - Ocean - Atmosphere: A - B Study.pdf", "Smith 2019"),
+        ("Иванов - 2012 - Некоторые вопросы теории.pdf", "Иванов 2012"),
+        # Several works in one year carry a letter suffix on the year.
+        ("Doe - 2005a - Second Paper.pdf", "Doe 2005a"),
+        # Not that shape: keep the name, but still drop the extension.
+        ("Remote sensing method [E9TAYZ6G].pdf", "Remote sensing method [E9TAYZ6G]"),
+        ("Scan - draft.pdf", "Scan - draft"),
+        ("report.PDF", "report"),
+    ],
+)
+def test_short_name_keeps_author_and_year_only(basename, expected):
+    assert _short_name(basename) == expected
+
+
+def test_a_zotero_name_reaches_the_line_shortened(tmp_path):
+    path = "/pdfs/Backus et al. - 2005 - Foundations of Geomagnetism.pdf"
+    f = _page_cache(tmp_path, "papers-0123456789.jsonl", pages=384, done=191, path=path)
+    _age(f, NOW)
+
+    assert get_ocr_progress_lines(tmp_path, now=NOW) == [
+        "OCR in progress: Backus et al. 2005: page 191 of 384 (49%)"
+    ]
