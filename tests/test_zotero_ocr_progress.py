@@ -5,6 +5,10 @@ page cache per document in flight, its own build totals, a log of finished
 documents and a list of deferred ones. This module turns them into a few plain
 lines, best effort: a missing, half-written or stale file costs its own line,
 never the call. Fixtures are invented; no Zotero, PDF or OCR service is involved.
+
+Only a page cache being appended to right now means OCR is running, so the lines
+appear only then: the totals, the log and the deferred list outlive the build by
+days and are shown as its context, never on their own.
 """
 
 import json
@@ -17,6 +21,8 @@ from lightrag.zotero_ocr_progress import _clear_cache, get_ocr_progress_lines
 pytestmark = pytest.mark.offline
 
 NOW = 1_700_000_000.0
+
+INFLIGHT_LINE = "OCR in progress: scan.pdf: page 4 of 10 (40%)"
 
 
 @pytest.fixture(autouse=True)
@@ -60,21 +66,36 @@ def _age(f, mtime):
     os.utime(f, (mtime, mtime))
 
 
+def _inflight_cache(bundle, pages=10, done=4, path="/pdfs/scan.pdf"):
+    """A page cache appended to seconds ago: what says OCR is running right now."""
+    f = _page_cache(
+        bundle, "papers-0123456789.jsonl", pages=pages, done=done, path=path
+    )
+    _age(f, NOW)
+    return f
+
+
 def test_empty_bundle_has_nothing_to_say(tmp_path):
     assert get_ocr_progress_lines(tmp_path, now=NOW) == []
 
 
 def test_running_marker_comes_first(tmp_path):
     (tmp_path / ".corpus_build_running").write_text("", encoding="utf-8")
-    assert get_ocr_progress_lines(tmp_path, now=NOW) == ["OCR: corpus build running"]
+    _inflight_cache(tmp_path)
+
+    assert get_ocr_progress_lines(tmp_path, now=NOW) == [
+        "OCR: corpus build running",
+        INFLIGHT_LINE,
+    ]
 
 
 def test_a_leaked_running_marker_goes_quiet_after_twelve_hours(tmp_path):
     marker = tmp_path / ".corpus_build_running"
     marker.write_text("", encoding="utf-8")
     _age(marker, NOW - 13 * 3600)
+    _inflight_cache(tmp_path)
 
-    assert get_ocr_progress_lines(tmp_path, now=NOW) == []
+    assert get_ocr_progress_lines(tmp_path, now=NOW) == [INFLIGHT_LINE]
 
 
 def test_in_flight_document_reports_page_and_percent(tmp_path):
@@ -83,7 +104,7 @@ def test_in_flight_document_reports_page_and_percent(tmp_path):
 
     lines = get_ocr_progress_lines(tmp_path, now=NOW)
 
-    assert lines == ["OCR in progress: scan.pdf: page 4 of 10 (40%)"]
+    assert lines == [INFLIGHT_LINE]
 
 
 def test_in_flight_progress_never_exceeds_all_the_pages(tmp_path):
@@ -126,63 +147,77 @@ def test_equation_pass_cache_is_not_a_document(tmp_path):
 
 
 def test_build_totals_report_what_this_build_has_done(tmp_path):
+    _inflight_cache(tmp_path)
     _totals(tmp_path)
 
     assert get_ocr_progress_lines(tmp_path, now=NOW) == [
+        INFLIGHT_LINE,
         "OCR this build: 4 document(s), 130 page(s), 42 min of OCR "
-        "(started 2026-11-15 12:30)"
+        "(started 2026-11-15 12:30)",
     ]
 
 
 def test_build_totals_without_a_start_time_drop_the_parenthesis(tmp_path):
+    _inflight_cache(tmp_path)
     _totals(tmp_path, started="not a timestamp")
 
     assert get_ocr_progress_lines(tmp_path, now=NOW) == [
-        "OCR this build: 4 document(s), 130 page(s), 42 min of OCR"
+        INFLIGHT_LINE,
+        "OCR this build: 4 document(s), 130 page(s), 42 min of OCR",
     ]
 
 
 def test_build_totals_without_docs_or_pages_say_nothing(tmp_path):
+    _inflight_cache(tmp_path)
     _totals(tmp_path, docs_done="4")
 
-    assert get_ocr_progress_lines(tmp_path, now=NOW) == []
+    assert get_ocr_progress_lines(tmp_path, now=NOW) == [INFLIGHT_LINE]
 
 
 def test_a_week_old_build_totals_file_says_nothing(tmp_path):
+    _inflight_cache(tmp_path)
     f = _totals(tmp_path)
     _age(f, NOW - 8 * 86400)
 
-    assert get_ocr_progress_lines(tmp_path, now=NOW) == []
+    assert get_ocr_progress_lines(tmp_path, now=NOW) == [INFLIGHT_LINE]
 
 
 def test_corrupt_build_totals_say_nothing(tmp_path):
+    _inflight_cache(tmp_path)
     (tmp_path / "ocr_build_progress.json").write_text(
         '{"docs_done": 4', encoding="utf-8"
     )
 
-    assert get_ocr_progress_lines(tmp_path, now=NOW) == []
+    assert get_ocr_progress_lines(tmp_path, now=NOW) == [INFLIGHT_LINE]
 
 
 def test_bundle_dir_comes_from_the_environment_when_not_given(tmp_path, monkeypatch):
     (tmp_path / ".corpus_build_running").write_text("", encoding="utf-8")
+    _inflight_cache(tmp_path)
     monkeypatch.setenv("ZOTERO_OCR_BUNDLE", str(tmp_path))
 
-    assert get_ocr_progress_lines(now=NOW) == ["OCR: corpus build running"]
+    assert get_ocr_progress_lines(now=NOW) == [
+        "OCR: corpus build running",
+        INFLIGHT_LINE,
+    ]
 
 
 def test_an_empty_bundle_env_var_falls_back_to_the_working_directory(
     tmp_path, monkeypatch
 ):
+    _inflight_cache(tmp_path)
     (tmp_path / "ocr_vlm_deferred.txt").write_text("wait.pdf\n", encoding="utf-8")
     monkeypatch.setenv("ZOTERO_OCR_BUNDLE", "")
     monkeypatch.chdir(tmp_path)
 
     assert get_ocr_progress_lines(now=NOW) == [
-        "OCR deferred: 1 document(s) waiting for a free OCR lane"
+        INFLIGHT_LINE,
+        "OCR deferred: 1 document(s) waiting for a free OCR lane",
     ]
 
 
 def test_last_three_finished_documents_oldest_first(tmp_path):
+    _inflight_cache(tmp_path)
     log = tmp_path / "vm_weekly_update.log"
     log.write_text(
         "\n".join(
@@ -197,6 +232,7 @@ def test_last_three_finished_documents_oldest_first(tmp_path):
     lines = get_ocr_progress_lines(tmp_path, now=NOW)
 
     assert lines == [
+        INFLIGHT_LINE,
         "OCR done: c.pdf: 3 page(s) via pepperocr-vl (remote) in 30 s",
         "OCR done: d.pdf: 4 page(s) via pepperocr-vl (remote) in 40 s",
         "OCR done: e.pdf: 5 page(s) via pepperocr-vl (remote) in 50 s",
@@ -204,6 +240,7 @@ def test_last_three_finished_documents_oldest_first(tmp_path):
 
 
 def test_a_log_nobody_touched_for_a_week_says_nothing(tmp_path):
+    _inflight_cache(tmp_path)
     log = tmp_path / "vm_weekly_update.log"
     log.write_text(
         "[build_corpus] VLM-OCR old.pdf: 7 page(s) via pepperocr-vl (remote) in 70 s\n",
@@ -211,10 +248,11 @@ def test_a_log_nobody_touched_for_a_week_says_nothing(tmp_path):
     )
     _age(log, NOW - 8 * 86400)
 
-    assert get_ocr_progress_lines(tmp_path, now=NOW) == []
+    assert get_ocr_progress_lines(tmp_path, now=NOW) == [INFLIGHT_LINE]
 
 
 def test_a_finished_line_with_a_tail_still_matches(tmp_path):
+    _inflight_cache(tmp_path)
     log = tmp_path / "vm_weekly_update.log"
     log.write_text(
         "[build_corpus] VLM-OCR scan.pdf: 12 page(s) via pepperocr-vl (local) "
@@ -223,12 +261,14 @@ def test_a_finished_line_with_a_tail_still_matches(tmp_path):
     )
 
     assert get_ocr_progress_lines(tmp_path, now=NOW) == [
-        "OCR done: scan.pdf: 12 page(s) via pepperocr-vl (local) in 900 s"
+        INFLIGHT_LINE,
+        "OCR done: scan.pdf: 12 page(s) via pepperocr-vl (local) in 900 s",
     ]
 
 
 def test_a_cut_first_line_does_not_hide_the_matches_after_it(tmp_path):
     # The tail read starts mid-line when the log is bigger than the window.
+    _inflight_cache(tmp_path)
     log = tmp_path / "vm_weekly_update.log"
     log.write_text(
         "[build_corpus] VLM-OCR cut.pdf: 12 pa\n"
@@ -238,7 +278,8 @@ def test_a_cut_first_line_does_not_hide_the_matches_after_it(tmp_path):
     )
 
     assert get_ocr_progress_lines(tmp_path, now=NOW) == [
-        "OCR done: later.pdf: 4 page(s) via pepperocr-vl (remote) in 40 s"
+        INFLIGHT_LINE,
+        "OCR done: later.pdf: 4 page(s) via pepperocr-vl (remote) in 40 s",
     ]
 
 
@@ -266,32 +307,35 @@ def test_names_with_colons_and_cyrillic_survive(tmp_path):
 
 
 def test_deferred_documents_are_counted(tmp_path):
+    _inflight_cache(tmp_path)
     (tmp_path / "ocr_vlm_deferred.txt").write_text(
         "AAAA0001__one.pdf\n\nBBBB0002__two.pdf\nCCCC0003__three.pdf\n",
         encoding="utf-8",
     )
 
     assert get_ocr_progress_lines(tmp_path, now=NOW) == [
-        "OCR deferred: 3 document(s) waiting for a free OCR lane"
+        INFLIGHT_LINE,
+        "OCR deferred: 3 document(s) waiting for a free OCR lane",
     ]
 
 
 def test_empty_deferred_list_says_nothing(tmp_path):
+    _inflight_cache(tmp_path)
     (tmp_path / "ocr_vlm_deferred.txt").write_text("\n\n", encoding="utf-8")
 
-    assert get_ocr_progress_lines(tmp_path, now=NOW) == []
+    assert get_ocr_progress_lines(tmp_path, now=NOW) == [INFLIGHT_LINE]
 
 
-def test_unreadable_header_costs_only_its_own_line(tmp_path):
+def test_an_unreadable_page_cache_means_nothing_is_running(tmp_path):
+    # The newest cache cannot be read, so no document is provably in flight and
+    # the deferred list alone must not keep the OCR lines in the dialog.
     (tmp_path / "ocr_vlm_pages").mkdir()
     f = tmp_path / "ocr_vlm_pages" / "torn-0123456789.jsonl"
     f.write_bytes(b'{"path": "/pdfs/torn.pdf", "pages"\n{"i": 0}\n{"i": 1}\n')
     _age(f, NOW)
     (tmp_path / "ocr_vlm_deferred.txt").write_text("x.pdf\n", encoding="utf-8")
 
-    lines = get_ocr_progress_lines(tmp_path, now=NOW)
-
-    assert lines == ["OCR deferred: 1 document(s) waiting for a free OCR lane"]
+    assert get_ocr_progress_lines(tmp_path, now=NOW) == []
 
 
 def test_header_without_a_page_count_is_skipped(tmp_path):
@@ -299,6 +343,20 @@ def test_header_without_a_page_count_is_skipped(tmp_path):
     f = tmp_path / "ocr_vlm_pages" / "odd-0123456789.jsonl"
     f.write_text(json.dumps({"path": "/pdfs/odd.pdf"}) + "\n{}\n", encoding="utf-8")
     _age(f, NOW)
+
+    assert get_ocr_progress_lines(tmp_path, now=NOW) == []
+
+
+def test_no_lines_at_all_without_an_in_flight_page_cache(tmp_path):
+    # Every build artifact is present and fresh -- running marker, totals, log,
+    # deferred list -- but nothing is being converted, so the dialog stays clear.
+    (tmp_path / ".corpus_build_running").write_text("", encoding="utf-8")
+    _totals(tmp_path)
+    (tmp_path / "vm_weekly_update.log").write_text(
+        "[build_corpus] VLM-OCR done.pdf: 7 page(s) via pepperocr-vl (remote) in 70 s\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "ocr_vlm_deferred.txt").write_text("wait.pdf\n", encoding="utf-8")
 
     assert get_ocr_progress_lines(tmp_path, now=NOW) == []
 
@@ -325,6 +383,7 @@ def test_all_sources_in_order(tmp_path):
 
 
 def test_two_polls_within_five_seconds_serve_the_cached_answer(tmp_path):
+    _page_cache(tmp_path, "papers-0123456789.jsonl", pages=10, done=4)
     deferred = tmp_path / "ocr_vlm_deferred.txt"
     deferred.write_text("one.pdf\n", encoding="utf-8")
     first = get_ocr_progress_lines(tmp_path)
@@ -332,5 +391,8 @@ def test_two_polls_within_five_seconds_serve_the_cached_answer(tmp_path):
     deferred.write_text("one.pdf\ntwo.pdf\n", encoding="utf-8")
     second = get_ocr_progress_lines(tmp_path)
 
-    assert first == ["OCR deferred: 1 document(s) waiting for a free OCR lane"]
+    assert first == [
+        INFLIGHT_LINE,
+        "OCR deferred: 1 document(s) waiting for a free OCR lane",
+    ]
     assert second == first

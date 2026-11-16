@@ -7,6 +7,11 @@ running marker, the per-document page cache, its own build totals, its log and
 its deferred list -- into a few plain lines the web UI can show in the Pipeline
 Status dialog.
 
+Those lines are shown only while OCR is actually running, i.e. only while a page
+cache is being written: the totals, log and deferred list stay on disk for days
+after a build and would otherwise sit in the dialog forever, so they are shown as
+context for an in-flight document and not on their own.
+
 Fork-local (no upstream counterpart), stdlib only, and best effort throughout: a
 missing, half-written, stale or unparseable file costs its own line, never the
 call. The bundle directory is the explicit argument when the caller has one, else
@@ -208,20 +213,34 @@ def _deferred(bundle: Path) -> list[str]:
 
 
 def _compute(bundle: Path, now: float) -> list[str]:
-    lines: list[str] = []
-    sources = (
+    # A page cache appended to moments ago is the ONLY trace that says OCR is
+    # running; every other source is a build artifact that survives for days.
+    # Without one, show nothing at all -- no totals, no log, no deferred count.
+    try:
+        inflight = _inflight(bundle, now)
+    except Exception as e:  # a broken bundle must not break the dialog
+        logger.debug(f"zotero_ocr_progress: _inflight failed for {bundle}: {e}")
+        inflight = []
+    if not inflight:
+        return []
+
+    head: list[str] = []
+    tail: list[str] = []
+    for fn, args in (
         (_running, (bundle, now)),
-        (_inflight, (bundle, now)),
         (_build_totals, (bundle, now)),
         (_done_lines, (bundle, now)),
         (_deferred, (bundle,)),
-    )
-    for fn, args in sources:
+    ):
         try:
-            lines.extend(fn(*args))
+            lines = fn(*args)
         except Exception as e:  # a broken bundle must not break the dialog
             logger.debug(f"zotero_ocr_progress: {fn.__name__} failed for {bundle}: {e}")
-    return lines
+            continue
+        # The running marker, when present, is the first line; the in-flight
+        # document follows it and precedes the build's context lines.
+        (head if fn is _running else tail).extend(lines)
+    return head + inflight + tail
 
 
 def get_ocr_progress_lines(
