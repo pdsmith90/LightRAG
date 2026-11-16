@@ -726,13 +726,24 @@ def test_old_server_lead_adds_title_words_when_family_and_year_tie(
 
 def test_search_library_sends_passages_as_chunk_top_k(fake_lightrag, load_server):
     srv = load_server()
-    assert srv.DEFAULT_PASSAGES == 8
+    assert srv.DEFAULT_PASSAGES == 10
     srv.search_library("q")
     srv.search_library("q", passages=3)
     srv.search_library("q", passages=99)
     srv.search_library("q", passages=0)
     sent = [c["json"]["chunk_top_k"] for c in fake_lightrag.calls("/query")]
-    assert sent == [8, 3, 12, 1]
+    assert sent == [10, 3, 14, 1]
+
+
+def test_search_library_answer_sends_the_same_passage_limits(
+    fake_lightrag, load_server
+):
+    srv = load_server()
+    srv.search_library("q", answer=True)
+    srv.search_library("q", answer=True, passages=99)
+    srv.search_library("q", answer=True, passages=0)
+    sent = [c["json"]["chunk_top_k"] for c in fake_lightrag.calls("/query")]
+    assert sent == [10, 14, 1]
 
 
 def test_search_library_strips_headers_and_merges_duplicate_copies(

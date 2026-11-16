@@ -199,10 +199,12 @@ def test_context_lists_every_source_in_server_order_before_context(
     body = fake_lightrag.calls("/query")[0]["json"]
     assert body == {
         "query": "attention",
-        "mode": "mix",
+        "mode": "naive",
         "top_k": 10,
-        "chunk_top_k": 8,
+        "chunk_top_k": 10,
         "only_need_context": True,
+        "max_entity_tokens": 1,
+        "max_relation_tokens": 1,
     }
 
 
@@ -683,11 +685,11 @@ def test_valid_modes_pass_through(fake_lightrag, load_server, mode):
 
 
 @pytest.mark.parametrize("mode", ["bypass", "graph", "", "MIXED"])
-def test_invalid_modes_fall_back_to_mix(fake_lightrag, load_server, mode):
+def test_invalid_modes_fall_back_to_naive(fake_lightrag, load_server, mode):
     srv = load_server()
     srv.search_library("q", mode=mode)
     srv.search_library("q", mode=mode, answer=True)
-    assert {c["json"]["mode"] for c in fake_lightrag.calls("/query")} == {"mix"}
+    assert {c["json"]["mode"] for c in fake_lightrag.calls("/query")} == {"naive"}
 
 
 @pytest.mark.parametrize(

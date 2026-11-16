@@ -1500,8 +1500,8 @@ def search_library(
     who studied what, how concepts relate)."""
     mode = mode if mode in VALID_MODES else "naive"
     top_k = _top_k(top_k)
+    passages = max(1, min(int(passages), MAX_PASSAGES))
     if not answer:
-        passages = max(1, min(int(passages), MAX_PASSAGES))
         return _context(query, mode, top_k, passages, include_graph)
     data = _post(
         "/query",
