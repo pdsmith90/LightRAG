@@ -1403,3 +1403,89 @@ async def test_a_chunk_with_stored_records_is_attributed_from_them():
     assert repairer.relation_chunks.data[
         make_relation_chunk_key("scale height", "thermosphere")
     ]["chunk_ids"] == ["c1"]
+
+
+async def test_stored_records_attribute_names_the_fold_changed():
+    """Fork (extraction contract): the records extraction stores name what the
+    merge wrote, after ENTITY_NAME_FOLD, so a folded name (``Soil moisture``
+    for the LLM's ``Soil Moisture``) is attributed from them."""
+    from lightrag import entity_name_fold
+    from lightrag.operate import extract_entities
+    from lightrag.prompt import resolve_entity_extraction_prompt_profile
+    from lightrag.utils import CHUNK_KG_RECORDS_FIELD
+
+    async def llm(prompt, system_prompt=None, history_messages=None, **_):
+        return json.dumps(
+            {
+                "entities": [
+                    {"name": "Soil Moisture", "type": "concept", "description": "s"},
+                    {"name": "Water Cycle", "type": "concept", "description": "w"},
+                ],
+                "relationships": [
+                    {
+                        "source": "Soil Moisture",
+                        "target": "Water Cycle",
+                        "keywords": "part_of",
+                        "description": "s in w",
+                    }
+                ],
+            }
+        )
+
+    class _Rows:
+        def __init__(self):
+            self.rows = {"c1": {"content": "Soil moisture and the water cycle."}}
+
+        async def get_by_id(self, key):
+            return self.rows.get(key)
+
+        async def upsert(self, rows):
+            self.rows.update(rows)
+
+    config = {
+        "role_llm_funcs": {r: llm for r in ("extract", "keyword", "query", "vlm")},
+        "entity_extract_max_gleaning": 0,
+        "entity_extract_max_records": 100,
+        "entity_extract_max_entities": 40,
+        "addon_params": {},
+        "llm_model_max_async": 1,
+        "entity_extraction_use_json": True,
+        "kg_extraction_validator": lambda key, text, nodes, edges: (nodes, edges),
+        "_entity_extraction_prompt_profile": resolve_entity_extraction_prompt_profile(
+            {}, True
+        ),
+    }
+    chunk = {
+        "tokens": 10,
+        "content": "Soil moisture and the water cycle.",
+        "full_doc_id": "doc-1",
+        "chunk_order_index": 0,
+    }
+    rows = _Rows()
+    entity_name_fold.load_fold_map(
+        [("Soil moisture", "concept", 10), ("Water cycle", "concept", 3)]
+    )
+    try:
+        await extract_entities({"c1": chunk}, config, text_chunks_storage=rows)
+    finally:
+        entity_name_fold.disarm()
+
+    chunks = {
+        "c1": {
+            "content": chunk["content"],
+            "llm_cache_list": [],
+            CHUNK_KG_RECORDS_FIELD: rows.rows["c1"][CHUNK_KG_RECORDS_FIELD],
+        }
+    }
+    graph = _Graph(["Soil moisture", "Water cycle"], [("Soil moisture", "Water cycle")])
+    repairer = _Repairer(
+        docs={"doc-1": _Doc(["c1"])}, chunks=chunks, cache={}, graph=graph
+    )
+
+    await _repair(repairer)
+
+    assert repairer.entity_chunks.data["Soil moisture"]["chunk_ids"] == ["c1"]
+    assert repairer.entity_chunks.data["Water cycle"]["chunk_ids"] == ["c1"]
+    assert repairer.relation_chunks.data[
+        make_relation_chunk_key("Soil moisture", "Water cycle")
+    ]["chunk_ids"] == ["c1"]
