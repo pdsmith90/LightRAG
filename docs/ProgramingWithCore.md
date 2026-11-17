@@ -769,14 +769,16 @@ Contract:
   caller supplies the graph directly — so it is not filtered.
 - **It runs once per chunk, at extraction** (fork). With a hook set, extraction
   stores with each chunk the records the hook returned (with the multimodal
-  links added after it), in the text-chunk field `kg_records`. The knowledge
+  links added after it, under the names `ENTITY_NAME_FOLD` gave them when it
+  is on), in the text-chunk field `kg_records`. The knowledge
   rebuild after a document deletion (and the kept-summary and rollback
   rebuilds) reads those records and never calls the hook, so a hook that is
   changed, removed or raising later does not change what a deletion rebuilds,
   and a hook need not decide the same way twice. A chunk extracted without a
   hook (and without the extraction contract) stores nothing and is rebuilt
   from its cached LLM output, as before. A failure to store the records fails
-  the chunk. See *Rebuilding from stored records* in `ZLIGHTRAG.md`.
+  the document's extraction. See *Rebuilding from stored records* in
+  `ZLIGHTRAG.md`.
 - **Multimodal entities are not shown to the hook.** For a drawing / table /
   equation chunk, LightRAG synthesizes one entity from the sidecar and links it
   to the chunk's surviving entities. That injection happens *after* the hook, so

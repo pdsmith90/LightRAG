@@ -5422,7 +5422,7 @@ async def write_chunk_kg_records(
     the field out of its general chunk reads and writes (PostgreSQL) has
     ``write_kg_records``; on the others the field lives in the chunk document,
     which is read and written back with it. Raises when the row is missing or
-    the write fails: the chunk's extraction must then fail."""
+    the write fails: the document's extraction must then fail."""
     write = getattr(text_chunks_storage, "write_kg_records", None)
     if write is not None:
         await write(chunk_id, records)

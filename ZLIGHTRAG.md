@@ -445,7 +445,8 @@ names, case-folded. The rename and the grounding depend on the chunk's text, so 
 can be kept in one chunk and renamed in another.
 
 The hook runs once per chunk, at extraction. Its result (with the multimodal links added
-after it) is stored with the chunk, and the knowledge rebuild after a document deletion,
+after it, under the names `ENTITY_NAME_FOLD` gave them when it is on) is stored with the
+chunk, and the knowledge rebuild after a document deletion,
 the kept-summary rebuild of a re-ingest and the rollback purge read that and never call
 the hook (*Rebuilding from stored records*): a renamed or dropped name's records are
 found under the name the graph holds, so a deletion leaves the edge and its nodes with
