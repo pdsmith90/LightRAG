@@ -281,13 +281,16 @@ RELATION_KEYWORD_COUNTS = (
     "checked",
     "normalized",
     "multi_type",
+    "inverse",
     "related_to",
     "dropped",
 )
 
 
 def check_relation_keywords(
-    keywords: str, types: Mapping[str, str]
+    keywords: str,
+    types: Mapping[str, str],
+    inverses: Mapping[str, str] | None = None,
 ) -> tuple[str | None, str | None]:
     """One LLM-extracted relation's ``keywords`` checked against the declared
     relation list: ``(keywords to store, or None to drop the relation; the
@@ -298,9 +301,18 @@ def check_relation_keywords(
     ``member of`` match nothing). A field of one keyword that matches is
     rewritten to the declared spelling (``normalized``). A field of several
     keywords keeps the declared types among them, in their order, and loses the
-    rest (``multi_type``); several spellings of one type are ``normalized``. A
-    field with no declared type becomes ``related_to`` when the list declares
-    it, and is otherwise dropped with its relation (``dropped``)."""
+    rest (``multi_type``); several spellings of one type are ``normalized``.
+
+    ``inverses`` is the two-way table of the profile's ``relationship_inverses``
+    (``inverse_table``). A field whose only names on the list are inverse names
+    (``has_part``: "B has_part A") is the relation read the other way round: it
+    is stored as the forward types (``part_of``) and the change is ``inverse``,
+    which tells the caller to swap the pair. In a field that also names a
+    declared type the inverse names are off-list keywords (``multi_type``).
+
+    A field with no declared type (and no inverse name) becomes ``related_to``
+    when the list declares it, and is otherwise dropped with its relation
+    (``dropped``)."""
     tokens = [token.strip() for token in keywords.split(",") if token.strip()]
     declared_by_fold = {name.casefold(): name for name in types}
     declared = list(
@@ -310,6 +322,21 @@ def check_relation_keywords(
             if token.casefold() in declared_by_fold
         )
     )
+    if not declared and inverses:
+        forward_by_fold = {
+            name.casefold(): forward
+            for name, forward in inverses.items()
+            if name not in types
+        }
+        forward = list(
+            dict.fromkeys(
+                forward_by_fold[token.casefold()]
+                for token in tokens
+                if token.casefold() in forward_by_fold
+            )
+        )
+        if forward:
+            return ",".join(forward), "inverse"
     if not declared:
         if "related_to" in types:
             return "related_to", "related_to"
@@ -322,19 +349,23 @@ def check_relation_keywords(
 
 
 def check_chunk_relation_keywords(
-    maybe_edges: dict, types: Mapping[str, str], counts: Counter | None = None
+    maybe_edges: dict,
+    types: Mapping[str, str],
+    counts: Counter | None = None,
+    inverses: Mapping[str, str] | None = None,
 ) -> dict:
     """``check_relation_keywords`` applied to every record of one parsed
     extraction result (``(source, target) -> [edge records]``). Returns a new
     dict without the dropped records (and without a pair left with none); the
-    records are copied when their keywords change. ``counts`` gains one
-    ``checked`` per record and one per change (``RELATION_KEYWORD_COUNTS``)."""
+    records are copied when their keywords change. A record written with
+    inverse names (``inverses``, the two-way table) moves to the swapped pair,
+    with ``src_id``/``tgt_id`` swapped and the forward types. ``counts`` gains
+    one ``checked`` per record and one per change (``RELATION_KEYWORD_COUNTS``)."""
     checked: dict = {}
     for edge_key, records in maybe_edges.items():
-        kept = []
         for record in records:
             keywords, change = check_relation_keywords(
-                str(record.get("keywords") or ""), types
+                str(record.get("keywords") or ""), types, inverses
             )
             if counts is not None:
                 counts["checked"] += 1
@@ -342,11 +373,18 @@ def check_chunk_relation_keywords(
                     counts[change] += 1
             if keywords is None:
                 continue
-            if keywords != record.get("keywords"):
+            key = edge_key
+            if change == "inverse":
+                key = (edge_key[1], edge_key[0])
+                record = {
+                    **record,
+                    "src_id": key[0],
+                    "tgt_id": key[1],
+                    "keywords": keywords,
+                }
+            elif keywords != record.get("keywords"):
                 record = {**record, "keywords": keywords}
-            kept.append(record)
-        if kept:
-            checked[edge_key] = kept
+            checked.setdefault(key, []).append(record)
     return checked
 
 

@@ -466,6 +466,42 @@ async def test_merge_pass_rules():
     assert edges[("B", "A")] == first[("B", "A")]
 
 
+@pytest.mark.parametrize(
+    "first_desc,glean_desc,kept",
+    [
+        ("a long first-pass description", "short", "first"),
+        ("short", "a longer gleaning description", "glean"),
+        ("same", "four", "first"),  # a tie keeps the earlier version
+    ],
+)
+async def test_a_reversed_symmetric_type_is_the_same_relation(
+    first_desc, glean_desc, kept
+):
+    """COLD1-05: the direction rule is for the types the inverse table names. A
+    symmetric type restated the other way round is the same relation: the
+    version with the longer description is kept, as for the same pair."""
+    first = _edge("A", "B", "related_to", first_desc)
+    glean = _edge("B", "A", "related_to", glean_desc)
+    edges = {("A", "B"): [first]}
+    await _merge_extraction_pass({}, edges, {}, {("B", "A"): [glean]}, TABLE)
+    assert edges == (
+        {("A", "B"): [first]} if kept == "first" else {("B", "A"): [glean]}
+    )
+
+    # a mix of a directed and a symmetric type is a second relation, kept beside
+    first = _edge("A", "B", "part_of, related_to", "first")
+    edges = {("A", "B"): [first]}
+    await _merge_extraction_pass(
+        {}, edges, {}, {("B", "A"): [_edge("B", "A", "related_to")]}, TABLE
+    )
+    assert edges == {("A", "B"): [first], ("B", "A"): [_edge("B", "A", "related_to")]}
+
+    # without the table both directions stay, as extraction always kept them
+    edges = {("A", "B"): [_edge("A", "B", "related_to", first_desc)]}
+    await _merge_extraction_pass({}, edges, {}, {("B", "A"): [glean]}, None)
+    assert set(edges) == {("A", "B"), ("B", "A")}
+
+
 # ------------------------------------------------------------ F3-03: the keyword check
 
 TYPES = load_entity_extraction_prompt_profile(CONTRACT_SAMPLE)["relationship_types"]
@@ -489,11 +525,48 @@ WITHOUT_RELATED = {k: v for k, v in TYPES.items() if k != "related_to"}
             "has_part",
             TYPES,
             ("related_to", "related_to"),
-        ),  # inverse names are not on the list
+        ),  # without the inverse table, inverse names are not on the list
     ],
 )
 def test_check_relation_keywords(keywords, types, expected):
     assert check_relation_keywords(keywords, types) == expected
+
+
+@pytest.mark.parametrize(
+    "keywords,types,expected",
+    [
+        ("has_part", TYPES, ("part_of", "inverse")),
+        ("Has_Part", TYPES, ("part_of", "inverse")),
+        ("used_by, member of", TYPES, ("uses", "inverse")),
+        ("has_part", {"part_of": "x"}, ("part_of", "inverse")),
+        # a field that names a declared type keeps it; the inverse name is off-list
+        ("uses, has_part", TYPES, ("uses", "multi_type")),
+        ("part_of", TYPES, ("part_of", None)),
+        ("member of", TYPES, ("related_to", "related_to")),
+    ],
+)
+def test_check_relation_keywords_reads_inverse_names(keywords, types, expected):
+    """COLD1-06: an inverse name is the forward type read the other way round."""
+    assert check_relation_keywords(keywords, types, TABLE) == expected
+
+
+def test_an_inverse_name_swaps_the_pair():
+    counts = Counter()
+    record = _edge("Constellation", "GRACE", "has_part", "The group holds GRACE.")
+    checked = check_chunk_relation_keywords(
+        {("Constellation", "GRACE"): [record]}, TYPES, counts, TABLE
+    )
+    assert checked == {
+        ("GRACE", "Constellation"): [
+            {
+                **record,
+                "src_id": "GRACE",
+                "tgt_id": "Constellation",
+                "keywords": "part_of",
+            }
+        ]
+    }
+    assert counts == Counter(checked=1, inverse=1)
 
 
 def test_check_chunk_relation_keywords_counts_and_drops():
@@ -512,7 +585,7 @@ def test_check_chunk_relation_keywords_counts_and_drops():
     assert counts == Counter(checked=4, normalized=1, dropped=2)
     assert relation_keyword_changes(counts) == (
         "3 of 4 relation keywords were not exactly one declared relationship type "
-        "(normalized=1, multi_type=0, related_to=0, dropped=2)"
+        "(normalized=1, multi_type=0, inverse=0, related_to=0, dropped=2)"
     )
     assert relation_keyword_changes(Counter(checked=4)) is None
 
@@ -578,6 +651,7 @@ async def test_extraction_checks_keywords_and_reports_the_document(
         "checked": 3,
         "normalized": 1,
         "multi_type": 1,
+        "inverse": 0,
         "related_to": 1,
         "dropped": 0,
     }

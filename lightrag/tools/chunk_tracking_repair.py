@@ -891,6 +891,7 @@ async def _accumulate_cached_attribution(
                         timestamp=timestamp,
                         chunk_data=chunk_data_by_id.get(chunk_id),
                         relationship_types=relationship_types,
+                        relation_inverses=relation_inverses,
                     )
                 except Exception as exc:
                     logger.warning(

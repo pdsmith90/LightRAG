@@ -1099,6 +1099,7 @@ async def _process_json_extraction_result(
     timestamp: int,
     file_path: str = "unknown_source",
     parsed: dict[str, Any] | None = None,
+    join_keyword_lists: bool = False,
 ) -> tuple[dict, dict]:
     """Process a JSON-formatted extraction result from LLM.
 
@@ -1118,6 +1119,10 @@ async def _process_json_extraction_result(
             and cache rebuild has to tell those apart. ``None`` means "not
             supplied" and is unambiguous: the helper always returns a dict,
             so an unrecoverable payload still arrives here as ``{}``.
+        join_keyword_lists: Fork (extraction contract): read a relation whose
+            ``keywords`` field is a JSON list as its elements, comma-separated,
+            so the contract's keyword check sees the types. False (without the
+            contract) stores the string of the list, as before.
 
     Returns:
         tuple: (nodes_dict, edges_dict) containing the extracted entities and relationships
@@ -1253,8 +1258,11 @@ async def _process_json_extraction_result(
                 )
                 continue
 
+            raw_keywords = rel_data.get("keywords", "")
+            if join_keyword_lists and isinstance(raw_keywords, list):
+                raw_keywords = ",".join(str(keyword) for keyword in raw_keywords)
             edge_keywords = sanitize_and_normalize_extracted_text(
-                str(rel_data.get("keywords", "")), remove_inner_quotes=True
+                str(raw_keywords), remove_inner_quotes=True
             )
             edge_keywords = edge_keywords.replace("，", ",")
 
@@ -1328,30 +1336,50 @@ async def _merge_extraction_pass(
     added.
 
     Fork (extraction contract): with ``relationship_inverses`` in the profile
-    (``relation_inverses`` is its two-way table) direction is the payload, so a
-    pass that states a pair the other way round with the same type is a
-    correction: each earlier record of the reversed pair whose types the pass
-    restates is removed (the pair with it, when none is left). A reversed pair
-    of another type is a second relation and stays beside the first. A pass
-    that itself states both orders of a pair corrects neither. Without the table
-    the merge is the one extraction always made."""
+    (``relation_inverses`` is its two-way table) direction is the payload of the
+    types the table names, so a pass that states a pair the other way round
+    with such a type is a correction: each earlier record of the reversed pair
+    whose types are all directed and all restated by the pass is removed (the
+    pair with it, when none is left). A symmetric type (one the table does not
+    name) has no direction: when the pass's records of the pair and the earlier
+    records of the reversed pair are all of symmetric types, the two are the
+    same relation and the one with the longer first description is kept, as
+    for the same pair (a tie keeps the earlier one). Any other reversed pair
+    (another directed type, or a mix of directed and symmetric types) is a
+    second relation and stays beside the first. A pass that itself states both
+    orders of a pair corrects neither. Without the table the merge is the one
+    extraction always made."""
+    superseded: set[tuple[str, str]] = set()
     if relation_inverses:
+
+        def symmetric(records: list[dict]) -> bool:
+            return all(
+                _keyword_types(r) and not _keyword_types(r) & relation_inverses.keys()
+                for r in records
+            )
+
         for (src, tgt), records in pass_edges.items():
             reverse = (tgt, src)
             if reverse in pass_edges or not maybe_edges.get(reverse):
                 continue
             restated = frozenset().union(*(_keyword_types(r) for r in records))
+            directed = restated & relation_inverses.keys()
             kept = [
                 record
                 for record in maybe_edges[reverse]
-                if not (_keyword_types(record) and _keyword_types(record) <= restated)
+                if not (_keyword_types(record) and _keyword_types(record) <= directed)
             ]
-            if len(kept) == len(maybe_edges[reverse]):
-                continue
-            if kept:
-                maybe_edges[reverse] = kept
-            else:
+            if not kept:
                 del maybe_edges[reverse]
+                continue
+            maybe_edges[reverse] = kept
+            if (src, tgt) not in maybe_edges and symmetric(records) and symmetric(kept):
+                kept_desc_len = len(kept[0].get("description", "") or "")
+                pass_desc_len = len(records[0].get("description", "") or "")
+                if pass_desc_len > kept_desc_len:
+                    del maybe_edges[reverse]
+                else:
+                    superseded.add((src, tgt))
 
     for i, (entity_name, pass_entities) in enumerate(pass_nodes.items(), start=1):
         if maybe_nodes.get(entity_name):
@@ -1369,7 +1397,10 @@ async def _merge_extraction_pass(
         await _cooperative_yield(i, every=8)
 
     for i, (edge_key, pass_edge_list) in enumerate(pass_edges.items(), start=1):
-        if maybe_edges.get(edge_key):
+        if edge_key in superseded:
+            # The earlier version of this symmetric relation was the better one.
+            pass
+        elif maybe_edges.get(edge_key):
             # Compare description lengths and keep the better one
             original_desc_len = len(
                 maybe_edges[edge_key][0].get("description", "") or ""
@@ -1569,6 +1600,7 @@ async def rebuild_knowledge_from_chunks(
                     chunk_data=chunk_data_by_id.get(chunk_id),
                     relationship_types=relationship_types,
                     relation_keyword_counts=relation_keyword_counts,
+                    relation_inverses=relation_inverses,
                 )
                 if kg_extraction_validator is None:
                     # Fork (ENTITY_NAME_FOLD): cached results carry the spelling
@@ -2027,6 +2059,7 @@ async def _rebuild_from_extraction_result(
     chunk_data: dict[str, Any] | None = None,
     relationship_types: dict[str, str] | None = None,
     relation_keyword_counts: Counter | None = None,
+    relation_inverses: dict[str, str] | None = None,
 ) -> tuple[dict, dict]:
     """Parse cached extraction result using the same logic as extract_entities.
 
@@ -2040,18 +2073,26 @@ async def _rebuild_from_extraction_result(
         chunk_id: The chunk ID for source tracking
         relationship_types: Fork (extraction contract): the active profile's
             relation list; the relations' keywords are checked against it as
-            extraction checks them (``check_chunk_relation_keywords``), and the
-            changes counted in ``relation_keyword_counts``. None: no check.
+            extraction checks them (``check_chunk_relation_keywords``, a JSON
+            list of keywords read as its elements), and the changes counted in
+            ``relation_keyword_counts``. None: no check.
+        relation_inverses: Fork (extraction contract): the two-way table of the
+            profile's ``relationship_inverses``, for the check's inverse names.
 
     Returns:
         Tuple of (entities_dict, relationships_dict)
     """
     nodes, edges = await _parse_cached_extraction_result(
-        text_chunks_storage, extraction_result, chunk_id, timestamp, chunk_data
+        text_chunks_storage,
+        extraction_result,
+        chunk_id,
+        timestamp,
+        chunk_data,
+        join_keyword_lists=bool(relationship_types),
     )
     if relationship_types:
         edges = check_chunk_relation_keywords(
-            edges, relationship_types, relation_keyword_counts
+            edges, relationship_types, relation_keyword_counts, relation_inverses
         )
     return nodes, edges
 
@@ -2062,6 +2103,7 @@ async def _parse_cached_extraction_result(
     chunk_id: str,
     timestamp: int,
     chunk_data: dict[str, Any] | None,
+    join_keyword_lists: bool = False,
 ) -> tuple[dict, dict]:
     """The parser half of ``_rebuild_from_extraction_result``."""
 
@@ -2090,6 +2132,7 @@ async def _parse_cached_extraction_result(
             timestamp,
             file_path,
             parsed=parsed,
+            join_keyword_lists=join_keyword_lists,
         )
         # A successful parse (tolerant_load_json_dict's own non-empty-dict
         # signal) is accepted even when it legitimately yields no nodes/edges.
@@ -4695,6 +4738,7 @@ async def extract_entities(
                 chunk_key,
                 timestamp,
                 file_path,
+                join_keyword_lists=bool(relationship_types),
             )
         else:
             maybe_nodes, maybe_edges = await _process_extraction_result(
@@ -4707,7 +4751,10 @@ async def extract_entities(
             )
         if relationship_types:
             maybe_edges = check_chunk_relation_keywords(
-                maybe_edges, relationship_types, relation_keyword_counts
+                maybe_edges,
+                relationship_types,
+                relation_keyword_counts,
+                relation_inverses,
             )
 
         # Process additional gleaning results only 1 time when entity_extract_max_gleaning is greater than zero.
@@ -4774,6 +4821,7 @@ async def extract_entities(
                     chunk_key,
                     timestamp,
                     file_path,
+                    join_keyword_lists=bool(relationship_types),
                 )
             else:
                 glean_nodes, glean_edges = await _process_extraction_result(
@@ -4787,7 +4835,10 @@ async def extract_entities(
 
             if relationship_types:
                 glean_edges = check_chunk_relation_keywords(
-                    glean_edges, relationship_types, relation_keyword_counts
+                    glean_edges,
+                    relationship_types,
+                    relation_keyword_counts,
+                    relation_inverses,
                 )
 
             # Merge results - compare description lengths to choose better version
