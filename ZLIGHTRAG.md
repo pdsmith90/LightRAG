@@ -377,7 +377,7 @@ The write paths and what each does with the key:
 | gleaning merge (`_merge_extraction_pass`) | within one chunk, a gleaning relation that states a first-pass relation's pair the other way round with a directed type (one the mapping names) removes each first-pass record of the reversed pair whose types are all directed and all restated (the gleaning turn is the correction). A symmetric type has no direction: when both sides are of symmetric types only, the reversed restatement is the same relation and the version with the longer description is kept, as for the same pair (a tie keeps the first pass). Any other reversed relation (another directed type, or a mix of directed and symmetric types) is a second relation and is kept beside the first |
 | extraction merge (`merge_nodes_and_edges`) | at the end of each chunk's extraction every relation record gets `reverse_keywords`, its keywords read the other way round (the inverse names, resolved with the table then; `add_reverse_keywords`); the merge puts each record into sorted order with `oriented_record`, which swaps the pair and takes `reverse_keywords` when the sort flips it, so the stored edge's keywords read in stored order |
 | rebuild after a deletion, the kept-summary rebuild and the rollback rebuild (`rebuild_knowledge_from_chunks`, `_rebuild_single_relationship`) | a chunk extracted under the contract has its stored records read (*Rebuilding from stored records*), each oriented by the same `oriented_record` from what the record carries, so the direction, a gleaning correction included, is what extraction stored whatever the profile says now; a chunk extracted without the contract is re-parsed from its cache as it was, without the rule and without inversion; the edge is written back in sorted order |
-| `ENTITY_NAME_FOLD` and `KG_CONTRACT_VALIDATOR` renames | no change needed: both rename endpoints before the merge and keep the extracted direction, so the merge orients the renamed pair |
+| `ENTITY_NAME_FOLD` and `KG_CONTRACT_VALIDATOR` renames | no change needed: both rename endpoints before the merge and keep the extracted direction, so the merge orients the renamed pair; the stored records carry the renamed pair, so a rebuild orients the same pair |
 | entity rename (`edit_entity`), entity merge (`merge_entities`, and `edit_entity` with `allow_merge`) | the stored keywords read in the old sorted pair; the renamed or redirected pair is re-sorted, inverted when it flips, and written in sorted order before duplicates are joined |
 | `create_relation`, `edit_relation`, `insert_custom_kg` | keywords given with (source, target) read "source keywords target"; they are inverted when the stored order is the other way, and the edge is written in sorted order |
 
@@ -473,13 +473,14 @@ When. Only while the profile declares `relationship_types` or a `kg_extraction_v
 is set (`KG_CONTRACT_VALIDATOR`). Without either nothing is written, and the chunk rows
 and the rebuild are those of the base branch (for PostgreSQL see *Storages*).
 
-What. One chunk's records as extraction hands them to the merge: after the first-pass
-parse and its keyword check, the gleaning parse, its check and the gleaning merge with
-its direction rule, the hook, and the multimodal links (the base rebuild does not make
-those again, so they are stored too), and before `ENTITY_NAME_FOLD` (the rebuild files
-them under both spellings with `alias_chunk_result`, as it files cached results). What
-was accepted is what is stored: a truncated gleaning reply that was merged but not cached
-is in the records.
+What. One chunk's records as the merge consumes them: after the first-pass parse and
+its keyword check, the gleaning parse, its check and the gleaning merge with its
+direction rule, the hook, the multimodal links (the base rebuild does not make those
+again, so they are stored too) and `ENTITY_NAME_FOLD`. What was accepted is what is
+stored: a truncated gleaning reply that was merged but not cached is in the records; a
+relation whose two ends the fold joined into one name, which the merge never sees, is
+not. The records are written for all of a document's chunks after the fold and before
+its extraction returns, so no chunk reaches the merge without them.
 
 Where. In the text-chunk row, field `kg_records` (`utils.CHUNK_KG_RECORDS_FIELD`), so it
 is deleted with the chunk. Its value has a fixed shape (no key varies per chunk):
@@ -494,16 +495,17 @@ is deleted with the chunk. Its value has a fixed shape (no key varies per chunk)
 ```
 
 A record holds those keys only (the ones it has); `entity_name` and `src_id`/`tgt_id` are
-the name and the pair it is filed under, in the spelling the model wrote (or the hook
-gave). `keywords` read from `src_id` to `tgt_id`; `reverse_keywords` read from `tgt_id`
-to `src_id`, resolved with the inverse names at extraction (the same keywords without
-`relationship_inverses`). The graph stores each pair sorted: an edge (a, b) gets a
-relation's `keywords` when `src_id <= tgt_id` and its `reverse_keywords` otherwise
-(`kg_contract.oriented_record`; the extraction merge and the rebuild both use it), so the
-stored graph can be checked against the stored records without the profile. Measured on
-5,988 chunks of the production cache (7,918 first-pass and gleaning replies): 3.8 kB of
-JSON per chunk on average (median 3.5 kB, 95th percentile 10.9 kB, largest 49 kB), 1.2 kB
-as PostgreSQL stores it compressed.
+the name and the pair it is filed under: the ones the merge wrote to, the model's
+spelling as the hook and the fold left it. The model's own spelling is not kept (the
+extraction cache has it). `keywords` read from `src_id` to `tgt_id`; `reverse_keywords`
+read from `tgt_id` to `src_id`, resolved with the inverse names at extraction (the same
+keywords without `relationship_inverses`). The graph stores each pair sorted: an edge
+(a, b) gets a relation's `keywords` when `src_id <= tgt_id` and its `reverse_keywords`
+otherwise (`kg_contract.oriented_record`; the extraction merge and the rebuild both use
+it, on the same stored pair), so the stored graph can be checked against the stored
+records without the profile. Measured on 5,988 chunks of the production cache (7,918
+first-pass and gleaning replies): 3.8 kB of JSON per chunk on average (median 3.5 kB,
+95th percentile 10.9 kB, largest 49 kB), 1.2 kB as PostgreSQL stores it compressed.
 
 Storages. JSON, Redis and OpenSearch keep the field in the chunk document: a row read and
 written back keeps it, and the pipeline's upsert of a re-created chunk (a document
@@ -520,17 +522,29 @@ it. Because the PostgreSQL upsert leaves the column alone, extraction clears the
 for a document's chunks before it extracts them, in every configuration, whenever the
 column exists (one statement per document), and a rebuild reads it with one statement.
 
-Lifecycle. A records write that fails fails that chunk's extraction, and so the document,
-which is retried as any failed document. A chunk extracted again with neither contract
-nor hook keeps no records (the document store replaced it; PostgreSQL cleared it) and is
-rebuilt from its cache.
+Lifecycle. A records write that fails fails the document's extraction, which is retried
+as any failed document. A process that stops between the write and the merge leaves
+the document unfinished: it is processed again (its records cleared or replaced first)
+or deleted with its chunks. A chunk extracted again with neither contract nor hook
+keeps no records (the document store replaced it; PostgreSQL cleared it) and is rebuilt
+from its cache.
 
 The rebuild. Each surviving chunk with stored records contributes them, whatever the
-configuration is now: nothing reads the current relation list, inverse table or hook for
-it, and it needs no extraction cache. Stored records of an unknown shape make the chunk
-unusable, as an unparseable cache does. A chunk without them is re-parsed from its cache
-as on the base branch. An entity or relation fed by both kinds gets each chunk's
-contribution its own way, which is how extraction merged them.
+configuration is now: nothing reads the current relation list, inverse table, hook or
+name fold for it, and it needs no extraction cache. Its records are filed under their
+stored names, which are the graph's, so with `ENTITY_NAME_FOLD` off, its map not armed
+within the wait, a key whose canonical spelling moved or another alias file, the rebuild
+finds them as it does with the map extraction used. Stored records of an unknown shape
+make the chunk unusable, as an unparseable cache does. A chunk without them is re-parsed
+from its cache as on the base branch and filed under the model's spelling and the
+spellings the fold map in force gives it (`alias_chunk_result`). An entity or relation
+fed by both kinds gets each chunk's contribution its own way: with the fold off or
+changed, a re-parsed chunk's contribution to a name the fold changed is not found (its
+chunk id stays), as on the base branch, while a chunk with records still contributes.
+
+The `lightrag-repair-chunk-tracking` tool attributes a chunk with stored records from
+them, names the fold changed included; a chunk without them from its cache, where a
+name the fold changed gets no attribution, as on the base branch.
 
 Chunks extracted before. Every chunk extracted before this rule, with or without the
 contract (production has none with it), carries no records and is rebuilt from its
@@ -538,7 +552,8 @@ cache, as the base branch rebuilds it: switching the contract or the hook on doe
 change what a deletion rebuilds for them. Re-ingest those documents to give them
 records. Switching the contract or the hook on does not re-check,
 re-key or rename anything already in the graph; switching it off, or changing the list,
-the inverse names or the hook, changes nothing for chunks that have records. Tests:
+the inverse names, the hook or the name fold, changes nothing for chunks that have
+records. Tests:
 `tests/extraction/test_kg_contract_reproduce.py`,
 `tests/kg/test_chunk_kg_records_storage.py`, and
 `tests/kg/postgres_impl/test_pg_kg_records_smoke.py` for the PostgreSQL column
@@ -599,10 +614,11 @@ best-ranked member), used when a name's own key is in neither the aliases nor th
 the key is then registered to that canonical. A key new to the map takes the
 best-ranked of the chunk's spellings of it, not the first one seen.
 
-Applied where results leave `extract_entities`, so the write-ahead anchors and the merge
-name the same nodes, and as an alias in the knowledge rebuild, which files each cached
-record under its original and its canonical name (and its legacy key's canonical when
-that is a third name). Changing the key rules or the lists
+Applied where results leave `extract_entities`, so the write-ahead anchors, the merge
+and the records stored with each chunk (*Rebuilding from stored records*) name the same
+nodes, and as an alias in the knowledge rebuild, which files each cached record of a
+chunk without stored records under its original and its canonical name (and its legacy
+key's canonical when that is a third name). Changing the key rules or the lists
 changes keys: existing variant nodes are not merged by the switch itself.
 
 ### Sidecar relations
