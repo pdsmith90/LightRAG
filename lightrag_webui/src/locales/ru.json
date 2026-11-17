@@ -164,6 +164,7 @@
         "parse": "Разбор",
         "analyze": "Анализ",
         "process": "Обработка",
+        "deleting": "Удаление",
         "failed": "Ошибка"
       },
       "status": {
@@ -174,6 +175,7 @@
         "analyzing": "Анализ",
         "processing": "Обработка",
         "pending": "Ожидание",
+        "deleting": "Удаление",
         "failed": "Ошибка"
       },
       "errors": {

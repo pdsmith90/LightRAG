@@ -2,7 +2,7 @@
 
 `zlightrag` is the default branch of this fork of
 [LightRAG](https://github.com/HKUDS/LightRAG). It is upstream LightRAG's `main` as of
-2026-10-14 (commit `aaebfe1bb`, which reports version **1.5.8**; upstream has tagged no
+2026-11-17 (commit `31bff1f60`, which reports version **1.5.8**; upstream has tagged no
 1.5.8 release) plus the changes listed below, and a `zotero-toolkit/` directory. Together they run LightRAG
 as a research knowledge base over a [Zotero](https://www.zotero.org) library: answers
 cite real bibliographic entries, reference-list text is kept out of the answer
@@ -180,7 +180,9 @@ specifically named work is a source, or, for an ambiguous naming, when any tied 
 With `LL_KEYWORDS_FALLBACK=true`, a `local`, `hybrid` or `mix` query whose keyword
 extraction returned no low-level keywords runs its entity leg on the high-level
 keywords instead of skipping it (`_fallback_low_level_keywords` in
-`lightrag/operate.py`). Off by default.
+`lightrag/operate.py`). Off by default. Upstream now applies the same fallback to every
+such query (`_resolve_kg_search_queries`), so the switch changes only the keywords
+reported with the answer and its cache key, not what is retrieved.
 
 ### Per-request rerank floor
 
@@ -585,8 +587,8 @@ Its offline tests run from
 ## How this branch follows upstream
 
 The changes above were rebuilt onto the v1.5.7 release tag on 2026-09-26, and the
-branch has since taken upstream `main` once, by merge (`aaebfe1bb`, merged
-2026-10-19). Its history is no longer rewritten: a rebuild onto a new base is published
+branch has since taken upstream `main` by merge, most recently `31bff1f60` (merged
+2026-11-17). Its history is no longer rewritten: a rebuild onto a new base is published
 as a merge commit whose tree is the rebuild's, so any commit you pin stays on the
 branch.
 
