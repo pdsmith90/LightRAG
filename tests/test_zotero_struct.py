@@ -549,6 +549,83 @@ async def test_a_topic_named_by_words_takes_the_best_match():
     assert nothing["reason"] == "no_topic"
 
 
+def _topic(tid, name, parent="subfield:1908"):
+    return {
+        "topic_id": tid,
+        "display_name": name,
+        "level": "topic",
+        "parent_id": parent,
+    }
+
+
+def _tables_with_topics(*topics):
+    """The shared tables plus topics (which hold no papers)."""
+    return dict(TABLES, topics=TABLES["topics"] + list(topics))
+
+
+# a short word is a whole word of the name, not a piece of one
+SHORT_WORD_TOPICS = (
+    _topic("topic:M1", "Random Matrices and Applications"),
+    _topic("topic:I1", "Arctic and Antarctic ice dynamics"),
+    _topic("topic:P1", "Pulsars and Gravitational Waves Research"),
+    _topic("topic:S1", "Sea Level Change"),
+)
+
+
+async def test_a_short_topic_word_matches_whole_words_only():
+    rag = _rag(_DB(_tables_with_topics(*SHORT_WORD_TOPICS)))
+    ice = await zs.papers_by_topic(rag, "ice")
+    assert ice["topic"]["topic_id"] == "topic:I1" and ice["alternatives"] == []
+    sea = await zs.papers_by_topic(rag, "SEA")
+    assert sea["topic"]["topic_id"] == "topic:S1" and sea["alternatives"] == []
+    listed = await zs.list_topics(rag, "ice")
+    assert [t["topic_id"] for t in listed["topics"]] == ["topic:I1"]
+    # a word of four letters or more may be the start of a name word
+    assert (await zs.list_topics(rag, "geoph"))["total"] == 1
+    assert (await zs.list_topics(rag, "arct antarc"))["total"] == 1
+    assert (await zs.list_topics(rag, "geo"))["total"] == 0
+    # every word must match
+    assert (await zs.list_topics(rag, "ice sea"))["total"] == 0
+    assert (await zs.list_topics(rag, "ice dynamics"))["total"] == 1
+
+
+async def test_topics_rank_exact_name_then_whole_words_then_paper_count():
+    rag = _rag(
+        _DB(
+            _tables_with_topics(
+                _topic("topic:W1", "Gravity Measurements Overview"),
+                _topic("topic:W2", "Gravity"),
+                _topic("topic:W3", "Gravitation theory"),
+            )
+        )
+    )
+    found = await zs.list_topics(rag, "gravity")
+    # the exact name, then the names with the word spelled out by papers
+    # (topic:T1 has 4 primary papers, topic:T2 2, topic:W1 none)
+    assert [t["topic_id"] for t in found["topics"]] == [
+        "topic:W2",
+        "topic:T1",
+        "topic:T2",
+        "topic:W1",
+    ]
+    # "gravit" is a start of three name words: no whole-word match, then by papers
+    started = await zs.list_topics(rag, "gravit")
+    assert [t["topic_id"] for t in started["topics"]][0] == "topic:T1"
+    assert {t["topic_id"] for t in started["topics"]} >= {"topic:W3"}
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\t", " - "])
+async def test_a_blank_topic_is_no_topic(blank):
+    result = await zs.papers_by_topic(_rag(), blank)
+    assert result["reason"] == "no_topic" and result["papers"] == []
+
+
+def test_a_blank_topic_is_no_topic_on_the_route():
+    client, headers = _client(_rag())
+    r = client.get("/graph/papers/by_topic?topic=%20%20", headers=headers)
+    assert r.status_code == 200 and r.json()["reason"] == "no_topic"
+
+
 # --- connect ----------------------------------------------------------------
 
 
@@ -815,7 +892,9 @@ async def test_map_links_keep_every_seed_link_and_each_papers_strongest():
     view = result["paper"]
     total = N_AROUND + N_AROUND * (N_AROUND - 1) // 2
     assert (view["n_links"], view["shown_links"]) == (total, len(result["edges"]))
-    assert view["shown_links"] < total and result["is_truncated"]
+    # links were thinned, but every paper is shown: that is not a truncation
+    assert view["shown_links"] < total and view["links_thinned"]
+    assert not result["is_truncated"]
     pairs = _pairs(result)
     assert len(pairs) == len(result["edges"])  # an edge kept for both ends: once
     assert all(
@@ -841,7 +920,7 @@ async def test_the_edge_total_is_capped_and_the_weakest_other_links_go_first(
     capped = await zs.paper_map(rag, ["10.1/s"], max_nodes=N_AROUND + 1)
     assert len(capped["edges"]) == N_AROUND + 1
     assert capped["paper"]["n_links"] == full["paper"]["n_links"]
-    assert capped["is_truncated"]
+    assert capped["paper"]["links_thinned"] and not capped["is_truncated"]
     seed_links = {e["id"] for e in capped["edges"] if "10.1/s" in e["id"].split("-")}
     assert len(seed_links) == N_AROUND  # the seed's links stay
     dropped = [
@@ -857,7 +936,83 @@ async def test_the_edge_total_is_capped_and_the_weakest_other_links_go_first(
 async def test_a_map_with_few_links_is_not_thinned():
     result = await zs.paper_map(_rag(), ["10.1/a"])
     assert result["paper"]["n_links"] == result["paper"]["shown_links"] == 5
-    assert not result["is_truncated"]
+    assert not result["is_truncated"] and not result["paper"]["links_thinned"]
+
+
+def _floating_tables():
+    """Seed s cites five papers h0..h4 (one hop), each coupled with all thirty of
+    m00..m29 (two hops). m0k's links are all weaker than m(k+1)'s, so the cap
+    cuts the weakest papers' links first."""
+    hubs = [f"h{i}" for i in range(5)]
+    outer = [f"m{i:02d}" for i in range(30)]
+    coupled = [(h, m, (j + 1) / 100) for j, m in enumerate(outer) for h in hubs]
+    return _graph_tables(["s"] + hubs + outer, [("s", h) for h in hubs], coupled)
+
+
+async def test_the_edge_cap_leaves_no_shown_paper_without_its_strongest_link(
+    monkeypatch,
+):
+    monkeypatch.setattr(zs, "_EDGE_CAP_FACTOR", 1)
+    rag = _rag(_DB(_floating_tables()))
+    result = await zs.paper_map(rag, ["10.1/s"], hops=2, max_nodes=36)
+    assert len(result["nodes"]) == 36
+    linked = {end for e in result["edges"] for end in (e["source"], e["target"])}
+    assert {n["id"] for n in result["nodes"]} <= linked
+    view = result["paper"]
+    assert view["shown_links"] == len(result["edges"]) > 36  # a little above the cap
+    assert view["n_links"] == 5 + 5 * 30 and view["links_thinned"]
+    again = await zs.paper_map(rag, ["10.1/s"], hops=2, max_nodes=36)
+    assert [e["id"] for e in again["edges"]] == [e["id"] for e in result["edges"]]
+
+
+def _wide_tables(n=200):
+    names = [f"n{i:03d}" for i in range(n)]
+    return _graph_tables(["s"] + names, [("s", x) for x in names])
+
+
+async def test_a_map_shows_150_papers_unless_asked_for_more():
+    rag = _rag(_DB(_wide_tables()))
+    result = await zs.paper_map(rag, ["10.1/s"])
+    view = result["paper"]
+    assert len(result["nodes"]) == 150 and result["is_truncated"]
+    assert (view["n_papers"], view["shown_papers"]) == (201, 150)
+    assert (view["max_nodes"], view["max_nodes_cap"]) == (150, 1000)
+    assert result["nodes"][0]["id"] == "10.1/s"
+    more = await zs.paper_map(rag, ["10.1/s"], max_nodes=300)
+    assert len(more["nodes"]) == 201 and not more["is_truncated"]
+    assert more["paper"]["max_nodes"] == 300
+    # the server's own limit is the ceiling
+    rag.max_graph_nodes = 180
+    capped = await zs.paper_map(rag, ["10.1/s"], max_nodes=5000)
+    assert len(capped["nodes"]) == 180
+    assert (capped["paper"]["max_nodes"], capped["paper"]["max_nodes_cap"]) == (
+        180,
+        180,
+    )
+
+
+async def test_the_map_limit_does_not_follow_the_graph_viewers_node_limit():
+    # a server whose graph limit is 1000 still answers a map with 150 papers
+    rag = _rag(_DB(_wide_tables()))
+    assert rag.max_graph_nodes == 1000
+    assert len((await zs.paper_map(rag, ["10.1/s"]))["nodes"]) == 150
+
+
+async def test_a_server_object_without_a_node_limit_still_draws_the_map():
+    rag = _rag()
+    del rag.max_graph_nodes
+    result = await zs.paper_map(rag, ["10.1/a"])
+    assert len(result["nodes"]) == 5 and result["paper"]["max_nodes"] == 150
+
+
+async def test_a_node_reports_every_attachment_key_of_its_paper():
+    result = await zs.paper_map(_rag(), ["10.1/a"])
+    props = _node(result, "10.1/a")["properties"]
+    assert props["attachment_key"] == "AAAA0002"  # the one in the knowledge base
+    assert props["attachment_keys"] == ["AAAA0001", "AAAA0002"]
+    # a paper with no key sends none
+    island = await zs.paper_map(_rag(), ["zot:ITEM0001"])
+    assert _node(island, "KKKK0001")["properties"]["attachment_keys"] == ["KKKK0001"]
 
 
 async def test_the_map_is_encoded_in_the_worker_thread(monkeypatch):
@@ -957,6 +1112,16 @@ def test_the_map_answers_json_with_the_shape_of_the_function():
     assert r.headers["content-type"] == "application/json"
     expected = asyncio.run(zs.paper_map(rag, ["10.1/a"]))
     assert r.json() == expected
+
+
+def test_the_map_route_defaults_to_150_papers_and_takes_a_limit():
+    rag = _rag(_DB(_wide_tables()))
+    client, headers = _client(rag)
+    plain = client.get("/graphs/paper/map?paper=10.1/s", headers=headers).json()
+    assert len(plain["nodes"]) == 150 and plain["paper"]["max_nodes"] == 150
+    assert plain["is_truncated"] and plain["paper"]["n_papers"] == 201
+    more = client.get("/graphs/paper/map?paper=10.1/s&max_nodes=300", headers=headers)
+    assert len(more.json()["nodes"]) == 201
 
 
 def test_routes_pass_their_options():

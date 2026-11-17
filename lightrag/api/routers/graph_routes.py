@@ -542,7 +542,10 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
         level: Optional[Literal["domain", "field", "subfield", "topic"]] = Query(None),
         limit: int = Query(20, ge=1, le=zotero_struct.MAX_LIMIT),
     ):
-        """Topics whose name holds every word of ``q``, at any level or one (fork).
+        """Topics with a name word for every word of ``q``, at any level or one (fork).
+
+        A word matches a whole word of the name, or the start of one when it has
+        at least 4 letters.
 
         Each carries ``topic_id``, ``name``, ``level``, ``path`` (domain to
         topic), ``n_papers`` (papers with a topic under it) and ``n_primary``
@@ -605,17 +608,26 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             description="Zotero attachment key or DOI of a paper; repeat for several papers",
         ),
         hops: int = Query(1, ge=1, le=2),
-        max_nodes: int = Query(1000, description="Maximum nodes to return", ge=1),
+        max_nodes: int = Query(
+            zotero_struct.MAP_DEFAULT_NODES,
+            description="Maximum papers to return (the server's own node limit is the ceiling)",
+            ge=1,
+        ),
     ):
         """A graph of papers around a few papers: citations and coupling, one or two hops (fork).
 
         Returns the ``/graphs`` structure (papers as nodes, ``entity_type``
         the field of their primary topic) plus ``paper``, the chosen papers'
         summaries and the view's counts; ``paper.reason`` says why a graph
-        is empty or has no edges. Links are thinned: all of a chosen paper's,
-        the strongest few of every other paper, at most 4 x the node limit in
-        all (``paper.n_links`` found, ``paper.shown_links`` drawn;
-        ``is_truncated`` when links or papers were dropped).
+        is empty or has no edges. At most ``max_nodes`` papers (default 150,
+        never more than the server's node limit): the chosen ones, then the
+        strongest neighbours; ``is_truncated`` is true only when papers were left
+        out (``paper.n_papers`` found, ``paper.shown_papers`` shown,
+        ``paper.max_nodes`` the limit applied, ``paper.max_nodes_cap`` the
+        ceiling). Links are thinned: all of a chosen paper's, the strongest few
+        of every other paper, at most 4 x the paper limit in all, and every
+        shown paper keeps its strongest link (``paper.n_links`` found,
+        ``paper.shown_links`` drawn, ``paper.links_thinned``).
         """
         if any(len(p) > 300 for p in paper):
             raise HTTPException(status_code=422, detail="a paper id is too long")
@@ -623,9 +635,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
         # event loop never serialises a large graph.
         body = await _struct_call(
             f"getting the paper map for '{paper}'",
-            zotero_struct.paper_map(
-                rag, paper, hops, min(max_nodes, rag.max_graph_nodes), encode=True
-            ),
+            zotero_struct.paper_map(rag, paper, hops, max_nodes, encode=True),
         )
         return Response(content=body, media_type="application/json")
 

@@ -85,10 +85,14 @@ _HUB_PENALTY = 0.5
 # paper_map: a two-hop paper reached through u gains strength(u) * w(u, v)
 # / log2(2 + links of u). Links shown: every link of a chosen paper, the
 # _EDGES_PER_PAPER strongest of every other shown paper, and at most
-# _EDGE_CAP_FACTOR x the node limit in all.
+# _EDGE_CAP_FACTOR x the node limit in all, except that a shown paper with any
+# link among the shown papers keeps its strongest.
 _AUTHORS_SHOWN = 10
 _EDGES_PER_PAPER = 6
 _EDGE_CAP_FACTOR = 4
+# How many papers a map shows unless asked for more (the graph viewer's own node
+# limit does not apply to it: a few hundred papers is as many as can be read).
+MAP_DEFAULT_NODES = 150
 
 
 class Unavailable(Exception):
@@ -701,27 +705,44 @@ def _topic_row(st: _Struct, tid: str) -> dict:
     }
 
 
+_WORD_RE = re.compile(r"[^\W_]+")
+# A query word of at least this many letters also matches the start of a name word
+# ("geophys" finds Geophysics); a shorter one must be a whole word, so "ice" finds
+# no "matrices" and "sea" no "research".
+_PREFIX_MIN = 4
+
+
+def _words(text: str) -> list[str]:
+    return _WORD_RE.findall(fold(text))
+
+
 def _find_topics(st: _Struct, q: str, level: str | None) -> list[str]:
-    """Topic ids whose name holds every word of ``q`` (folded), exact names
-    first, then names starting with it, then by papers whose primary topic is
-    under them; without ``q`` every topic (of ``level``) by that count."""
-    words = fold(q).split()
-    exact = fold(q).strip()
+    """Topic ids with a name word for every word of ``q`` (folded; the word
+    itself, or its start when it has at least _PREFIX_MIN letters). A name equal
+    to ``q`` comes first, then names with every word spelled out, then the rest,
+    each by papers whose primary topic is under the topic, then by papers with a
+    topic under it; without ``q`` every topic (of ``level``) by those counts."""
+    words = _words(q)
     hits = []
     for tid, (name, lvl, _) in st.topics.items():
         if level and lvl != level:
             continue
-        folded = fold(name)
-        if all(w in folded for w in words):
-            hits.append(
-                (
-                    folded != exact,
-                    not folded.startswith(exact),
-                    -st.n_primary.get(tid, 0),
-                    -st.n_papers.get(tid, 0),
-                    tid,
-                )
+        have = _words(name)
+        whole = all(w in have for w in words)
+        if not whole and not all(
+            any(h == w or (len(w) >= _PREFIX_MIN and h.startswith(w)) for h in have)
+            for w in words
+        ):
+            continue
+        hits.append(
+            (
+                not words or have != words,
+                not whole,
+                -st.n_primary.get(tid, 0),
+                -st.n_papers.get(tid, 0),
+                tid,
             )
+        )
     return [h[-1] for h in sorted(hits)]
 
 
@@ -736,9 +757,10 @@ def _topics(st: _Struct, q: str, level: str | None, limit: int) -> dict:
 async def list_topics(
     rag, q: str = "", level: str | None = None, limit: int = 20
 ) -> dict:
-    """Topics at any level whose name holds every word of ``q``, with how many
-    papers have a topic under each and how many have their primary topic
-    under it. Raises :class:`Unavailable`."""
+    """Topics at any level with a name word for every word of ``q`` (a whole word,
+    or for a word of 4 or more letters its start), with how many papers have a
+    topic under each and how many have their primary topic under it. Raises
+    :class:`Unavailable`."""
     st = await _structure(rag)
     return await asyncio.to_thread(_topics, st, q or "", level, limit)
 
@@ -751,7 +773,7 @@ def _by_topic(
     if topic in st.topics:
         tid = topic
     else:
-        tids = _find_topics(st, topic, None)
+        tids = _find_topics(st, topic, None) if _words(topic) else []
         if not tids:
             return {"topic": None, "reason": "no_topic", "papers": [], "total": 0}
         tid, alternatives = tids[0], tids[1:6]
@@ -792,10 +814,11 @@ async def papers_by_topic(
 ) -> dict:
     """The papers under one topic: ``topic`` is a topic id at any level
     (``topic:T…``, ``subfield:…``, ``field:…``, ``domain:…``) or words of its
-    name (the best match is used; ``alternatives`` lists the next ones). A
+    name (matched as :func:`list_topics` does; the best match is used,
+    ``alternatives`` lists the next ones). A
     paper counts when one of its topics is the topic or below it;
     ``primary_only`` keeps papers whose primary topic is. ``reason:
-    "no_topic"`` when nothing matches. Raises :class:`Unavailable`."""
+    "no_topic"`` when nothing matches or ``topic`` is blank. Raises :class:`Unavailable`."""
     st = await _structure(rag)
     kb = await _kb_keys(rag)
     return await asyncio.to_thread(_by_topic, st, kb, topic, limit, primary_only)
@@ -1039,8 +1062,10 @@ def _thin_links(st: _Struct, shown: list[int], seeds: set[int], max_nodes: int) 
     every link of a chosen paper; of every other paper its _EDGES_PER_PAPER
     strongest (a link kept for either end counts once); then at most
     _EDGE_CAP_FACTOR x ``max_nodes`` in all, the weakest links of papers that
-    were not chosen going first. Strength is _link_weight, ties go to the
-    papers' ids. ``found`` counts all the links among the shown papers."""
+    were not chosen going first; but a shown paper with any link among the shown
+    papers keeps its strongest, so the total can exceed the cap by a few. Strength
+    is _link_weight, ties go to the papers' ids. ``found`` counts all the links
+    among the shown papers."""
     inside = set(shown)
     weight: dict[tuple[int, int], float] = {}
     for u in shown:
@@ -1061,12 +1086,29 @@ def _thin_links(st: _Struct, shown: list[int], seeds: set[int], max_nodes: int) 
     for pairs in own.values():
         kept.update(sorted(pairs, key=rank)[:_EDGES_PER_PAPER])
     ordered = sorted(kept, key=lambda p: (p not in chosen, *rank(p)))
-    kept = sorted(ordered[: _EDGE_CAP_FACTOR * max_nodes], key=rank)
-    return {"found": len(weight), "kept": kept}
+    kept = set(ordered[: _EDGE_CAP_FACTOR * max_nodes])
+    # The cap must not leave a paper floating: each shown paper that has a link
+    # keeps its strongest one.
+    best: dict[int, tuple[int, int]] = {}
+    for pair in weight:
+        for v in pair:
+            if v not in best or rank(pair) < rank(best[v]):
+                best[v] = pair
+    covered = {v for pair in kept for v in pair}
+    for v in shown:
+        if v in best and v not in covered:
+            kept.add(best[v])
+            covered.update(best[v])
+    return {"found": len(weight), "kept": sorted(kept, key=rank)}
 
 
 def _map_graph(
-    st: _Struct, kb: set[str], asked: list[str], hops: int, max_nodes: int
+    st: _Struct,
+    kb: set[str],
+    asked: list[str],
+    hops: int,
+    max_nodes: int,
+    node_cap: int,
 ) -> dict:
     view: dict = {"mode": "map", "hops": hops}
     empty = KnowledgeGraph().model_dump()
@@ -1084,7 +1126,14 @@ def _map_graph(
     if not seeds:
         return {**empty, "paper": {**view, "reason": "not_in_structure"}}
     shown, hop, counts = _map(st, seeds, hops, max_nodes)
+    found = len(seeds) + counts["n_hop1"] + counts["n_hop2"]
     view.update(counts)
+    view.update(
+        n_papers=found,
+        shown_papers=len(shown),
+        max_nodes=max_nodes,
+        max_nodes_cap=node_cap,
+    )
     view["shown_hop1"] = sum(1 for v in shown if hop[v] == 1)
     view["shown_hop2"] = sum(1 for v in shown if hop[v] == 2)
     view["ranking"] = (
@@ -1093,16 +1142,15 @@ def _map_graph(
         "then two-hop papers by the strength of the one-hop papers they link "
         "to, damped by log2(2 + links) of each; links: all of a chosen paper's, "
         f"the {_EDGES_PER_PAPER} strongest of each other paper, at most "
-        f"{_EDGE_CAP_FACTOR} x the node limit"
+        f"{_EDGE_CAP_FACTOR} x the node limit, and at least the strongest of "
+        "every shown paper that has one"
     )
 
     labels = _unique_labels(st, shown)
     links = _thin_links(st, shown, set(seeds), max_nodes)
     view["n_links"], view["shown_links"] = links["found"], len(links["kept"])
-    kg = KnowledgeGraph(
-        is_truncated=len(shown) < len(seeds) + counts["n_hop1"] + counts["n_hop2"]
-        or len(links["kept"]) < links["found"]
-    )
+    view["links_thinned"] = len(links["kept"]) < links["found"]
+    kg = KnowledgeGraph(is_truncated=len(shown) < found)
     node_ids = {v: _node_id(st, v, kb) for v in shown}
     for v in shown:
         names = [name for _, name in st.authors[v]]
@@ -1125,6 +1173,7 @@ def _map_graph(
             "in_kb": _kb_key(st, v, kb) is not None,
             "attachment_key": _kb_key(st, v, kb)
             or (st.keys[v][0] if st.keys[v] else None),
+            "attachment_keys": st.keys[v] or None,
         }
         kg.nodes.append(
             KnowledgeGraphNode(
@@ -1174,20 +1223,24 @@ async def paper_map(
     rag,
     papers: str | list[str],
     hops: int = 1,
-    max_nodes: int = 1000,
+    max_nodes: int = MAP_DEFAULT_NODES,
     encode: bool = False,
 ) -> dict | bytes:
     """A graph of papers around one or more chosen papers, in the ``/graphs``
     shape, plus ``paper``: the chosen papers' summaries and the view's counts.
 
     Nodes are papers one or ``hops`` = 2 steps away over citations and
-    coupling, capped at ``max_nodes`` (seeds kept, then the strongest
-    neighbours; ``paper.ranking`` says how). A node's ``entity_type`` is the
-    field of its primary topic, its label "Family Year". An edge runs from the
-    citing paper to the cited one; a coupling-only edge is ``UNDIRECTED``.
-    Links are thinned (see :func:`_thin_links`): ``paper.n_links`` counts those
-    among the shown papers, ``paper.shown_links`` the ones drawn, and
-    ``is_truncated`` is true when papers or links were dropped.
+    coupling, capped at ``max_nodes`` (default MAP_DEFAULT_NODES, at most the
+    server's ``max_graph_nodes``; seeds kept, then the strongest neighbours;
+    ``paper.ranking`` says how). A node's ``entity_type`` is the field of its
+    primary topic, its label "Family Year", its ``attachment_keys`` all the
+    keys of the paper. An edge runs from the citing paper to the cited one; a
+    coupling-only edge is ``UNDIRECTED``. ``is_truncated`` is true when papers
+    were left out: ``paper.n_papers`` found, ``paper.shown_papers`` shown,
+    ``paper.max_nodes`` the limit applied and ``paper.max_nodes_cap`` the
+    server's. Links are thinned (see :func:`_thin_links`): ``paper.n_links``
+    counts those among the shown papers, ``paper.shown_links`` the ones drawn,
+    and ``paper.links_thinned`` is true when some were left out.
     ``paper.reason``: ``too_many_papers`` (over MAX_PAPERS),
     ``not_in_structure`` (no chosen paper is in it), ``no_links``.
     With ``encode`` the answer is JSON bytes made in the worker thread, so a
@@ -1218,6 +1271,8 @@ async def paper_map(
         )
     st = await _structure(rag)
     kb = await _kb_keys(rag)
+    node_cap = max(1, getattr(rag, "max_graph_nodes", None) or max_nodes)
+    limit = max(1, min(max_nodes, node_cap))
     return await asyncio.to_thread(
-        lambda: finish(_map_graph(st, kb, asked, hops, max_nodes))
+        lambda: finish(_map_graph(st, kb, asked, hops, limit, node_cap))
     )
