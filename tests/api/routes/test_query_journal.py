@@ -247,9 +247,12 @@ def test_an_error_mid_stream_is_journaled_as_incomplete():
             stream=True,
         )
 
-        assert {"error": "stream broke"} in lines
+        # The client gets a sanitized message with an id for the server log,
+        # and the journal records the line the client got.
+        (error_line,) = [line for line in lines if "error" in line]
+        assert error_line["error"].startswith("Internal server error (error_id: ")
         (entry,) = _entries(journal)
-        assert entry["error"] == "stream broke"
+        assert entry["error"] == error_line["error"]
         assert entry["complete"] is False
         assert entry["response"].startswith(PROSE)
     finally:

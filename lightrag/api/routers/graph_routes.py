@@ -14,6 +14,7 @@ from lightrag.exceptions import (
     PipelineReservationConflictError,
 )
 from lightrag.utils import logger
+from lightrag.utils_graph import resolve_entity_name_for_lookup
 from ..utils_api import get_combined_auth_dependency, internal_server_error
 from .document_routes import check_pipeline_busy_or_raise
 
@@ -65,6 +66,12 @@ def _hold_exceeded_to_http(
     """
     logger.error(f"Admin-write hold ceiling exceeded {context}: {exc}")
     return HTTPException(status_code=500, detail=str(exc))
+
+
+def _failed_deletion_status(result: DeletionResult) -> int:
+    """HTTP status for a ``fail`` deletion: 400 when it was refused on its
+    arguments (the helper says so through ``status_code``), else 500."""
+    return 400 if result.status_code == 400 else 500
 
 
 def _require_nonempty_entity_name(entity_name: str) -> str:
@@ -488,7 +495,12 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             Dict[str, bool]: Dictionary with 'exists' key indicating if entity exists
         """
         try:
-            exists = await rag.chunk_entity_relation_graph.has_node(name)
+            # Same resolution as the write paths, so a name POST /graph/entity/create
+            # accepted reports as existing.
+            resolved = await resolve_entity_name_for_lookup(
+                rag.chunk_entity_relation_graph, name
+            )
+            exists = await rag.chunk_entity_relation_graph.has_node(resolved)
             return {"exists": exists}
         except Exception as e:
             logger.error(f"Error checking entity existence for '{name}': {str(e)}")
@@ -1045,7 +1057,8 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             DeletionResult: An object containing the outcome of the deletion process.
 
         Raises:
-            HTTPException: If the entity is not found (404) or an error occurs (500).
+            HTTPException: If the entity is not found (404), an entity name
+                cannot address any entity (400), or an error occurs (500).
         """
         try:
             await check_pipeline_busy_or_raise(rag)
@@ -1053,7 +1066,9 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             if result.status == "not_found":
                 raise HTTPException(status_code=404, detail=result.message)
             if result.status == "fail":
-                raise HTTPException(status_code=500, detail=result.message)
+                raise HTTPException(
+                    status_code=_failed_deletion_status(result), detail=result.message
+                )
             # Set doc_id to empty string since this is an entity operation, not document
             result.doc_id = ""
             return result
@@ -1087,7 +1102,8 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             DeletionResult: An object containing the outcome of the deletion process.
 
         Raises:
-            HTTPException: If the relation is not found (404) or an error occurs (500).
+            HTTPException: If the relation is not found (404), an entity name
+                cannot address any entity (400), or an error occurs (500).
         """
         try:
             await check_pipeline_busy_or_raise(rag)
@@ -1098,7 +1114,9 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             if result.status == "not_found":
                 raise HTTPException(status_code=404, detail=result.message)
             if result.status == "fail":
-                raise HTTPException(status_code=500, detail=result.message)
+                raise HTTPException(
+                    status_code=_failed_deletion_status(result), detail=result.message
+                )
             # Set doc_id to empty string since this is a relation operation, not document
             result.doc_id = ""
             return result
