@@ -31,7 +31,8 @@ import LegendButton from '@/components/graph/LegendButton'
 import { useSettingsStore } from '@/stores/settings'
 import { useGraphStore } from '@/stores/graph'
 import useIsDarkMode from '@/hooks/useIsDarkMode'
-import { labelColorDarkTheme, labelColorLightTheme, edgeColorDarkTheme, EDGE_PERF_LIMIT } from '@/lib/constants'
+import { labelColorDarkTheme, labelColorLightTheme, edgeColorDarkTheme } from '@/lib/constants'
+import { edgeEventsActive } from '@/lib/paperFilter'
 
 import '@react-sigma/core/lib/style.css'
 import '@react-sigma/graph-search/lib/style.css'
@@ -160,13 +161,16 @@ const GraphViewer = () => {
   const theme = useSettingsStore.use.theme()
   const enableEdgeEvents = useSettingsStore.use.enableEdgeEvents()
   const graphEdgeCount = useGraphStore.use.graphEdgeCount()
+  // A paper map turns edge events on for itself, whatever the setting says: its links are
+  // citations and coupling with a meaning to read, and an entity graph is untouched.
+  const paperMap = useGraphStore.use.rawGraph()?.isPaperMap === true
 
   // Edge events are disabled above EDGE_PERF_LIMIT regardless of the user
   // setting: the picking buffer renders edges to an extra frame buffer every
   // frame, which is too costly on large graphs. The user setting is preserved
   // (Settings greys the menu item but keeps its value), so dropping back below
   // the limit auto-restores edge events.
-  const effectiveEdgeEvents = enableEdgeEvents && graphEdgeCount <= EDGE_PERF_LIMIT
+  const effectiveEdgeEvents = edgeEventsActive(enableEdgeEvents, paperMap, graphEdgeCount)
 
   const [isThemeSwitching, setIsThemeSwitching] = useState(false)
 

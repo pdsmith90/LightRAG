@@ -5,11 +5,11 @@ import { fireEvent, screen, within } from '@testing-library/react'
 import { renderWithProviders } from '@/test/render'
 import en from '@/locales/en.json'
 import { __setAxiosAdapterForTests } from '@/api/lightrag'
-import { useGraphStore } from '@/stores/graph'
+import { RawGraph, useGraphStore } from '@/stores/graph'
 import { useSettingsStore } from '@/stores/settings'
 import { useBackendState } from '@/stores/state'
 import { AsyncSelect } from '@/components/ui/AsyncSelect'
-import { __resetPaperContextForTests } from '@/lib/paperFilter'
+import { __resetPaperContextForTests, readMapLimit } from '@/lib/paperFilter'
 import { SearchHistoryManager } from '@/utils/SearchHistoryManager'
 import PaperFilter, { __resetPaperFilterForTests } from './PaperFilter'
 
@@ -36,6 +36,9 @@ const LIBRARY = [paper('10.1/a', 'Alpha 2020', ['AAAA1111']), paper('10.1/b', 'B
 
 const label = () => useSettingsStore.getState().queryLabel
 const version = () => useGraphStore.getState().graphDataVersion
+
+// The reach tooltip names the map's paper limit (the default until the user asks for more).
+const reach = (text: string, limit = 150) => text.replace('{{limit}}', String(limit))
 
 const setPaperMap = (available: boolean | undefined) =>
   useBackendState.setState({
@@ -230,13 +233,85 @@ describe('PaperFilter paper map', () => {
     renderWithProviders(<PaperFilter />)
     const before = version()
 
-    fireEvent.click(screen.getByRole('button', { name: strings.mapOneHopTooltip }))
+    fireEvent.click(screen.getByRole('button', { name: reach(strings.mapOneHopTooltip) }))
     expect(version()).toBe(before + 1)
     expect(localStorage.getItem('lightrag-paper-map-hops')).toBe('2')
     // the density for the other views is untouched, and so is the label
     expect(localStorage.getItem('lightrag-paper-context')).toBe(null)
     expect(label()).toBe('paper+map:10.1/a')
-    expect(screen.getAllByRole('button', { name: strings.mapTwoHopsTooltip }).length).toBe(1)
+    expect(screen.getAllByRole('button', { name: reach(strings.mapTwoHopsTooltip) }).length).toBe(1)
+  })
+})
+
+describe('PaperFilter paper map size', () => {
+  const MAP_LABEL = 'paper+map:10.1/a'
+  const summary = {
+    mode: 'map',
+    papers: [],
+    n_papers: 612,
+    shown_papers: 150,
+    max_nodes: 150,
+    max_nodes_cap: 1000
+  } as any
+
+  // The map the server answered for the label, as the hook leaves it on screen.
+  const showMap = (map: any, shownLabel = MAP_LABEL) => {
+    const raw = new RawGraph()
+    raw.isPaperMap = true
+    raw.paperSummary = map
+    useGraphStore.getState().setRawGraph(raw)
+    useGraphStore.getState().setLastSuccessfulQueryLabel(shownLabel)
+  }
+  const more = (limit: number) =>
+    `Show more papers (150 of 612 shown, next limit ${limit})`
+
+  beforeEach(() => {
+    setPaperMap(true)
+    useGraphStore.getState().reset()
+    useGraphStore.getState().setLastSuccessfulQueryLabel('')
+    useSettingsStore.getState().setQueryLabel(MAP_LABEL)
+  })
+
+  test('a map that left papers out offers more; one click doubles the limit and refetches', () => {
+    showMap(summary)
+    renderWithProviders(<PaperFilter />)
+    const before = version()
+
+    fireEvent.click(screen.getByRole('button', { name: more(300) }))
+    expect(readMapLimit(MAP_LABEL)).toBe(300)
+    expect(version()).toBe(before + 1)
+    expect(useGraphStore.getState().graphDataFetchAttempted).toBe(false)
+    // the selection is untouched and the reach tooltip names the new limit
+    expect(label()).toBe(MAP_LABEL)
+    expect(screen.getByRole('button', { name: reach(strings.mapOneHopTooltip, 300) })).toBeTruthy()
+  })
+
+  test('the limit stops at what the server allows', () => {
+    showMap(summary)
+    renderWithProviders(<PaperFilter />)
+    for (const next of [300, 600, 1000]) {
+      fireEvent.click(screen.getByRole('button', { name: more(next) }))
+      expect(readMapLimit(MAP_LABEL)).toBe(next)
+    }
+  })
+
+  test.each([
+    ['a map with every paper shown', { ...summary, shown_papers: 612 }, MAP_LABEL],
+    ['a map already at the server ceiling', { ...summary, max_nodes: 1000 }, MAP_LABEL],
+    ['a map of another selection', summary, 'paper+map:10.1/b'],
+    ['a server that does not count its papers', { ...summary, n_papers: undefined }, MAP_LABEL]
+  ])('no more papers are offered for %s', (_name, map, shownLabel) => {
+    showMap(map, shownLabel)
+    renderWithProviders(<PaperFilter />)
+    expect(screen.queryByRole('button', { name: /Show more papers/ })).toBeNull()
+  })
+
+  test('nothing is offered outside the map view', () => {
+    showMap(summary)
+    useSettingsStore.getState().setQueryLabel('paper:10.1/a')
+    useGraphStore.getState().setLastSuccessfulQueryLabel('paper:10.1/a')
+    renderWithProviders(<PaperFilter />)
+    expect(screen.queryByRole('button', { name: /Show more papers/ })).toBeNull()
   })
 })
 

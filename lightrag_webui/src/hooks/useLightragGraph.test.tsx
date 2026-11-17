@@ -10,6 +10,12 @@ import { __setAxiosAdapterForTests } from '@/api/lightrag'
 import { RawGraph, useGraphStore } from '@/stores/graph'
 import { useSettingsStore } from '@/stores/settings'
 import useLightragGraph from '@/hooks/useLightragGraph'
+import {
+  __resetPaperContextForTests,
+  MAP_CITATION_COLOR,
+  MAP_COUPLING_COLOR,
+  raiseMapLimit
+} from '@/lib/paperFilter'
 
 /**
  * The graph hook, driven through the real stores and the real request layer (the HTTP
@@ -33,12 +39,20 @@ const mapNode = (id: string, doi: string, key: string) => ({
   labels: [doi],
   properties: { entity_type: 'Field', doi, attachment_key: key, paper_id: `doi:${doi}` }
 })
-const MAP = {
+const mapEdge = (source: string, target: string, properties: Record<string, unknown>) => ({
+  id: `${source}-${target}`,
+  type: 'DIRECTED',
+  source,
+  target,
+  properties
+})
+const MAP: Record<string, any> = {
   nodes: [mapNode('10.1/a', '10.1/a', 'AAAA0001'), mapNode('10.1/b', '10.1/b', 'BBBB0001')],
   edges: [],
   is_truncated: false,
   paper: { mode: 'map', papers: [] }
 }
+let mapBody: Record<string, any> = MAP
 
 const entityRequests = () => calls.filter((c) => c.path === '/graphs')
 const mapRequests = () => calls.filter((c) => c.path === '/graphs/paper/map')
@@ -59,6 +73,8 @@ beforeEach(() => {
   toast.dismiss() // toasts outlive a test's render
   calls = []
   mapStatus = 200
+  mapBody = MAP
+  __resetPaperContextForTests()
   useGraphStore.getState().reset()
   useGraphStore.getState().triggerNodeExpand(null)
   useGraphStore.getState().setGraphDataFetchAttempted(false)
@@ -66,7 +82,7 @@ beforeEach(() => {
   __setAxiosAdapterForTests(async (config: any) => {
     const url = new URL(config.url, 'http://x')
     calls.push({ path: url.pathname, query: url.searchParams })
-    if (url.pathname === '/graphs/paper/map') return respond(config, MAP, mapStatus)
+    if (url.pathname === '/graphs/paper/map') return respond(config, mapBody, mapStatus)
     return respond(config, { nodes: [], edges: [], is_truncated: false })
   })
 })
@@ -160,6 +176,112 @@ describe('paper map in the graph hook', () => {
       expect(screen.getAllByText(strings.mapUnavailable).length).toBe(1)
     }
   )
+
+  test('a map asks for its own paper limit, not the graph viewer\'s node limit', async () => {
+    useSettingsStore.getState().setGraphMaxNodes(1000)
+    useSettingsStore.getState().setQueryLabel('paper+map:AAAA0001')
+    renderWithProviders(<Harness />)
+    await loadedMap()
+    expect(mapRequests()[0].query.get('max_nodes')).toBe('150')
+  })
+
+  test('the limit raised for this map is the one asked for, and only for this map', async () => {
+    raiseMapLimit('paper+map:AAAA0001', 1000)
+    useSettingsStore.getState().setQueryLabel('paper+map:AAAA0001')
+    renderWithProviders(<Harness />)
+    await loadedMap()
+    expect(mapRequests()[0].query.get('max_nodes')).toBe('300')
+    // the shown map keeps the server's summary for the control that asks for more
+    expect(useGraphStore.getState().rawGraph?.paperSummary?.mode).toBe('map')
+    act(() => {
+      useGraphStore.getState().setGraphDataFetchAttempted(false)
+      useSettingsStore.getState().setQueryLabel('paper+map:AAAA0001 10.1/b')
+      useGraphStore.getState().incrementGraphDataVersion()
+    })
+    await waitFor(() => expect(mapRequests().length).toBe(2))
+    expect(mapRequests()[1].query.get('max_nodes')).toBe('150')
+  })
+
+  test('citations are arrows from the citing paper and coupling links plain, in two colours', async () => {
+    mapBody = {
+      ...MAP,
+      nodes: [...MAP.nodes, mapNode('10.1/c', '10.1/c', 'CCCC0001'), mapNode('10.1/d', '10.1/d', 'DDDD0001')],
+      edges: [
+        mapEdge('10.1/a', '10.1/b', { keywords: 'cites', direction: 'source cites target' }),
+        mapEdge('10.1/a', '10.1/c', { keywords: 'coupled', shared_refs: 7 }),
+        mapEdge('10.1/b', '10.1/c', { keywords: 'cite each other', direction: 'both' })
+      ]
+    }
+    useSettingsStore.getState().setQueryLabel('paper+map:AAAA0001')
+    renderWithProviders(<Harness />)
+    await loadedMap()
+    await waitFor(() => expect(useGraphStore.getState().sigmaGraph?.size).toBe(3))
+    const graph = useGraphStore.getState().sigmaGraph!
+    const edge = (a: string, b: string) => graph.edge(a, b) as string
+    const cites = graph.getEdgeAttributes(edge('10.1/a', '10.1/b'))
+    expect(cites.color).toBe(MAP_CITATION_COLOR)
+    expect(cites.type).toBe('curvedArrow')
+    // the arrow points at the cited paper: the edge runs from the citing one
+    expect([graph.source(edge('10.1/a', '10.1/b')), graph.target(edge('10.1/a', '10.1/b'))]).toEqual([
+      '10.1/a',
+      '10.1/b'
+    ])
+    const coupled = graph.getEdgeAttributes(edge('10.1/a', '10.1/c'))
+    expect(coupled.color).toBe(MAP_COUPLING_COLOR)
+    expect(coupled.type).toBeUndefined()
+    const mutual = graph.getEdgeAttributes(edge('10.1/b', '10.1/c'))
+    expect(mutual.color).toBe(MAP_CITATION_COLOR)
+    expect(mutual.type).toBeUndefined()
+  })
+
+  test('an entity graph keeps its edges as they were', async () => {
+    useSettingsStore.getState().setQueryLabel('GRACE')
+    __setAxiosAdapterForTests(async (config: any) =>
+      respond(config, {
+        nodes: [
+          { id: 'A', labels: ['A'], properties: { entity_type: 'x' } },
+          { id: 'B', labels: ['B'], properties: { entity_type: 'x' } }
+        ],
+        edges: [{ id: 'A-B', type: 'DIRECTED', source: 'A', target: 'B', properties: { keywords: 'cites', direction: 'source cites target' } }],
+        is_truncated: false
+      })
+    )
+    renderWithProviders(<Harness />)
+    await waitFor(() => expect(useGraphStore.getState().sigmaGraph?.size).toBe(1))
+    const graph = useGraphStore.getState().sigmaGraph!
+    const attrs = graph.getEdgeAttributes(graph.edge('A', 'B') as string)
+    expect(attrs.type).toBeUndefined()
+    expect(attrs.color).toBeUndefined()
+  })
+
+  test('the truncation toast means papers were left out; thinned links only reach the summary', async () => {
+    const summary = {
+      mode: 'map',
+      papers: [],
+      n_papers: 300,
+      shown_papers: 300,
+      max_nodes: 300,
+      max_nodes_cap: 1000,
+      n_links: 900,
+      shown_links: 800,
+      links_thinned: true
+    }
+    mapBody = { ...MAP, is_truncated: false, paper: summary }
+    useSettingsStore.getState().setQueryLabel('paper+map:AAAA0001')
+    const { unmount } = renderWithProviders(<Harness />)
+    expect(await screen.findByText(/800 of the 900 links between them shown/)).toBeTruthy()
+    expect(screen.queryByText('Graph data is truncated to Max Nodes')).toBeNull()
+    unmount()
+
+    toast.dismiss()
+    mapBody = { ...MAP, is_truncated: true, paper: { ...summary, n_papers: 612, shown_papers: 300 } }
+    useGraphStore.getState().reset()
+    useGraphStore.getState().setGraphDataFetchAttempted(false)
+    useSettingsStore.getState().setQueryLabel('paper+map:10.1/b')
+    renderWithProviders(<Harness />)
+    expect(await screen.findByText('Graph data is truncated to Max Nodes')).toBeTruthy()
+    expect(await screen.findByText(/612 papers found, 2 shown/)).toBeTruthy()
+  })
 
   test('another failure of a map fetch is still retried', async () => {
     mapStatus = 500

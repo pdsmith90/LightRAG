@@ -7,6 +7,7 @@ import { useEffect, useRef } from 'react'
 import { EdgeType, NodeType } from '@/hooks/useLightragGraph'
 import useIsDarkMode from '@/hooks/useIsDarkMode'
 import * as Constants from '@/lib/constants'
+import { edgeEventsActive } from '@/lib/paperFilter'
 
 import { useSettingsStore } from '@/stores/settings'
 import { useGraphStore } from '@/stores/graph'
@@ -38,13 +39,15 @@ const GraphControl = ({ disableHoverEffect }: { disableHoverEffect?: boolean }) 
   const focusedEdge = useGraphStore.use.focusedEdge()
   const sigmaGraph = useGraphStore.use.sigmaGraph()
   const graphEdgeCount = useGraphStore.use.graphEdgeCount()
+  // A paper map turns edge events on for itself, so its links can be selected (see GraphViewer).
+  const paperMap = useGraphStore.use.rawGraph()?.isPaperMap === true
 
   // Mirror GraphViewer's gating: above EDGE_PERF_LIMIT the sigma instance is
   // (re)built without the edge picking buffer, so edge events cannot fire even
   // though the user setting may be on. Use this — not the raw setting — for
   // event registration and the reducers, so we never run the costly edge-focus
   // path against a graph that can't actually pick edges.
-  const effectiveEdgeEvents = enableEdgeEvents && graphEdgeCount <= Constants.EDGE_PERF_LIMIT
+  const effectiveEdgeEvents = edgeEventsActive(enableEdgeEvents, paperMap, graphEdgeCount)
 
   // The graph the initial FA2 layout has already been run for. Used to run the
   // layout once PER GRAPH, not once per sigma instance (a theme change rebuilds

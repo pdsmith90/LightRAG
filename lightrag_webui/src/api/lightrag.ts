@@ -642,9 +642,15 @@ export type PaperSummary = {
   n_hop2?: number
   shown_hop1?: number
   shown_hop2?: number
+  // Papers found, papers shown, the limit applied and the server's ceiling for it.
+  n_papers?: number
+  shown_papers?: number
+  max_nodes?: number
+  max_nodes_cap?: number
   // Links among the papers shown: found, and drawn after the server thinned them.
   n_links?: number
   shown_links?: number
+  links_thinned?: boolean
   references_available?: boolean
   cited_sharing?: number
   n_linking?: number

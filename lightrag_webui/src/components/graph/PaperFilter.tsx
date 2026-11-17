@@ -20,15 +20,19 @@ import Button from '@/components/ui/Button'
 import { controlButtonVariant } from '@/lib/constants'
 import {
   MapHops,
+  mapHasMorePapers,
   MAX_PAPERS,
   nextContext,
   nextHops,
+  nextMapLimit,
   nextMode,
   paperLabel,
   parsePaperLabel,
   PaperContext,
   PaperGraphMode,
+  raiseMapLimit,
   readMapHops,
+  readMapLimit,
   readPaperContext,
   togglePaper,
   writeMapHops,
@@ -87,8 +91,16 @@ const PaperFilter = () => {
   const [hops, setHops] = useState<MapHops>(readMapHops)
   // The map is offered only when the server reports its paper structure readable.
   const mapAvailable = useBackendState.use.status()?.configuration?.zotero_struct === true
+  // The map on screen (when it is the one this label asks for): its summary says whether the
+  // server left papers out and would show more.
+  const shownLabel = useGraphStore.use.lastSuccessfulQueryLabel()
+  const mapSummary = useGraphStore.use.rawGraph()?.paperSummary
+  const moreAvailable = mode === 'map' && shownLabel === label && mapHasMorePapers(mapSummary)
   // Bumped when a lookup fills knownPapers, to redraw the chips.
   const [, setKnownVersion] = useState(0)
+  // Bumped when the map's paper limit changes, to redraw the tooltip and the button before the
+  // new map arrives.
+  const [, setLimitVersion] = useState(0)
 
   // Ids that came from a reload or the search history have no citation yet.
   useEffect(() => {
@@ -181,6 +193,13 @@ const PaperFilter = () => {
     refetch()
   }, [mode, hops, context, refetch])
 
+  // Ask for twice as many papers for this map, up to what the server allows.
+  const showMore = useCallback(() => {
+    raiseMapLimit(label, mapSummary?.max_nodes_cap ?? 0)
+    setLimitVersion((v) => v + 1)
+    refetch()
+  }, [label, mapSummary, refetch])
+
   const ModeIcon = modeIcons[mode]
   const ContextIcon = mode === 'map' ? hopsIcons[hops] : contextIcons[context]
   // The tooltip names what a click shows next, which depends on the map.
@@ -207,7 +226,8 @@ const PaperFilter = () => {
         ? 'graphPanel.paperFilter.contextLinkedTooltip'
         : context === 'kb'
           ? 'graphPanel.paperFilter.contextKbTooltip'
-          : 'graphPanel.paperFilter.contextOwnTooltip'
+          : 'graphPanel.paperFilter.contextOwnTooltip',
+    { limit: readMapLimit(label) }
   )
 
   return (
@@ -297,6 +317,15 @@ const PaperFilter = () => {
               onClick={() => apply([])}
             >
               {t('graphPanel.paperFilter.clearPapers')}
+            </Button>
+          )}
+          {moreAvailable && (
+            <Button variant="ghost" className="h-5 px-2 text-xs" onClick={showMore}>
+              {t('graphPanel.paperFilter.mapShowMore', {
+                shown: mapSummary?.shown_papers ?? 0,
+                found: mapSummary?.n_papers ?? 0,
+                limit: nextMapLimit(readMapLimit(label), mapSummary?.max_nodes_cap ?? 0)
+              })}
             </Button>
           )}
         </div>

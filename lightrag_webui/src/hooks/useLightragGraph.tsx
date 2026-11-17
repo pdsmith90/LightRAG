@@ -11,7 +11,9 @@ import {
   isPaperMapUnavailable,
   mapFallbackLabel,
   parsePaperLabel,
+  paperMapEdgeAttrs,
   readMapHops,
+  readMapLimit,
   readPaperContext,
   paperSummaryMessage,
   paperNodeAttrs,
@@ -166,6 +168,7 @@ export type NodeType = {
 }
 export type EdgeType = {
   label: string
+  type?: string
   originalWeight?: number
   size?: number
   color?: string
@@ -187,7 +190,7 @@ const fetchGraph = async (label: string, maxDepth: number, maxNodes: number) => 
     console.log(`Fetching graph label: ${queryLabel}, depth: ${maxDepth}, nodes: ${maxNodes}`)
     rawData = paperFilter
       ? paperFilter.mode === 'map'
-        ? await queryPaperMap(paperFilter.papers, readMapHops(), maxNodes)
+        ? await queryPaperMap(paperFilter.papers, readMapHops(), readMapLimit(queryLabel))
         : await queryPaperGraph(paperFilter.papers, paperFilter.mode, readPaperContext(), maxNodes)
       : await queryGraphs(queryLabel, maxDepth, maxNodes)
   } catch (e) {
@@ -271,6 +274,7 @@ const fetchGraph = async (label: string, maxDepth: number, maxNodes: number) => 
     rawGraph.nodeIdMap = nodeIdMap
     rawGraph.edgeIdMap = edgeIdMap
     rawGraph.isPaperMap = paperFilter?.mode === 'map'
+    if (rawGraph.isPaperMap) rawGraph.paperSummary = rawData.paper
 
     console.log('Graph data loaded')
   }
@@ -344,7 +348,9 @@ const createSigmaGraph = async (rawGraph: RawGraph | null): Promise<UndirectedGr
     const attributes = {
       label: (rawEdge.properties?.keywords as string | undefined) || undefined,
       originalWeight: parseEdgeWeight(rawEdge.properties),
-      ...paperEdgeAttrs(rawEdge)
+      ...paperEdgeAttrs(rawEdge),
+      // a paper map tells its citation links (arrows) from its coupling links (plain)
+      ...(rawGraph.isPaperMap ? paperMapEdgeAttrs(rawEdge, edges.length) : {})
     }
     const dynamicId = addUndirectedEdgeSafe(graph, rawEdge.source, rawEdge.target, attributes)
     if (dynamicId === null) {
