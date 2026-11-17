@@ -357,7 +357,8 @@ def check_chunk_relation_keywords(
 #                   "timestamp"}, ...]}
 #
 # A record holds only those keys (the ones it has of them); ``entity_name`` and
-# ``src_id``/``tgt_id`` are the name or pair the record is filed under.
+# ``src_id``/``tgt_id`` are the name or pair the record is filed under: the
+# ones the merge used, after ENTITY_NAME_FOLD.
 KG_RECORDS_FORMAT = 1
 REVERSE_KEYWORDS = "reverse_keywords"
 _ENTITY_RECORD_FIELDS = (
@@ -429,8 +430,8 @@ def oriented_record(record: dict) -> dict:
 
 
 def accepted_records(maybe_nodes: dict, maybe_edges: dict) -> dict[str, Any]:
-    """One chunk's records as extraction hands them to the merge, in the shape
-    stored with the chunk (see the comment above ``KG_RECORDS_FORMAT``). The
+    """One chunk's records as extraction hands them to the merge (after the
+    name fold), in the shape stored with the chunk (see the comment above ``KG_RECORDS_FORMAT``). The
     relation records must carry ``reverse_keywords`` (``add_reverse_keywords``)."""
     return {
         "format": KG_RECORDS_FORMAT,
