@@ -165,7 +165,11 @@ from lightrag.base import (
 from lightrag.namespace import NameSpace
 from lightrag.query_validation import validate_query_not_empty, validate_rag_query
 from lightrag.chunker import chunking_by_token_size
-from lightrag.kg_contract import inverse_table, orient_relation
+from lightrag.kg_contract import (
+    inverse_table,
+    orient_relation,
+    stores_accepted_records,
+)
 from lightrag.operate import (
     KGRebuildReport,
     _configure_junk_entity_filter,
@@ -226,6 +230,7 @@ from lightrag.exceptions import (
 )
 from lightrag.utils import (
     Tokenizer,
+    ensure_chunk_kg_records_field,
     cancellation_was_deferred,
     mark_cancellation_deferred,
     TiktokenTokenizer,
@@ -574,24 +579,6 @@ class _PurgeStageError(Exception):
     def __init__(self, message: str, *, stage: str) -> None:
         super().__init__(message)
         self.purge_stage = stage
-
-
-def _unreproducible_rebuild_note(report: KGRebuildReport | None) -> str | None:
-    """Fork (extraction contract): the sentence a deletion's result carries when
-    its rebuild met surviving chunks whose cached extraction it could not
-    re-process as it was processed when extracted (``KGRebuildReport``
-    ``unreproducible_chunk_ids``), or None when there were none."""
-    if report is None or not report.unreproducible_chunk_ids:
-        return None
-    return (
-        f"completed with unreproducible items: "
-        f"{len(report.unreproducible_chunk_ids)} surviving chunk(s) could not be "
-        "re-processed under the current extraction contract; "
-        f"{len(report.degraded_entities)} entities and "
-        f"{len(report.degraded_relationships)} relations kept their stored "
-        "descriptions with their chunk provenance repaired (re-ingest their "
-        "documents to rebuild them)"
-    )
 
 
 @dataclass(frozen=True)
@@ -1938,6 +1925,15 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             self._entity_extraction_prompt_profile.get("relationship_inverses")
         )
 
+    def _stores_kg_records(self) -> bool:
+        """Fork (extraction contract): whether extraction stores each chunk's
+        accepted records (``kg_contract.stores_accepted_records``)."""
+        self._ensure_addon_params_cache()
+        return stores_accepted_records(
+            self._entity_extraction_prompt_profile.get("relationship_types"),
+            self.kg_extraction_validator,
+        )
+
     def _ensure_addon_params_cache(self) -> None:
         if (
             not self._addon_params_dirty
@@ -2934,6 +2930,14 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             await flush_configuration_storage(
                 self.configuration_storage, "the startup claims"
             )
+            # Fork (extraction contract): with the contract or an extraction
+            # hook, every chunk extracted stores its accepted records, and a
+            # chunk whose records cannot be written fails. A storage that needs
+            # a schema change for them (PostgreSQL: the kg_records column) gets
+            # it now, or start-up is refused here rather than every document
+            # failing later.
+            if self._stores_kg_records():
+                await ensure_chunk_kg_records_field(self.text_chunks)
         except BaseException as failure:
             # Sticky (see the top of this method), cancellation included: a
             # CancelledError here leaves the status INITIALIZED with the checks
@@ -4723,7 +4727,6 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             "recorded_at": datetime.now(timezone.utc).isoformat(),
             "missing_cache_chunks": _sample(report.missing_cache_chunk_ids),
             "unusable_cache_chunks": _sample(report.unusable_cache_chunk_ids),
-            "unreproducible_chunks": _sample(report.unreproducible_chunk_ids),
             "degraded_entities": _sample(report.degraded_entities),
             "degraded_relationships": _sample(relationship_labels),
             "surviving_chunks": _sample(surviving_chunk_ids),
@@ -8536,15 +8539,6 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                 raise
             if keep_summaries:
                 self._record_kept_summaries(doc_id, purge_report)
-            # Fork (extraction contract): the rebuild could not reproduce some
-            # surviving chunks' extraction; the deletion completed, and its
-            # result says which part of the graph kept stored descriptions.
-            unreproducible_note = _unreproducible_rebuild_note(purge_report)
-            if unreproducible_note:
-                logger.warning(f"Document {doc_id}: {unreproducible_note}")
-                async with pipeline_status_lock:
-                    pipeline_status["latest_message"] = unreproducible_note
-                    append_pipeline_history(pipeline_status, unreproducible_note)
 
             # 9. Delete LLM cache while the document status still exists so a failure
             # remains retryable via the same doc_id.
@@ -8627,8 +8621,6 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                 raise Exception(f"Failed to delete document and status: {e}") from e
 
             deletion_fully_completed = True
-            if unreproducible_note:
-                log_message = f"{log_message}; {unreproducible_note}"
             return DeletionResult(
                 status="success",
                 doc_id=doc_id,

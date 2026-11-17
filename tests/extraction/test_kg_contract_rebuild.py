@@ -1,17 +1,16 @@
 """Extraction contract: what a chunk's extraction stored, the rebuild after a
 deletion reproduces (lightrag/kg_contract.py, lightrag/operate.py).
 
-- The extraction-quality hook (``kg_extraction_validator``) runs again on each
-  chunk's re-parsed records, with the text it saw at extraction, so a name it
-  renamed is rebuilt from the surviving document only, as without a hook.
+- The extraction-quality hook (``kg_extraction_validator``) runs once, at
+  extraction; the chunk's accepted records are stored with it, so a name the
+  hook renamed is rebuilt from the surviving document only, as without a hook.
 - With ``relationship_inverses``, a gleaning turn that restates a first-pass
   relation the other way round with the same type corrects its direction; one
-  of another type is a second relation. The rebuild merges a chunk's cached
-  passes the same way.
+  of another type is a second relation. The rebuild reads the merged records.
 - With ``relationship_types``, every LLM-extracted relation's keywords are
-  checked against the list at parse time (first pass, gleaning, the rebuild's
-  re-parse), the changes counted, logged per document and totalled for
-  ``/health``; edges the code makes (sidecar links) are not checked.
+  checked against the list at parse time (first pass and gleaning), the
+  changes counted, logged per document and totalled for ``/health``; edges the
+  code makes (sidecar links) are not checked. The rebuild checks nothing.
 
 All names are invented.
 """
@@ -253,11 +252,9 @@ class _RenamingValidator:
         return self
 
 
-async def test_any_validator_sees_the_extraction_text_again_in_the_rebuild(
-    tmp_path,
-):
-    """A user hook gets each surviving chunk's records again in the rebuild,
-    with the text it got at extraction (markup stripped as for the prompt)."""
+async def test_any_validator_runs_at_extraction_only(tmp_path):
+    """A user hook judges each chunk once, at extraction, on the text the
+    prompt carried (markup stripped); the rebuild reads what it returned."""
     docs = {
         "d1": 'Probe-X watches <cite refid="r1">the Quux Belt</cite>. Report one.',
         "d2": "Probe-X watches the Quux Belt. Report two.",
@@ -284,9 +281,8 @@ async def test_any_validator_sees_the_extraction_text_again_in_the_rebuild(
         ],
         validator=validator,
     )
-    texts = validator.texts["d1-chunk-000"]
-    assert len(texts) == 2 and texts[0] == texts[1]
-    assert "<cite" not in texts[0] and "the Quux Belt" in texts[0]
+    [text] = validator.texts["d1-chunk-000"]
+    assert "<cite" not in text and "the Quux Belt" in text
     edge = graph["edges"][("Quux Belt", "probe x")]
     assert edge["source_id"] == "d1-chunk-000"
     assert edge["description"] == "The probe watches (one)."
@@ -655,7 +651,6 @@ async def test_extraction_checks_keywords_and_reports_the_document(
         "related_to": 1,
         "dropped": 0,
     }
-    assert not any(delta["rebuild"].values())
     [warning] = [
         r.getMessage()
         for r in warnings_seen.records
@@ -676,9 +671,12 @@ async def test_without_related_to_an_off_list_relation_is_dropped(prompt_dir, tm
     assert graph["edges"][("Constellation", "GRACE")]["keywords"] == "has_part"
 
 
-async def test_the_rebuild_re_parse_checks_keywords(
+async def test_the_rebuild_reads_the_checked_keywords_and_counts_nothing(
     prompt_dir, tmp_path, warnings_seen
 ):
+    """The rebuild reads the stored, already checked keywords: the edge is
+    rebuilt from the surviving document, and only extraction is counted."""
+
     def first(text):
         tag = "one" if "one" in text else "two"
         return _reply(
@@ -705,9 +703,9 @@ async def test_the_rebuild_re_parse_checks_keywords(
     assert edge["description"] == "GRACE in the group (one)."
     delta = _totals_delta(before)
     assert delta["extraction"]["normalized"] == 2
-    assert delta["rebuild"]["normalized"] == 1 and delta["rebuild"]["checked"] == 1
-    assert any(
-        "KG rebuild" in r.getMessage() and "normalized=1" in r.getMessage()
+    assert delta["extraction"]["checked"] == 2
+    assert not any(
+        "KG rebuild" in r.getMessage() and "relation keywords" in r.getMessage()
         for r in warnings_seen.records
     )
 
@@ -761,6 +759,6 @@ async def test_sidecar_links_are_not_checked(prompt_dir):
 
 def test_health_totals_start_with_every_count():
     totals = relation_keyword_totals()
-    assert set(totals) == {"extraction", "rebuild"}
+    assert set(totals) == {"extraction"}
     for stage in totals.values():
         assert set(stage) == set(kg_contract.RELATION_KEYWORD_COUNTS)

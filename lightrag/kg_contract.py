@@ -53,17 +53,15 @@ identifiers glued from several words, drops a relation whose endpoint is
 neither a declared entity nor present in the chunk text, and drops self-loops
 that a rename creates.
 
-Extraction records a fingerprint of this post-processing (``contract_fingerprint``:
-the relation type names, the inverse mapping and the hook) with each chunk's
-extraction cache references, so a knowledge rebuild re-parses every chunk the way it
-was post-processed when it was extracted (``operate._cached_extraction_mode``).
+With the contract or a hook on, extraction stores each chunk's accepted records
+with the chunk (``accepted_records``), each relation with its keywords for both
+reading orders, and a knowledge rebuild after a deletion reads them instead of
+re-running any of this post-processing (``oriented_record``).
 """
 
 from __future__ import annotations
 
 import argparse
-import functools
-import hashlib
 import json
 import re
 import sys
@@ -231,55 +229,6 @@ def orient_relation(
     return tgt, src, keywords
 
 
-def orient_edge_records(
-    edge_key: tuple[str, str], records: list[dict], table: Mapping[str, str] | None
-) -> list[dict]:
-    """The parsed relation records of ``edge_key`` (as extracted: source,
-    target) for the sorted key: when sorting flips the pair, copies with
-    ``src_id``/``tgt_id`` swapped and ``keywords`` inverted. The records are
-    returned as they are when there is no table or no flip."""
-    src, tgt = edge_key
-    if not table or src <= tgt:
-        return records
-    flipped = []
-    for record in records:
-        record = {**record, "src_id": tgt, "tgt_id": src}
-        if record.get("keywords"):
-            record["keywords"] = invert_keywords(str(record["keywords"]), table)
-        flipped.append(record)
-    return flipped
-
-
-def _active_profile(global_config: Mapping[str, Any]) -> Mapping[str, Any]:
-    """The profile ``global_config`` carries (the one ``LightRAG`` caches as
-    ``_entity_extraction_prompt_profile``). A config without a cached profile
-    (tests, custom wiring) resolves it the way ``extract_entities`` does; one
-    without a profile file has no contract keys."""
-    profile = global_config.get("_entity_extraction_prompt_profile")
-    if profile is None:
-        addon_params = global_config.get("addon_params") or {}
-        if not addon_params.get("entity_type_prompt_file"):
-            return {}
-        from lightrag.prompt import resolve_entity_extraction_prompt_profile
-
-        profile = resolve_entity_extraction_prompt_profile(
-            addon_params, global_config.get("entity_extraction_use_json", False)
-        )
-    return profile
-
-
-def relation_inverse_table(global_config: Mapping[str, Any]) -> dict[str, str] | None:
-    """The inverse table of the profile ``global_config`` carries, or None when
-    it declares no ``relationship_inverses``."""
-    return inverse_table(_active_profile(global_config).get("relationship_inverses"))
-
-
-def relation_types(global_config: Mapping[str, Any]) -> dict[str, str] | None:
-    """The ``relationship_types`` of the profile ``global_config`` carries, or
-    None when it declares none (the contract is off)."""
-    return _active_profile(global_config).get("relationship_types") or None
-
-
 # ---- the relation list at parse time ----------------------------------------------
 
 # What the keyword check counts: every relation it checks, and each change it
@@ -395,98 +344,145 @@ def check_chunk_relation_keywords(
     return checked
 
 
-# ---- the contract fingerprint -----------------------------------------------------
+# ---- the records a chunk's extraction accepted ------------------------------------
 
-# Bump whenever the contract's own post-processing of a parsed extraction changes:
-# check_relation_keywords, the gleaning merge rules for the inverse table
-# (operate._merge_extraction_pass), reading a JSON list of keywords. Chunks
-# extracted under the old rules then no longer match the configuration, and a
-# knowledge rebuild treats them as unreproducible instead of applying new rules
-# to them.
-CONTRACT_RULES_VERSION = 1
-
-# Bump whenever the rules of validate_chunk (the shipped kg_extraction_validator)
-# change, for the same reason.
-VALIDATOR_RULES_VERSION = 1
-
-
-def validator_identity(validator: Any) -> str:
-    """A stable name for an extraction-quality hook, for the contract
-    fingerprint. The shipped ``kg_extraction_validator`` is named with
-    ``VALIDATOR_RULES_VERSION``. Any other hook is named by the module and
-    qualified name of its function (through ``functools.partial``) or of its
-    class, plus its ``kg_validator_version`` attribute when it has one: a caller
-    that changes what its hook does without renaming it must set or bump that
-    attribute, or the rebuild cannot tell its old output from its new one."""
-    if validator is kg_extraction_validator:
-        return f"{__name__}.kg_extraction_validator/v{VALIDATOR_RULES_VERSION}"
-    target = validator
-    while isinstance(target, functools.partial):
-        target = target.func
-    module = getattr(target, "__module__", None) or type(target).__module__
-    name = getattr(target, "__qualname__", None) or type(target).__qualname__
-    identity = f"{module}.{name}"
-    version = getattr(validator, "kg_validator_version", None)
-    if version is None:
-        version = getattr(target, "kg_validator_version", None)
-    if version is not None:
-        identity += f"/v{version}"
-    return identity
+# The text-chunk field that holds them is ``utils.CHUNK_KG_RECORDS_FIELD``.
+# Its value is a JSON object of a fixed shape (``accepted_records``):
+#
+#   {"format": 1,
+#    "entities":  [{"entity_name", "entity_type", "description", "source_id",
+#                   "file_path", "timestamp"}, ...],
+#    "relations": [{"src_id", "tgt_id", "keywords", "reverse_keywords",
+#                   "description", "weight", "source_id", "file_path",
+#                   "timestamp"}, ...]}
+#
+# A record holds only those keys (the ones it has of them); ``entity_name`` and
+# ``src_id``/``tgt_id`` are the name or pair the record is filed under.
+KG_RECORDS_FORMAT = 1
+REVERSE_KEYWORDS = "reverse_keywords"
+_ENTITY_RECORD_FIELDS = (
+    "entity_name",
+    "entity_type",
+    "description",
+    "source_id",
+    "file_path",
+    "timestamp",
+)
+_RELATION_RECORD_FIELDS = (
+    "src_id",
+    "tgt_id",
+    "keywords",
+    REVERSE_KEYWORDS,
+    "description",
+    "weight",
+    "source_id",
+    "file_path",
+    "timestamp",
+)
 
 
-def contract_fingerprint(
-    relationship_types: Mapping[str, str] | None,
-    relationship_inverses: Mapping[str, str] | None,
-    validator: Any = None,
-) -> str | None:
-    """A short stable digest of everything that decides how a chunk's parsed
-    extraction is post-processed before it reaches the graph: the declared
-    relation type names (the keyword check), the inverse mapping (the gleaning
-    direction rule, inverse names), the extraction-quality hook
-    (``validator_identity``) and the rules versions. None when there is none of
-    these: the post-processing extraction does without the contract.
+def stores_accepted_records(
+    relationship_types: Mapping[str, str] | None, validator: Any
+) -> bool:
+    """Whether extraction stores each chunk's accepted records with the chunk:
+    when the profile declares ``relationship_types`` or an extraction-quality
+    hook is set. Without either, nothing is stored and a rebuild re-parses the
+    chunk's cached LLM output, which is all extraction did to it."""
+    return bool(relationship_types) or validator is not None
 
-    Extraction records it with each chunk's extraction cache references (the
-    chunk row's ``llm_cache_contract``), and a knowledge rebuild compares it
-    with the current configuration's to decide how each chunk's cached
-    extraction is re-parsed."""
-    if not relationship_types and validator is None:
-        return None
-    payload = {
-        "rules": CONTRACT_RULES_VERSION if relationship_types else None,
-        "types": sorted(relationship_types or ()),
-        "inverses": sorted((relationship_inverses or {}).items()),
-        "validator": validator_identity(validator) if validator is not None else None,
+
+def add_reverse_keywords(maybe_edges: dict, table: Mapping[str, str] | None) -> None:
+    """Give every relation record of one chunk, in place, its pair as filed
+    (``src_id``, ``tgt_id``) and ``reverse_keywords``: its keywords read from
+    target to source, resolved now with the inverse table (``table``, the
+    two-way table of ``relationship_inverses``; the keywords unchanged without
+    one). ``oriented_record`` then needs nothing but the record."""
+    for (src, tgt), records in maybe_edges.items():
+        for record in records:
+            record["src_id"], record["tgt_id"] = src, tgt
+            keywords = record.get("keywords")
+            if table and isinstance(keywords, str) and keywords:
+                keywords = invert_keywords(keywords, table)
+            record[REVERSE_KEYWORDS] = keywords
+
+
+def oriented_record(record: dict) -> dict:
+    """A relation record in the graph's storage order (``src_id <= tgt_id``):
+    a copy with the pair swapped and ``reverse_keywords`` as its keywords when
+    it reads the other way round, and without ``reverse_keywords``. A record
+    without ``reverse_keywords`` (extracted with no contract and no hook) is
+    returned as it is. The extraction merge and the knowledge rebuild both
+    orient every relation record through this function."""
+    if REVERSE_KEYWORDS not in record:
+        return record
+    oriented = {k: v for k, v in record.items() if k != REVERSE_KEYWORDS}
+    if record["src_id"] > record["tgt_id"]:
+        oriented["src_id"], oriented["tgt_id"] = record["tgt_id"], record["src_id"]
+        oriented["keywords"] = record[REVERSE_KEYWORDS]
+    return oriented
+
+
+def accepted_records(maybe_nodes: dict, maybe_edges: dict) -> dict[str, Any]:
+    """One chunk's records as extraction hands them to the merge, in the shape
+    stored with the chunk (see the comment above ``KG_RECORDS_FORMAT``). The
+    relation records must carry ``reverse_keywords`` (``add_reverse_keywords``)."""
+    return {
+        "format": KG_RECORDS_FORMAT,
+        "entities": [
+            {
+                **{k: record[k] for k in _ENTITY_RECORD_FIELDS if k in record},
+                "entity_name": name,
+            }
+            for name, records in maybe_nodes.items()
+            for record in records
+        ],
+        "relations": [
+            {
+                **{k: record[k] for k in _RELATION_RECORD_FIELDS if k in record},
+                "src_id": src,
+                "tgt_id": tgt,
+            }
+            for (src, tgt), records in maybe_edges.items()
+            for record in records
+        ],
     }
-    digest = hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
-    return f"kgc-{digest[:16]}"
 
 
-def active_contract_fingerprint(global_config: Mapping[str, Any]) -> str | None:
-    """``contract_fingerprint`` of the profile ``global_config`` carries and its
-    ``kg_extraction_validator``."""
-    profile = _active_profile(global_config)
-    return contract_fingerprint(
-        profile.get("relationship_types"),
-        profile.get("relationship_inverses"),
-        global_config.get("kg_extraction_validator"),
-    )
+def chunk_result_from_records(stored: Any) -> tuple[dict, dict]:
+    """The ``(maybe_nodes, maybe_edges)`` of one chunk from its stored records,
+    filed under the names and pairs they were stored under, in stored order.
+    Raises ``ValueError`` for a value that is not of the stored shape."""
+    if not isinstance(stored, Mapping) or stored.get("format") != KG_RECORDS_FORMAT:
+        raise ValueError("stored records of an unknown format")
+    entities, relations = stored.get("entities"), stored.get("relations")
+    if not isinstance(entities, list) or not isinstance(relations, list):
+        raise ValueError("stored records without entity and relation lists")
+    nodes: dict = {}
+    for record in entities:
+        if not isinstance(record, Mapping) or not record.get("entity_name"):
+            raise ValueError("a stored entity record without a name")
+        nodes.setdefault(record["entity_name"], []).append(dict(record))
+    edges: dict = {}
+    for record in relations:
+        if (
+            not isinstance(record, Mapping)
+            or not record.get("src_id")
+            or not record.get("tgt_id")
+            or REVERSE_KEYWORDS not in record
+        ):
+            raise ValueError("a stored relation record without its pair or reading")
+        edges.setdefault((record["src_id"], record["tgt_id"]), []).append(dict(record))
+    return nodes, edges
 
 
-# Running totals of this process for /health, by where the check ran: new LLM
-# output ("extraction") or cached LLM output re-parsed by a knowledge rebuild
-# ("rebuild"), which re-counts records an extraction already counted.
-_RELATION_KEYWORD_TOTALS: dict[str, Counter] = {
-    "extraction": Counter(),
-    "rebuild": Counter(),
-}
+# Running totals of this process for /health: the checks extraction made on new
+# LLM output. A knowledge rebuild reads the stored records and checks nothing.
+_RELATION_KEYWORD_TOTALS: dict[str, Counter] = {"extraction": Counter()}
 
 
 def record_relation_keyword_counts(stage: str, counts: Mapping[str, int]) -> None:
-    """Add one document's (or one rebuild's) keyword-check counts to the
-    running totals of ``stage`` (``extraction`` or ``rebuild``)."""
+    """Add one document's keyword-check counts to the running totals of
+    ``stage`` (``extraction``)."""
     _RELATION_KEYWORD_TOTALS[stage].update(counts)
 
 

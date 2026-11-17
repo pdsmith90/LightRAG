@@ -59,7 +59,7 @@ def test_health_shows_the_contract_off_without_the_keys(monkeypatch):
 
 
 def test_health_shows_the_relation_keyword_totals(monkeypatch):
-    """The running totals of the parse-time keyword check, by stage."""
+    """The running totals of the parse-time keyword check (extraction only)."""
     from collections import Counter
 
     from lightrag import kg_contract
@@ -69,7 +69,6 @@ def test_health_shows_the_relation_keyword_totals(monkeypatch):
         "_RELATION_KEYWORD_TOTALS",
         {
             "extraction": Counter(checked=10, normalized=2, related_to=1),
-            "rebuild": Counter(checked=3, dropped=1),
         },
     )
     config = _health_config(monkeypatch)
@@ -81,13 +80,5 @@ def test_health_shows_the_relation_keyword_totals(monkeypatch):
             "inverse": 0,
             "related_to": 1,
             "dropped": 0,
-        },
-        "rebuild": {
-            "checked": 3,
-            "normalized": 0,
-            "multi_type": 0,
-            "inverse": 0,
-            "related_to": 0,
-            "dropped": 1,
         },
     }

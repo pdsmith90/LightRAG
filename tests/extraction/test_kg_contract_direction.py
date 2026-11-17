@@ -24,11 +24,11 @@ from lightrag.kg_contract import (
     RELATIONSHIP_INVERSES_V31,
     RELATIONSHIP_TYPES_V31,
     inverse_table,
+    add_reverse_keywords,
     invert_keywords,
-    orient_edge_records,
     orient_relation,
+    oriented_record,
     profile_status,
-    relation_inverse_table,
     schema_for_profile,
 )
 from lightrag.operate import merge_nodes_and_edges
@@ -112,18 +112,40 @@ def test_orient_relation_sorts_and_inverts_a_flipped_pair():
     )
 
 
-def test_orient_edge_records_copies_only_a_flipped_pair():
-    records = [{"src_id": "B", "tgt_id": "A", "keywords": "uses", "weight": 1.0}]
-    assert orient_edge_records(("B", "A"), records, None) is records
-    assert orient_edge_records(("A", "B"), records, TABLE) is records
-    [flipped] = orient_edge_records(("B", "A"), records, TABLE)
-    assert flipped == {
+def test_a_record_carries_its_reverse_reading_and_is_oriented_by_it():
+    """The extraction merge and the rebuild orient a relation record through
+    ``oriented_record`` alone; the reverse reading is resolved before, with the
+    table, by ``add_reverse_keywords``."""
+    record = {"src_id": "x", "tgt_id": "y", "keywords": "uses", "weight": 1.0}
+    edges = {("B", "A"): [record], ("A", "C"): [{"keywords": "part_of"}]}
+    add_reverse_keywords(edges, TABLE)
+    assert record == {
+        "src_id": "B",
+        "tgt_id": "A",
+        "keywords": "uses",
+        "weight": 1.0,
+        "reverse_keywords": "used_by",
+    }
+    assert oriented_record(record) == {
         "src_id": "A",
         "tgt_id": "B",
         "keywords": "used_by",
         "weight": 1.0,
     }
-    assert records[0]["keywords"] == "uses"  # the input is not modified
+    assert record["keywords"] == "uses"  # the input is not modified
+    # in order: only the reverse reading goes
+    assert oriented_record(edges[("A", "C")][0]) == {
+        "src_id": "A",
+        "tgt_id": "C",
+        "keywords": "part_of",
+    }
+    # without a table the reverse reading is the same keywords
+    edges = {("B", "A"): [{"keywords": "uses"}]}
+    add_reverse_keywords(edges, None)
+    assert oriented_record(edges[("B", "A")][0])["keywords"] == "uses"
+    # a record without one (no contract, no hook) is returned as it is
+    plain = {"src_id": "B", "tgt_id": "A", "keywords": "uses"}
+    assert oriented_record(plain) is plain
 
 
 # ------------------------------------------------------------ the profile key
@@ -159,25 +181,13 @@ def test_the_inverses_reach_the_cached_profile(prompt_dir):
     )
     validated = validate_entity_extraction_prompt_profile_for_mode(resolved, True)
     assert validated["relationship_inverses"] == RELATIONSHIP_INVERSES_V31
-    assert relation_inverse_table(
-        {"_entity_extraction_prompt_profile": validated}
-    ) == inverse_table(RELATIONSHIP_INVERSES_V31)
-    # a config without the cached profile resolves the same table
-    assert relation_inverse_table(
-        {
-            "addon_params": {"entity_type_prompt_file": "contract.yml"},
-            "entity_extraction_use_json": True,
-        }
-    ) == inverse_table(RELATIONSHIP_INVERSES_V31)
 
 
 def test_no_table_without_the_key(prompt_dir):
     plain = resolve_entity_extraction_prompt_profile(
         {"entity_type_prompt_file": "plain.yml"}, True
     )
-    assert relation_inverse_table({"_entity_extraction_prompt_profile": plain}) is None
-    assert relation_inverse_table({}) is None
-    assert relation_inverse_table({"addon_params": {}}) is None
+    assert inverse_table(plain.get("relationship_inverses")) is None
 
 
 async def test_the_llm_never_sees_an_inverse_name(prompt_dir):
@@ -266,8 +276,14 @@ def _node_record(name, chunk="chunk-1"):
 
 async def _merge(chunk_results, profile, graph=None):
     """merge_nodes_and_edges with ``profile`` as the cached prompt profile (None:
-    a config without one, as custom wiring builds it)."""
+    a config without one, as custom wiring builds it). Under a contract each
+    relation record first gets its reverse reading, as extraction gives it
+    before the records reach the merge."""
     graph = graph or _RecordingGraph()
+    if profile and profile.get("relationship_types"):
+        table = inverse_table(profile.get("relationship_inverses"))
+        for _nodes, edges in chunk_results:
+            add_reverse_keywords(edges, table)
     global_config = {
         "tokenizer": Tokenizer("characters", _Characters()),
         "llm_model_max_async": 1,
@@ -397,16 +413,16 @@ def _armed_fold(monkeypatch):
 async def test_the_name_fold_renames_before_the_pair_is_oriented():
     """'imaginary filter' sorts after 'Quux Basin', its canonical spelling
     before it: the orientation follows the folded names."""
-    folded = fold_chunk_result(
-        *_chunk(("imaginary filter", "applied_to", "Quux Basin"))
-    )
+    nodes, edges = _chunk(("imaginary filter", "applied_to", "Quux Basin"))
+    add_reverse_keywords(edges, TABLE)  # extraction: before the fold
+    folded = fold_chunk_result(nodes, edges)
     assert set(folded[1]) == {("Imaginary Filter", "Quux Basin")}
     graph = await _merge([folded], CONTRACT_WITH_INVERSES)
     assert graph.writes == [("Imaginary Filter", "Quux Basin", "applied_to")]
 
-    folded = fold_chunk_result(
-        *_chunk(("Quux Basin", "located_in", "imaginary filter"))
-    )
+    nodes, edges = _chunk(("Quux Basin", "located_in", "imaginary filter"))
+    add_reverse_keywords(edges, TABLE)
+    folded = fold_chunk_result(nodes, edges)
     graph = await _merge([folded], CONTRACT_WITH_INVERSES)
     assert graph.writes == [("Imaginary Filter", "Quux Basin", "location_of")]
 

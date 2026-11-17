@@ -1,17 +1,19 @@
-"""Extraction contract: the knowledge rebuild that follows a deletion re-parses
-each surviving chunk's cached extraction the way that chunk was post-processed
-when it was extracted (lightrag/operate.py, lightrag/kg_contract.py).
+"""Extraction contract: the knowledge rebuild that follows a deletion reads each
+surviving chunk's stored accepted records (lightrag/operate.py,
+lightrag/kg_contract.py), whatever the configuration is at that time.
 
-- A chunk extracted without any contract or hook (every chunk extracted before
-  this rule) gets the plain re-parse even after the hook or the relation list
-  is switched on, so the graph is rebuilt exactly as without them.
-- A chunk extracted under another contract or hook cannot be reproduced; an
-  entity or relation for which it then yields no record keeps its stored
-  description and gets its provenance repaired, and the deletion says so.
-- A hook that raises in the rebuild, or a chunk without its text, is handled
-  the same way: no unjudged records reach the graph, no stale chunk id stays.
-- With the name fold armed and relationship_inverses declared, the rebuild
-  folds after the gleaning merge, as extraction does.
+- A chunk extracted with the contract or a hook stored the records extraction
+  handed the merge; the rebuild reads them and re-runs none of the
+  post-processing, so changing the relation list, the inverse names, the hook
+  (or its rules), switching the contract off or the JSON mode changes nothing
+  in what a deletion rebuilds.
+- A chunk extracted with neither (every chunk extracted before the contract)
+  stored none and is re-parsed from its cached LLM output, as on the base
+  branch, even when the contract or hook is on later; an entity or relation fed
+  by both kinds of chunk gets each chunk's contribution its way.
+- A chunk extracted again with neither loses its stored records.
+- With the name fold armed, the stored records (in the LLM's spelling) are
+  filed under both spellings, as cached results are.
 
 Each test drives a real LightRAG instance (JSON and NetworkX storages) through
 inserts, a reopen with another configuration and a deletion. All names are
@@ -19,14 +21,20 @@ invented.
 """
 
 import json
+import sys
 from uuid import uuid4
 
 import pytest
 
-from lightrag import LightRAG, entity_name_fold
+from lightrag import LightRAG, entity_name_fold, kg_contract
 from lightrag.kg.shared_storage import get_namespace_data
 from lightrag.kg_contract import kg_extraction_validator
-from lightrag.utils import EmbeddingFunc, Tokenizer
+from lightrag.utils import (
+    CHUNK_KG_RECORDS_FIELD,
+    EmbeddingFunc,
+    Tokenizer,
+    TruncatedResponse,
+)
 
 from tests.extraction import test_kg_contract_rebuild as _rebuild_tests
 from tests.extraction.test_kg_contract_rebuild import (
@@ -89,7 +97,17 @@ def _first(text: str) -> str:
     return _reply(entities, relations)
 
 
-async def _open(path, workspace, llm, *, profile=None, validator=None, gleaning=0):
+async def _open(
+    path,
+    workspace,
+    llm,
+    *,
+    profile=None,
+    validator=None,
+    gleaning=0,
+    use_json=True,
+    **extra,
+):
     rag = LightRAG(
         working_dir=str(path),
         workspace=workspace,
@@ -97,12 +115,13 @@ async def _open(path, workspace, llm, *, profile=None, validator=None, gleaning=
         embedding_func=EmbeddingFunc(embedding_dim=8, func=_embed),
         tokenizer=Tokenizer("characters", _Characters()),
         entity_extract_max_gleaning=gleaning,
-        entity_extraction_use_json=True,
+        entity_extraction_use_json=use_json,
         chunk_token_size=4000,
         chunk_overlap_token_size=0,
         max_parallel_insert=1,
         addon_params={"entity_type_prompt_file": profile} if profile else {},
         **({"kg_extraction_validator": validator} if validator else {}),
+        **extra,
     )
     await rag.initialize_storages()
     return rag
@@ -166,7 +185,6 @@ async def test_switching_the_validator_on_rebuilds_old_chunks_as_they_were(tmp_p
     )
     plain = await _build_then_delete(tmp_path, {}, {})
     assert hooked["result"].status == "success"
-    assert "unreproducible" not in hooked["result"].message
     assert hooked["graph"] == plain["graph"]
     edge = hooked["graph"]["edges"][("ScaleHeight", "thermosphere")]
     assert edge["source_id"] == "A-chunk-000"
@@ -183,7 +201,6 @@ async def test_declaring_the_relation_list_rebuilds_old_chunks_as_they_were(
     ``related_to`` on the list."""
     contract = await _build_then_delete(tmp_path, {}, {"profile": profile})
     plain = await _build_then_delete(tmp_path, {}, {})
-    assert "unreproducible" not in contract["result"].message
     assert contract["graph"] == plain["graph"]
     edge = contract["graph"]["edges"][("Alpha Unit", "Zeta System")]
     assert edge["keywords"] == "contains, holds"
@@ -191,111 +208,244 @@ async def test_declaring_the_relation_list_rebuilds_old_chunks_as_they_were(
     assert edge["description"] == "ZA A."
 
 
-# ------------------------------------------ chunks extracted under another configuration
+# ------------------------------- chunks with stored records: the configuration changes
 
 
-async def test_switching_the_validator_off_repairs_what_it_renamed(tmp_path):
-    """A graph built with the hook, the hook switched off, a document deleted:
-    the surviving chunk's plain re-parse has no record for the names the hook
-    gave, so those items keep their stored descriptions and lose the deleted
-    document's chunk id; the deletion says it completed with unreproducible
-    items."""
-    out = await _build_then_delete(tmp_path, {"validator": kg_extraction_validator}, {})
-    result, built, graph = out["result"], out["built"], out["graph"]
-    assert result.status == "success"
-    assert "completed with unreproducible items" in result.message
-    assert "1 surviving chunk(s)" in result.message
-    assert any("cannot be reproduced" in m for m in out["history"])
+def _flipped(text: str) -> str:
+    """COLD3-01: ``Zeta System part_of Alpha Unit`` and ``Mid Tool uses Beta
+    Set``, both pairs sorting the other way round; ``ScaleHeight`` for the hook
+    to rename."""
+    tag = _tag(text)
+    entities, relations = [], []
+    if "scale height" in text:
+        entities += [
+            ("ScaleHeight", "Concept", f"SH {tag}."),
+            ("thermosphere", "Location", f"T {tag}."),
+        ]
+        relations.append(("ScaleHeight", "thermosphere", "located_in", f"SH-T {tag}."))
+    if "Zeta" in text:
+        entities += [
+            ("Zeta System", "Concept", f"Z {tag}."),
+            ("Alpha Unit", "Concept", f"A {tag}."),
+        ]
+        relations.append(("Zeta System", "Alpha Unit", "part_of", f"ZA {tag}."))
+    if "Mid Tool" in text:
+        entities += [
+            ("Mid Tool", "Method", f"M {tag}."),
+            ("Beta Set", "Data", f"B {tag}."),
+        ]
+        relations.append(("Mid Tool", "Beta Set", "uses", f"MB {tag}."))
+    return _reply(entities, relations)
 
-    key = ("scale height", "thermosphere")
-    assert graph["edges"][key]["source_id"] == "A-chunk-000"
-    assert graph["edges"][key]["description"] == built["edges"][key]["description"]
-    node = graph["nodes"]["scale height"]
-    assert node["source_id"] == "A-chunk-000"
-    assert node["description"] == built["nodes"]["scale height"]["description"]
-    assert out["tracking"]["entities"]["scale height"] == ["A-chunk-000"]
-    # a name the hook left alone is rebuilt from the plain re-parse
-    assert graph["nodes"]["thermosphere"]["description"] == "T A."
+
+@pytest.fixture
+def flipped_llm(monkeypatch):
+    monkeypatch.setattr(sys.modules[__name__], "_first", _flipped)
 
 
-async def test_changing_the_relation_list_counts_the_old_chunks(prompt_dir, tmp_path):
-    """A graph built with one relation list, then another: the surviving chunk
-    is re-parsed plainly and counted; nothing keeps the deleted chunk id."""
-    out = await _build_then_delete(
-        tmp_path, {"profile": "contract.yml"}, {"profile": "norelated.yml"}
+@pytest.fixture
+def other_profile(prompt_dir):
+    """other.yml: another relation list (no ``affects``) and other inverse
+    names for part_of and uses."""
+    from lightrag.prompt import load_entity_extraction_prompt_profile
+
+    profile = load_entity_extraction_prompt_profile(
+        prompt_dir / "entity_type" / "contract.yml"
     )
-    assert "completed with unreproducible items" in out["result"].message
-    for data in (*out["graph"]["nodes"].values(), *out["graph"]["edges"].values()):
-        assert "B-chunk-000" not in data["source_id"]
+    profile["relationship_types"] = {
+        k: v for k, v in profile["relationship_types"].items() if k != "affects"
+    }
+    profile["relationship_inverses"] = {
+        k: {"part_of": "contains_part", "uses": "employed_by"}.get(k, v)
+        for k, v in profile["relationship_inverses"].items()
+        if k != "affects"
+    }
+    (prompt_dir / "entity_type" / "other.yml").write_text(
+        json.dumps(profile), encoding="utf-8"
+    )
+    return "other.yml"
 
 
-# ------------------------------------------- the hook fails or has no text in the rebuild
-
-
-class _FlakyValidator:
-    """The contract validator, raising for one chunk once switched on."""
-
-    def __init__(self):
-        self.fail_on = None
+class _OtherValidator:
+    """Another hook: renames every name to upper case."""
 
     def __call__(self, chunk_key, chunk_text, maybe_nodes, maybe_edges):
-        if chunk_key == self.fail_on:
-            raise RuntimeError("transient hook failure")
-        return kg_extraction_validator(chunk_key, chunk_text, maybe_nodes, maybe_edges)
+        nodes = {
+            n.upper(): [dict(r, entity_name=n.upper()) for r in records]
+            for n, records in maybe_nodes.items()
+        }
+        edges = {
+            (s.upper(), t.upper()): [
+                dict(r, src_id=s.upper(), tgt_id=t.upper()) for r in records
+            ]
+            for (s, t), records in maybe_edges.items()
+        }
+        return nodes, edges
 
     def __deepcopy__(self, memo):
         return self
 
 
-async def _hook_trouble(tmp_path, trouble: str) -> dict:
-    validator = _FlakyValidator()
-    rag = await _open(
-        tmp_path / f"rag_{uuid4().hex}",
-        f"kgc_{uuid4().hex}",
-        _llm(_first),
-        validator=validator,
-    )
-    try:
-        await _insert(rag, "A", "B", "C")
-        built = _graph(rag)
-        if trouble == "raises":
-            validator.fail_on = "A-chunk-000"
-        else:
-            row = await rag.text_chunks.get_by_id("A-chunk-000")
-            await rag.text_chunks.upsert({"A-chunk-000": {**row, "content": None}})
-        result = await rag.adelete_by_doc_id("B")
+def _raising_validator(chunk_key, chunk_text, maybe_nodes, maybe_edges):
+    raise RuntimeError("hook down")
+
+
+def _broken_rules(monkeypatch):
+    """A code update that changes every rule: the rules version (where there is
+    one), the keyword check and the inverse names."""
+    monkeypatch.setattr(kg_contract, "CONTRACT_RULES_VERSION", 2, raising=False)
+    monkeypatch.setattr(kg_contract, "VALIDATOR_RULES_VERSION", 2, raising=False)
+
+    def check(maybe_edges, *args, **kwargs):
         return {
-            "built": built,
-            "graph": _graph(rag),
-            "tracking": await _tracking(rag),
-            "result": result,
+            key: [dict(r, keywords="changed_rule") for r in records]
+            for key, records in maybe_edges.items()
         }
-    finally:
-        await rag.finalize_storages()
+
+    import lightrag.operate as operate
+
+    monkeypatch.setattr(operate, "check_chunk_relation_keywords", check)
+    monkeypatch.setattr(kg_contract, "invert_keywords", lambda k, t: "changed_rule")
 
 
-@pytest.mark.parametrize("trouble", ["raises", "no-text"])
-async def test_a_failing_hook_in_the_rebuild_repairs_provenance(tmp_path, trouble):
-    """COLD1-02: the hook raises on (or cannot run for) a surviving chunk. The
-    deletion completes and says so; no item keeps the deleted chunk id or text
-    of a record the hook did not judge; the items the chunk touches keep their
-    stored descriptions with their provenance repaired."""
-    out = await _hook_trouble(tmp_path, trouble)
-    result, built, graph = out["result"], out["built"], out["graph"]
-    assert result.status == "success"
-    assert "completed with unreproducible items" in result.message
-    for data in (*graph["nodes"].values(), *graph["edges"].values()):
-        assert "B-chunk-000" not in data["source_id"]
+BUILT_UNDER = {
+    "contract": {"profile": "contract.yml"},
+    "contract+hook": {"profile": "contract.yml", "validator": kg_extraction_validator},
+}
+AFTER = {
+    "same": None,
+    "rules-version": "rules",
+    "hook-swapped": {"profile": "contract.yml", "validator": _OtherValidator()},
+    "hook-removed": {"profile": "contract.yml"},
+    "hook-added": {"profile": "contract.yml", "validator": kg_extraction_validator},
+    "hook-raises": {"profile": "contract.yml", "validator": _raising_validator},
+    "list-and-inverses-changed": {"profile": "other.yml"},
+    "inverses-removed": {"profile": "noinv.yml"},
+    "contract-off": {},
+    "text-mode": {"use_json": False},
+}
 
-    key = ("Beta Set", "Mid Tool")  # A and B only
-    assert graph["edges"][key]["source_id"] == "A-chunk-000"
-    assert graph["edges"][key]["description"] == built["edges"][key]["description"]
-    assert out["tracking"]["entities"]["Mid Tool"] == ["A-chunk-000"]
-    assert graph["nodes"]["Mid Tool"]["source_id"] == "A-chunk-000"
 
-    node = graph["nodes"]["Alpha Unit"]  # A, B and C
-    assert node["source_id"].split("<SEP>") == ["A-chunk-000", "C-chunk-000"]
-    assert node["description"] == built["nodes"]["Alpha Unit"]["description"]
+@pytest.mark.usefixtures("flipped_llm")
+@pytest.mark.parametrize("after", list(AFTER))
+@pytest.mark.parametrize("built_under", list(BUILT_UNDER))
+async def test_a_deletion_rebuilds_what_extraction_stored_whatever_the_config(
+    prompt_dir, other_profile, tmp_path, monkeypatch, built_under, after
+):
+    """COLD3-01, R1: a graph built under the contract (with or without the
+    hook), the configuration changed, a document deleted: the graph equals the
+    one the same deletion gives under the unchanged configuration, and the
+    flipped pairs keep their stored direction (``has_part``, ``used_by``)."""
+    before = BUILT_UNDER[built_under]
+    control = await _build_then_delete(tmp_path, before, before)
+    change = AFTER[after]
+    if change == "rules":
+        orig_open = sys.modules[__name__]._open
+        calls = []
+
+        async def _open_then_break(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 2:
+                _broken_rules(monkeypatch)
+            return await orig_open(*args, **kwargs)
+
+        monkeypatch.setattr(sys.modules[__name__], "_open", _open_then_break)
+        change = before
+    elif change is None:
+        change = before
+    out = await _build_then_delete(tmp_path, before, change)
+    assert out["result"].status == "success"
+    edges = control["graph"]["edges"]
+    if "hook" in built_under:
+        assert edges[("scale height", "thermosphere")]["source_id"] == "A-chunk-000"
+    assert edges[("Alpha Unit", "Zeta System")]["keywords"] == "has_part"
+    assert edges[("Beta Set", "Mid Tool")]["keywords"] == "used_by"
+    assert out["graph"] == control["graph"]
+    assert out["tracking"] == control["tracking"]
+
+
+# ------------------------------------------------------------- mixed graphs
+
+
+async def test_an_item_fed_by_a_legacy_chunk_and_a_stored_one(prompt_dir, tmp_path):
+    """Document A extracted without the contract (no stored records), C and B
+    with it; the inverse names are then dropped from the profile and B is
+    deleted. The items A and C share are rebuilt from A's cached extraction
+    (its keywords as written) and C's stored records (oriented as extraction
+    oriented them): the graph of A and C alone."""
+
+    async def run(docs, delete=None):
+        path, workspace = tmp_path / f"rag_{uuid4().hex}", f"kgc_{uuid4().hex}"
+        rag = await _open(path, workspace, _llm(_flipped))
+        try:
+            await _insert(rag, "A")
+        finally:
+            await rag.finalize_storages()
+        rag = await _open(path, workspace, _llm(_flipped), profile="contract.yml")
+        try:
+            await _insert(rag, *docs)
+        finally:
+            await rag.finalize_storages()
+        rag = await _open(path, workspace, _llm(_flipped), profile="noinv.yml")
+        try:
+            if delete:
+                assert (await rag.adelete_by_doc_id(delete)).status == "success"
+            rows = await rag.text_chunks.get_by_ids(["A-chunk-000", "C-chunk-000"])
+            assert [CHUNK_KG_RECORDS_FIELD in row for row in rows] == [False, True]
+            return _normalized(_graph(rag))
+        finally:
+            await rag.finalize_storages()
+
+    alone = await run(["C"])
+    rebuilt = await run(["C", "B"], delete="B")
+    edge = rebuilt["edges"][("Alpha Unit", "Zeta System")]
+    assert edge["keywords"] == "has_part,part_of"  # A as written, C oriented
+    assert edge["source_id"].split("<SEP>") == ["A-chunk-000", "C-chunk-000"]
+    assert rebuilt == alone
+
+
+# ------------------------------------------------- a chunk extracted again without
+
+
+async def test_a_chunk_extracted_again_without_the_contract_loses_its_records(
+    prompt_dir, tmp_path
+):
+    """Document A extracted under the contract, then processed again with
+    neither contract nor hook: its chunk keeps no records, and a deletion
+    rebuilds it by the plain re-parse, as a graph built without the contract
+    from the start."""
+    from lightrag.base import DocStatus
+
+    async def run(first_profile):
+        path, workspace = tmp_path / f"rag_{uuid4().hex}", f"kgc_{uuid4().hex}"
+        rag = await _open(path, workspace, _llm(_flipped), profile=first_profile)
+        try:
+            await _insert(rag, "A", "B")
+        finally:
+            await rag.finalize_storages()
+        rag = await _open(path, workspace, _llm(_flipped))
+        try:
+            status = await rag.doc_status.get_by_id("A")
+            await rag.doc_status.upsert(
+                {"A": {**status, "status": DocStatus.PROCESSING}}
+            )
+            await rag.apipeline_process_enqueue_documents()
+            assert (await rag.doc_status.get_by_id("A"))["status"] == (
+                DocStatus.PROCESSED
+            )
+            row = await rag.text_chunks.get_by_id("A-chunk-000")
+            assert CHUNK_KG_RECORDS_FIELD not in row
+            assert (await rag.adelete_by_doc_id("B")).status == "success"
+            return _graph(rag)
+        finally:
+            await rag.finalize_storages()
+
+    again = await run("contract.yml")
+    plain = await run(None)
+    edge = again["edges"][("Alpha Unit", "Zeta System")]
+    assert edge["keywords"] == "part_of"  # the plain re-parse: as the LLM wrote it
+    assert edge["source_id"] == "A-chunk-000"
+    assert again == plain
 
 
 # ------------------------------------------------- fold, inverse names and the gleaning
@@ -463,127 +613,240 @@ async def test_inverse_names_and_keyword_lists_are_read_under_the_contract(
         assert edge["source_id"] == "A-chunk-000"
 
 
-# ------------------------------------------------------- the fingerprint and its use
+class _ChunkStore:
+    """Text-chunk storage stub with the PostgreSQL-only entry points."""
+
+    def __init__(self, fail_write=False):
+        self.rows, self.cleared, self.written = {}, [], {}
+        self.fail_write = fail_write
+
+    async def get_by_id(self, key):
+        return self.rows.get(key)
+
+    async def upsert(self, rows):
+        self.rows.update(rows)
+
+    async def clear_kg_records(self, chunk_ids):
+        self.cleared.append(list(chunk_ids))
+
+    async def write_kg_records(self, chunk_id, records):
+        if self.fail_write:
+            raise RuntimeError("column write failed")
+        self.written[chunk_id] = records
 
 
-def test_the_contract_fingerprint():
-    from functools import partial
+def _extract_config(validator):
+    from lightrag.prompt import resolve_entity_extraction_prompt_profile
 
-    from lightrag.kg_contract import (
-        RELATIONSHIP_INVERSES_V31,
-        RELATIONSHIP_TYPES_V31,
-        contract_fingerprint,
-        validator_identity,
-    )
+    async def llm(prompt, system_prompt=None, history_messages=None, **_):
+        return _flipped("Report one. The Zeta System holds the Alpha Unit.")
 
-    types, inverses = RELATIONSHIP_TYPES_V31, RELATIONSHIP_INVERSES_V31
-    assert contract_fingerprint(None, None, None) is None
-    assert contract_fingerprint({}, {}, None) is None
-    base = contract_fingerprint(types, inverses, None)
-    assert base.startswith("kgc-") and len(base) == 20
-    # stable, and independent of the definitions' text and of the order
-    assert (
-        contract_fingerprint(
-            dict(reversed(list({k: "x" for k in types}.items()))), inverses, None
-        )
-        == base
-    )
-    others = {
-        contract_fingerprint(types, None, None),
-        contract_fingerprint(
-            {k: v for k, v in types.items() if k != "related_to"}, inverses, None
+    return {
+        "role_llm_funcs": {r: llm for r in ("extract", "keyword", "query", "vlm")},
+        "entity_extract_max_gleaning": 0,
+        "entity_extract_max_records": 100,
+        "entity_extract_max_entities": 40,
+        "addon_params": {},
+        "llm_model_max_async": 1,
+        "entity_extraction_use_json": True,
+        "kg_extraction_validator": validator,
+        "_entity_extraction_prompt_profile": resolve_entity_extraction_prompt_profile(
+            {}, True
         ),
-        contract_fingerprint(types, inverses, kg_extraction_validator),
-        contract_fingerprint(None, None, kg_extraction_validator),
     }
-    assert base not in others and len(others) == 4
 
-    def hook(chunk_key, chunk_text, nodes, edges):
-        return nodes, edges
 
-    assert validator_identity(hook).endswith(
-        "test_the_contract_fingerprint.<locals>.hook"
+CHUNKS = {
+    "c1": {
+        "tokens": 10,
+        "content": "The Zeta System holds the Alpha Unit.",
+        "full_doc_id": "doc-1",
+        "chunk_order_index": 0,
+    }
+}
+
+
+@pytest.mark.parametrize("validator", [None, kg_extraction_validator])
+async def test_extraction_clears_earlier_records_then_stores_its_own(validator):
+    """R6: before a document's chunks are extracted, records an earlier run
+    left are cleared (a no-op except on PostgreSQL); with a hook (or the
+    contract) each chunk's accepted records are written, without neither."""
+    from lightrag.operate import extract_entities
+
+    store = _ChunkStore()
+    await extract_entities(
+        CHUNKS, _extract_config(validator), text_chunks_storage=store
     )
-    assert validator_identity(partial(hook)) == validator_identity(hook)
-    assert validator_identity(_FlakyValidator()).endswith("._FlakyValidator")
-    hook.kg_validator_version = 2
-    assert validator_identity(hook).endswith(".hook/v2")
-    assert "kg_extraction_validator/v" in validator_identity(kg_extraction_validator)
+    assert store.cleared == [["c1"]]
+    if validator is None:
+        assert store.written == {}
+    else:
+        records = store.written["c1"]
+        assert records["format"] == 1
+        assert {r["entity_name"] for r in records["entities"]} == {
+            "Zeta System",
+            "Alpha Unit",
+        }
+        [relation] = records["relations"]
+        assert (relation["src_id"], relation["tgt_id"]) == ("Zeta System", "Alpha Unit")
+        assert relation["reverse_keywords"] == relation["keywords"] == "part_of"
 
 
-@pytest.mark.parametrize(
-    "made_under,mode",
-    [
-        ({}, "baseline"),  # before fingerprints, or no contract and no hook
-        ({"k1": "kgc-now", "k2": "kgc-now"}, "contract"),
-        ({"k1": "kgc-old", "k2": "kgc-old"}, "unreproducible"),
-        ({"k1": "kgc-now"}, "unreproducible"),  # COLD1-11: two runs, two configs
-        ({"k1": "kgc-now", "k2": "kgc-old"}, "unreproducible"),
-    ],
-)
-def test_how_a_chunk_is_re_parsed(made_under, mode):
-    from lightrag.operate import _cached_extraction_mode
+async def test_a_failed_records_write_fails_the_chunk():
+    from lightrag.operate import extract_entities
 
-    results = [("r1", 1, "k1"), ("r2", 2, "k2")]
-    row = {"llm_cache_list": ["k1", "k2"], "llm_cache_contract": made_under}
-    assert _cached_extraction_mode(row, results, "kgc-now") == mode
-    if not made_under:
-        assert _cached_extraction_mode(row, results, None) == "baseline"
-        assert _cached_extraction_mode(None, [("r1", 1)], "kgc-now") == "baseline"
-    elif mode == "contract":
-        # the contract switched off after the chunk was extracted under it
-        assert _cached_extraction_mode(row, results, None) == "unreproducible"
+    store = _ChunkStore(fail_write=True)
+    with pytest.raises(RuntimeError, match="column write failed"):
+        await extract_entities(
+            CHUNKS, _extract_config(kg_extraction_validator), text_chunks_storage=store
+        )
 
 
-async def test_extraction_records_the_fingerprint_only_under_a_contract(
+# ------------------------------------------------ kept summaries, the rollback policy
+
+
+async def test_a_kept_summary_gets_the_document_once_after_its_re_ingest(
     prompt_dir, tmp_path
 ):
-    from lightrag.kg_contract import contract_fingerprint
-    from lightrag.prompt import load_entity_extraction_prompt_profile
-
-    for profile, validator in (
-        (None, None),
-        ("contract.yml", None),
-        (None, kg_extraction_validator),
-    ):
-        rag = await _open(
-            tmp_path / f"rag_{uuid4().hex}",
-            f"kgc_{uuid4().hex}",
-            _llm(_first),
-            profile=profile,
-            validator=validator,
+    """COLD3-09, R9: a keep_summaries deletion keeps the summaries a rebuild
+    would need the LLM for and registers them; the hook is switched on before
+    the deletion. After the document's re-ingest the kept items are rebuilt from
+    the stored records, so the graph equals the one built before the deletion
+    and no description holds the document's text twice."""
+    path, workspace = tmp_path / f"rag_{uuid4().hex}", f"kgc_{uuid4().hex}"
+    kw = dict(profile="contract.yml", force_llm_summary_on_merge=2)
+    rag = await _open(path, workspace, _llm(_flipped), **kw)
+    try:
+        await _insert(rag, "A", "B", "C")
+        built = _graph(rag)
+    finally:
+        await rag.finalize_storages()
+    rag = await _open(
+        path, workspace, _llm(_flipped), validator=_OtherValidator(), **kw
+    )
+    try:
+        result = await rag.adelete_by_doc_id("B", keep_summaries=True)
+        assert result.status == "success"
+        registry = json.loads((path / "kg_kept_summaries.json").read_text())
+        assert "Alpha Unit" in registry["B"]["entities"]
+    finally:
+        await rag.finalize_storages()
+    rag = await _open(path, workspace, _llm(_flipped), **kw)
+    try:
+        await _insert(rag, "B")
+        again = _graph(rag)
+        assert not (path / "kg_kept_summaries.json").exists() or not json.loads(
+            (path / "kg_kept_summaries.json").read_text()
         )
+    finally:
+        await rag.finalize_storages()
+    for data in (*again["nodes"].values(), *again["edges"].values()):
+        assert data["description"].count(" B.") <= 1
+    assert again["edges"][("Alpha Unit", "Zeta System")]["keywords"] == "has_part"
+
+    def provenance_sorted(graph):
+        # the re-ingested document's chunk now comes last
+        for data in (*graph["nodes"].values(), *graph["edges"].values()):
+            for field in ("source_id", "file_path"):
+                data[field] = sorted(data[field].split("<SEP>"))
+        return graph
+
+    assert provenance_sorted(again) == provenance_sorted(built)
+
+
+async def test_the_rollback_policy_reads_stored_records_without_the_cache(
+    prompt_dir, tmp_path
+):
+    """Under ``rollback``, a chunk with stored records needs no extraction
+    cache: its items are rebuilt from the records, not structurally repaired."""
+    from lightrag.operate import rebuild_knowledge_from_chunks
+
+    path, workspace = tmp_path / f"rag_{uuid4().hex}", f"kgc_{uuid4().hex}"
+    rag = await _open(path, workspace, _llm(_flipped), profile="contract.yml")
+    try:
+        await _insert(rag, "A", "B")
+        await rag.llm_response_cache.drop()
+        report = await rebuild_knowledge_from_chunks(
+            entities_to_rebuild={"Alpha Unit": ["A-chunk-000"]},
+            relationships_to_rebuild={("Alpha Unit", "Zeta System"): ["A-chunk-000"]},
+            knowledge_graph_inst=rag.chunk_entity_relation_graph,
+            entities_vdb=rag.entities_vdb,
+            relationships_vdb=rag.relationships_vdb,
+            text_chunks_storage=rag.text_chunks,
+            llm_response_cache=rag.llm_response_cache,
+            global_config=rag._build_global_config(),
+            rebuild_policy="rollback",
+        )
+        graph = _graph(rag)
+    finally:
+        await rag.finalize_storages()
+    assert not report.has_warnings
+    edge = graph["edges"][("Alpha Unit", "Zeta System")]
+    assert (edge["keywords"], edge["description"]) == ("has_part", "ZA A.")
+    assert graph["nodes"]["Alpha Unit"]["description"] == "A A."
+
+
+# ---------------------------------------------- a gleaning correction, also truncated
+
+CORRECTION_TEXT = "Report one. Alpha Unit is a component of the Zeta System."
+WRONG = ("Zeta System", "Alpha Unit", "part_of", "Zeta part of Alpha.")
+CORRECTED = ("Alpha Unit", "Zeta System", "part_of", "Corrected: Alpha in Zeta.")
+
+
+def _correction_llm(truncated: bool):
+    units = [
+        ("Alpha Unit", "Concept", "A unit."),
+        ("Zeta System", "Concept", "A system."),
+    ]
+
+    def first(text):
+        if text == CORRECTION_TEXT:
+            return _reply(units, [WRONG])
+        return _reply(
+            units, [("Alpha Unit", "Zeta System", "part_of", "Alpha in Zeta (B).")]
+        )
+
+    def glean(text):
+        if text != CORRECTION_TEXT:
+            return NO_REPLY
+        reply = _reply((), [CORRECTED])
+        # A truncated reply is parsed and merged but never cached.
+        return TruncatedResponse(reply) if truncated else reply
+
+    return _llm(first, glean)
+
+
+@pytest.mark.parametrize("truncated", [False, True], ids=["cached", "truncated"])
+@pytest.mark.parametrize("after", ["same", "contract-off"])
+async def test_a_gleaning_direction_correction_survives_a_deletion(
+    prompt_dir, tmp_path, truncated, after
+):
+    """COLD3-05: the gleaning turn corrects the first pass's direction; a
+    deletion of another document rebuilds the edge as extraction stored it,
+    also when the gleaning reply was truncated (and so not cached)."""
+
+    async def run(docs, delete):
+        path, workspace = tmp_path / f"rag_{uuid4().hex}", f"kgc_{uuid4().hex}"
+        llm = _correction_llm(truncated)
+        rag = await _open(path, workspace, llm, profile="contract.yml", gleaning=1)
         try:
-            await _insert(rag, "C")
-            row = await rag.text_chunks.get_by_id("C-chunk-000")
+            for doc_id, text in docs:
+                await rag.ainsert(text, ids=[doc_id], file_paths=[f"{doc_id}.txt"])
         finally:
             await rag.finalize_storages()
-        if profile is None and validator is None:
-            assert "llm_cache_contract" not in row
-            continue
-        types = inverses = None
-        if profile:
-            loaded = load_entity_extraction_prompt_profile(
-                prompt_dir / "entity_type" / profile
-            )
-            types, inverses = (
-                loaded["relationship_types"],
-                loaded["relationship_inverses"],
-            )
-        expected = contract_fingerprint(types, inverses, validator)
-        assert row["llm_cache_contract"] == {
-            key: expected for key in row["llm_cache_list"]
-        }
+        profile = "contract.yml" if after == "same" else None
+        rag = await _open(path, workspace, llm, profile=profile, gleaning=1)
+        try:
+            if delete:
+                assert (await rag.adelete_by_doc_id(delete)).status == "success"
+            return _normalized(_graph(rag))
+        finally:
+            await rag.finalize_storages()
 
-
-def test_the_postgres_column_reads_like_the_other_backends():
-    from lightrag.kg.postgres_impl import _dump_cache_contract, _parse_cache_contract
-
-    row = {"id": "c1", "llm_cache_contract": None}
-    _parse_cache_contract(row)
-    assert row == {"id": "c1"}  # a NULL column is no key, as before the column
-    row = {"id": "c1", "llm_cache_contract": '{"k1": "kgc-a"}'}
-    _parse_cache_contract(row)
-    assert row == {"id": "c1", "llm_cache_contract": {"k1": "kgc-a"}}
-    assert _dump_cache_contract({"id": "c1"}) is None
-    assert _dump_cache_contract(row) == '{"k1": "kgc-a"}'
+    alone = await run([("A", CORRECTION_TEXT)], None)
+    rebuilt = await run(
+        [("A", CORRECTION_TEXT), ("B", "Report two. Alpha Unit sits in Zeta.")], "B"
+    )
+    edge = alone["edges"][("Alpha Unit", "Zeta System")]
+    assert (edge["keywords"], edge["description"]) == ("part_of", CORRECTED[3])
+    assert rebuilt == alone

@@ -84,33 +84,3 @@ async def test_a_failing_write_reports_failure_without_raising():
     storage.fail_on_upsert = True
 
     assert await update_chunk_cache_list("chunk-1", storage, ["k1"]) is False
-
-
-@pytest.mark.asyncio
-async def test_the_extraction_contract_is_recorded_per_key():
-    """Fork (extraction contract): the fingerprint the extraction behind a key
-    was post-processed under is recorded with the reference, and a re-attach
-    under another fingerprint rewrites it; the same one costs no write."""
-    storage = _FakeKV({"chunk-1": {"content": "c"}})
-
-    await update_chunk_cache_list("chunk-1", storage, ["k1"], cache_contract="kgc-a")
-    assert storage.data["chunk-1"]["llm_cache_contract"] == {"k1": "kgc-a"}
-    await update_chunk_cache_list("chunk-1", storage, ["k1"], cache_contract="kgc-a")
-    assert storage.upserts == 1
-    await update_chunk_cache_list("chunk-1", storage, ["k1"], cache_contract="kgc-b")
-    assert storage.data["chunk-1"]["llm_cache_contract"] == {"k1": "kgc-b"}
-    assert storage.data["chunk-1"]["llm_cache_list"] == ["k1"]
-    assert storage.upserts == 2
-
-    # a run without a contract takes its key back out of the mapping
-    await update_chunk_cache_list("chunk-1", storage, ["k1"])
-    assert storage.data["chunk-1"]["llm_cache_contract"] == {}
-    assert storage.upserts == 3
-
-
-@pytest.mark.asyncio
-async def test_without_a_contract_a_row_is_written_as_before():
-    storage = _FakeKV({"chunk-1": {"content": "c", "llm_cache_list": ["k0"]}})
-
-    await update_chunk_cache_list("chunk-1", storage, ["k1"])
-    assert storage.data["chunk-1"] == {"content": "c", "llm_cache_list": ["k0", "k1"]}

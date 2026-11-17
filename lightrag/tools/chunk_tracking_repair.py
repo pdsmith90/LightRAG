@@ -34,14 +34,9 @@ from typing import Any
 from dotenv import load_dotenv
 
 from lightrag.base import CURSOR_END, CURSOR_START, DocStatus
-from lightrag.constants import (
-    DEFAULT_KG_CONTRACT_VALIDATOR,
-    DEFAULT_WORKING_DIR,
-    RELATION_NO_EVIDENCE_SOURCE_IDS,
-)
+from lightrag.constants import DEFAULT_WORKING_DIR, RELATION_NO_EVIDENCE_SOURCE_IDS
 from lightrag.utils import (
     EmbeddingFunc,
-    get_env_value,
     has_chunk_tracking_row,
     logger,
     make_relation_chunk_key,
@@ -290,11 +285,6 @@ class ChunkTrackingRepairReport:
     chunks_with_cache: int = 0
     chunks_with_attribution: int = 0
     chunks_without_cache: int = 0
-    # Fork (extraction contract): chunks whose cached extraction was made under
-    # another contract or hook (attributed from the plain re-parse), and chunks
-    # the current contract or hook failed on (no attribution from them).
-    chunks_unreproducible: int = 0
-    chunks_reprocess_failed: int = 0
     graph_entities: int = 0
     graph_relations: int = 0
     existing_entity_rows: int = 0
@@ -651,8 +641,6 @@ async def build_chunk_tracking_repair_plan(
                 report.chunks_with_cache,
                 report.chunks_with_attribution,
                 report.chunks_without_cache,
-                report.chunks_unreproducible,
-                report.chunks_reprocess_failed,
             ) = await _accumulate_cached_attribution(rag, disk)
         else:
             report.chunks_without_cache = report.scanned_chunks
@@ -854,34 +842,16 @@ async def _collect_graph_objects(rag, disk: _DiskPlan) -> None:
 async def _accumulate_cached_attribution(
     rag,
     disk: _DiskPlan,
-) -> tuple[int, int, int, int, int]:
-    from lightrag.kg_contract import (
-        active_contract_fingerprint,
-        relation_inverse_table,
-        relation_types,
-    )
+) -> tuple[int, int, int]:
+    from lightrag.kg_contract import chunk_result_from_records
     from lightrag.operate import (
-        _cached_extraction_mode,
         _get_cached_extraction_results,
         _rebuild_from_extraction_result,
-        _reparse_contract_extraction,
     )
-
-    # A chunk's records are the ones its extraction stored, so each chunk's
-    # cached extraction is re-parsed as the knowledge rebuild re-parses it: with
-    # the current extraction contract and hook when its recorded contract
-    # fingerprint is the current one, plainly when it has none, and plainly but
-    # counted as unreproducible when it was made under another configuration.
-    global_config = rag._build_global_config()
-    current_contract = active_contract_fingerprint(global_config)
-    kg_extraction_validator = global_config.get("kg_extraction_validator")
-    relationship_types = relation_types(global_config)
-    relation_inverses = relation_inverse_table(global_config)
+    from lightrag.utils import read_chunk_kg_records
 
     with_cache = 0
     with_attribution = 0
-    unreproducible = 0
-    reprocess_failed = 0
     for batch in disk.iter_chunks(_CHUNK_SCAN_BATCH):
         missing = await rag.text_chunks.filter_keys(set(batch))
         batch = [chunk_id for chunk_id in batch if chunk_id not in missing]
@@ -891,48 +861,45 @@ async def _accumulate_cached_attribution(
             rag.llm_response_cache,
             set(batch),
             text_chunks_storage=rag.text_chunks,
-            with_cache_ids=True,
         )
-        for chunk_id, results in cached_results.items():
-            mode = _cached_extraction_mode(
-                chunk_data_by_id.get(chunk_id), results, current_contract
-            )
-            if mode == "contract":
-                try:
-                    entities, relationships = await _reparse_contract_extraction(
-                        rag.text_chunks,
-                        chunk_id,
-                        results,
-                        chunk_data_by_id.get(chunk_id),
-                        relationship_types=relationship_types,
-                        relation_inverses=relation_inverses,
-                        kg_extraction_validator=kg_extraction_validator,
-                    )
-                except Exception as exc:
-                    reprocess_failed += 1
-                    logger.warning(
-                        "Chunk tracking repair: cached extraction of chunk "
-                        f"{chunk_id} could not be re-processed under the "
-                        f"extraction contract; no attribution from it: {exc}"
-                    )
-                    continue
-                with_cache += 1
-                if entities or relationships:
-                    with_attribution += 1
-                _add_attribution(disk, chunk_id, entities, relationships)
+        # Fork (extraction contract): a chunk extracted with the contract or an
+        # extraction hook is attributed from the records its extraction
+        # accepted, which name what the graph got (a hook's renames included);
+        # it counts as a chunk with its cache. The others as before.
+        stored_records = await read_chunk_kg_records(
+            rag.text_chunks, batch, chunk_data_by_id
+        )
+        for chunk_id, stored in stored_records.items():
+            try:
+                entities, relationships = chunk_result_from_records(stored)
+            except ValueError as exc:
+                logger.warning(
+                    "Chunk tracking repair: unusable stored extraction records "
+                    f"for chunk {chunk_id}: {exc}"
+                )
                 continue
-
-            if mode == "unreproducible":
-                unreproducible += 1
+            with_cache += 1
+            if entities or relationships:
+                with_attribution += 1
+            for entity_name in entities:
+                if disk.object_exists("entity_chunks", entity_name):
+                    disk.add_row("entity_chunks", entity_name, [chunk_id])
+            for src, tgt in relationships:
+                storage_key = make_relation_chunk_key(src, tgt)
+                if disk.object_exists("relation_chunks", storage_key):
+                    disk.add_row("relation_chunks", storage_key, [chunk_id])
+        for chunk_id, results in cached_results.items():
+            if chunk_id in stored_records:
+                continue
             parsed_any = False
             attributed_any = False
-            for result in results:
+            for extraction_result, timestamp in results:
                 try:
                     entities, relationships = await _rebuild_from_extraction_result(
                         text_chunks_storage=rag.text_chunks,
                         chunk_id=chunk_id,
-                        extraction_result=result[0],
-                        timestamp=result[1],
+                        extraction_result=extraction_result,
+                        timestamp=timestamp,
                         chunk_data=chunk_data_by_id.get(chunk_id),
                     )
                 except Exception as exc:
@@ -944,46 +911,21 @@ async def _accumulate_cached_attribution(
                 parsed_any = True
                 if entities or relationships:
                     attributed_any = True
-                _add_attribution(disk, chunk_id, entities, relationships)
+                for entity_name in entities:
+                    if disk.object_exists("entity_chunks", entity_name):
+                        disk.add_row("entity_chunks", entity_name, [chunk_id])
+                for src, tgt in relationships:
+                    storage_key = make_relation_chunk_key(src, tgt)
+                    if disk.object_exists("relation_chunks", storage_key):
+                        disk.add_row("relation_chunks", storage_key, [chunk_id])
             if parsed_any:
                 with_cache += 1
             if attributed_any:
                 with_attribution += 1
-    return (
-        with_cache,
-        with_attribution,
-        disk.count("chunks") - with_cache,
-        unreproducible,
-        reprocess_failed,
-    )
-
-
-def _add_attribution(
-    disk: _DiskPlan, chunk_id: str, entities: dict, relationships: dict
-) -> None:
-    for entity_name in entities:
-        if disk.object_exists("entity_chunks", entity_name):
-            disk.add_row("entity_chunks", entity_name, [chunk_id])
-    for src, tgt in relationships:
-        storage_key = make_relation_chunk_key(src, tgt)
-        if disk.object_exists("relation_chunks", storage_key):
-            disk.add_row("relation_chunks", storage_key, [chunk_id])
+    return with_cache, with_attribution, disk.count("chunks") - with_cache
 
 
 def _add_plan_warnings(report: ChunkTrackingRepairReport) -> None:
-    if report.chunks_unreproducible:
-        report.warnings.append(
-            f"{report.chunks_unreproducible} chunk(s) were extracted under another "
-            "extraction contract or hook than the configured one; they are "
-            "attributed from their plain cached extraction, which may miss "
-            "objects that contract or hook renamed."
-        )
-    if report.chunks_reprocess_failed:
-        report.warnings.append(
-            f"{report.chunks_reprocess_failed} chunk(s) could not be re-processed "
-            "under the configured extraction contract or hook (it raised, or the "
-            "chunk has no text); they add no attribution."
-        )
     if report.chunks_without_cache:
         report.warnings.append(
             f"{report.chunks_without_cache} of {report.scanned_chunks} chunk(s) "
@@ -1133,7 +1075,6 @@ def _print_run_status(message: str) -> None:
 
 async def _build_rag():
     from lightrag import LightRAG
-    from lightrag.kg_contract import kg_extraction_validator
 
     async def _noop_llm(*_args, **_kwargs) -> str:
         raise RuntimeError("chunk_tracking_repair never calls the LLM")
@@ -1142,15 +1083,6 @@ async def _build_rag():
         raise RuntimeError("chunk_tracking_repair never embeds")
 
     return LightRAG(
-        # The server's extraction hook (KG_CONTRACT_VALIDATOR) decided which
-        # records each chunk stored; attribution re-applies it.
-        **(
-            {"kg_extraction_validator": kg_extraction_validator}
-            if get_env_value(
-                "KG_CONTRACT_VALIDATOR", DEFAULT_KG_CONTRACT_VALIDATOR, bool
-            )
-            else {}
-        ),
         working_dir=os.getenv("WORKING_DIR", DEFAULT_WORKING_DIR),
         workspace=os.getenv("WORKSPACE", ""),
         kv_storage=os.getenv("LIGHTRAG_KV_STORAGE", "JsonKVStorage"),
