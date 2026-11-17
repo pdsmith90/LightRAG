@@ -8,7 +8,7 @@ original and the canonical name. Apparatus names never become canonical. Off,
 nothing changes. All names below are invented.
 """
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -175,6 +175,45 @@ async def test_build_fold_map_reads_the_graph():
 
     assert await fold_mod.build_fold_map(_Graph()) == 4
     assert fold_mod.is_armed()
+
+
+def _pgtable_graph(rows):
+    """A PGTableGraphStorage whose _fetch answers ``rows``, built without a
+    database the way the storage's own offline tests build it."""
+    from lightrag.kg.pgtable_impl import PGTableGraphStorage
+
+    graph = object.__new__(PGTableGraphStorage)
+    graph.workspace = "ws"
+    graph.namespace = "chunk_entity_relation"
+    graph.global_config = {}
+    graph.db = MagicMock()
+    graph._fetch = AsyncMock(return_value=rows)
+    return graph
+
+
+async def test_build_fold_map_reads_the_table_graph():
+    graph = _pgtable_graph([{"name": n, "type": t, "degree": d} for n, t, d in NODES])
+    assert await fold_mod.build_fold_map(graph) == 4
+    assert fold_mod.is_armed()
+    [call] = graph._fetch.call_args_list
+    sql, *params = call.args
+    assert "lightrag_graph_nodes" in sql and "lightrag_graph_edges" in sql
+    assert '"DIRECTED"' not in sql
+    # both tables are read for this storage's workspace and namespace only
+    assert params == ["ws", "chunk_entity_relation"]
+    assert sql.count("workspace = $1 AND namespace = $2") == 2  # the edges
+    assert "WHERE n.workspace = $1 AND n.namespace = $2" in sql  # the nodes
+    # the best-connected spelling wins, as with the AGE graph
+    assert canonical_name("imaginary-filter") == "Imaginary Filter"
+
+
+def test_build_fold_map_counts_both_edge_columns_for_the_table_graph():
+    # one row per undirected edge in canonical order: a node's degree is its
+    # appearances as src_id plus as tgt_id
+    sql = fold_mod._PGTABLE_FOLD_SQL
+    assert "SELECT src_id AS id FROM lightrag_graph_edges" in sql
+    assert "SELECT tgt_id FROM lightrag_graph_edges" in sql
+    assert "UNION ALL" in sql and "LEFT JOIN" in sql
 
 
 async def test_build_fold_map_needs_a_supported_graph():
