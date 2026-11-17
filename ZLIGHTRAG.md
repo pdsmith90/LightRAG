@@ -453,10 +453,10 @@ by an attachment key, a DOI or a schema `paper_id`; papers in results carry `in_
 | Route | Parameters | Answer |
 |---|---|---|
 | `GET /graph/papers/related` | `paper`; `relations` (comma-separated `cites`, `cited_by`, `coupled`, `coauthor`; default all); `limit` 1..200 (20) | `paper`, `totals` per relation, `ranking`, `related` (each with `reasons`, `score`, `shared_refs` / `coupling_score`, `shared_authors`), `truncated`; `reason: not_in_structure` for an unknown paper |
-| `GET /graph/papers/topics` | `q` (words of the name), `level` (`domain`, `field`, `subfield`, `topic`), `limit` | `total`, `topics` (each with `path`, `n_papers`: a topic row under it, `n_primary`: primary topic under it) |
-| `GET /graph/papers/by_topic` | `topic` (id at any level, or words of its name), `limit`, `primary_only` | `topic`, `alternatives` (next name matches), `total`, `in_kb`, `ranking`, `papers`; `reason: no_topic` |
+| `GET /graph/papers/topics` | `q` (words of the name: each a whole word of it, or the start of one when it has four letters or more), `level` (`domain`, `field`, `subfield`, `topic`), `limit` | `total`, `topics` (each with `path`, `n_papers`: a topic row under it, `n_primary`: primary topic under it) |
+| `GET /graph/papers/by_topic` | `topic` (id at any level, or words of its name, matched as for `topics`), `limit`, `primary_only` | `topic`, `alternatives` (next name matches), `total`, `in_kb`, `ranking`, `papers`; `reason: no_topic` (also for a blank `topic`) |
 | `GET /graph/papers/connect` | `a`, `b`, `paths` 1..5 (3), `max_hops` 1..8 (6) | `a`, `b`, `links` (`relation`, `shared_refs` / `coupling_score`, `shared_authors`, `same_topic` / `same_subfield` / `same_field`, `cited_by_both`, `cite_both`), `paths` (each with `hops`, `cost`, `papers` passed through and labelled `steps`), `max_hops`; `reason`: `not_in_structure` (with `missing`), `same_paper`, `not_connected` (with a `message` naming the step limit and the links) |
-| `GET /graphs/paper/map` | `paper` (repeat, at most 10), `hops` 1..2 (1), `max_nodes` (capped by `MAX_GRAPH_NODES`) | the `/graphs` structure plus `paper` (the papers' summaries, `n_hop1` / `n_hop2` found, `shown_hop1` / `shown_hop2`, `n_links` found among the shown papers and `shown_links` drawn, `ranking`); `is_truncated` also when links were dropped; `paper.reason`: `too_many_papers`, `not_in_structure`, `no_links` |
+| `GET /graphs/paper/map` | `paper` (repeat, at most 10), `hops` 1..2 (1), `max_nodes` (default 150; capped by `MAX_GRAPH_NODES`) | the `/graphs` structure plus `paper` (the papers' summaries, `n_papers` found and `shown_papers` shown, `max_nodes` the limit applied and `max_nodes_cap` the server's, `n_hop1` / `n_hop2` found, `shown_hop1` / `shown_hop2`, `n_links` found among the shown papers, `shown_links` drawn and `links_thinned`, `ranking`); `is_truncated` only when papers were left out; `paper.reason`: `too_many_papers`, `not_in_structure`, `no_links` |
 
 Rankings, also stated in each answer: related papers score 1.0 for a citation either
 way (+0.25 both ways), plus 2 x the coupling score, plus 0.25 per shared author (at
@@ -477,24 +477,45 @@ coupling: the chosen papers, then one-step papers by the strength of their links
 them (1.0 when either cites the other, once even if both do, plus 2 x the coupling
 score), then two-step papers by
 the strength of the one-step papers they link to, each damped by log2(2 + its links),
-cut at the node limit. Links among the shown papers are thinned, since a two-step map
+cut at the map's own paper limit: 150 unless `max_nodes` asks for more, never above the
+server's `MAX_GRAPH_NODES` (a map of a heavily cited paper has up to a thousand papers
+and cannot be read, so the graph viewer's general node limit does not apply to it).
+`paper.n_papers` and `paper.shown_papers` say how many papers were found and how many are
+shown; `is_truncated` means papers were left out, not links. Links among the shown papers
+are thinned, since a two-step map
 of a much cited paper has tens of thousands: every link of a chosen paper is kept, each
 other paper keeps its six strongest (ties broken by id), and at most four times the
-node limit are drawn, the weakest links of papers that were not chosen going first;
-`paper.n_links` and `paper.shown_links` say how many there were and how many are drawn.
+paper limit are drawn, the weakest links of papers that were not chosen going first; but
+a shown paper that has any link among the shown papers keeps its strongest one, so no
+paper floats unconnected and the total can exceed the cap by a few.
+`paper.n_links` and `paper.shown_links` say how many there were and how many are drawn,
+`paper.links_thinned` whether some were left out.
 A node is a paper: its id the DOI (else an attachment key),
 its label "Family Year", `entity_type` the field of its primary topic (so the legend
 colours fields), and its properties title, year, venue, DOI, authors, topic,
-subfield, counts, `in_kb` and `attachment_key`. An edge runs from the citing to the
+subfield, counts, `in_kb`, `attachment_key` (the one in the knowledge base, else the first)
+and `attachment_keys` (all of them). An edge runs from the citing to the
 cited paper (`DIRECTED`; coupling-only pairs are `UNDIRECTED`), with `keywords`
 `cites`, `cite each other`, `coupled` or both, and `weight` 1.0 for a citation either
 way (once when both papers cite each other) plus 2 x the coupling score. The response
 is encoded in the thread that builds the map. In the WebUI the picker's mode button reaches the map after
 "in common" (label `paper+map:<ids>`) while `/health` reports `zotero_struct: true`;
 in map mode the second button sets the reach, one or two steps (remembered per
-browser). Expanding a node adds that paper to the map's papers instead of expanding
-an entity (unless the node already is one of the chosen papers, by DOI, attachment key
-or structure id, which the WebUI says), and map nodes and edges are not editable. Both
+browser), and its tooltip names the paper limit. The map's summary line says how many
+papers were found and how many are shown; when papers were left out and the server would
+show more, a "Show more papers" button next to the chosen papers asks again for twice the
+limit (150, 300, 600, up to `paper.max_nodes_cap`) for the current selection only: another
+selection starts at 150 again. The generic "truncated" toast appears only when papers were left out;
+thinned links are said in the summary line. Citations are drawn as arrows from the citing
+to the cited paper in one colour (two papers citing each other: the same colour, no
+arrowhead), and links that are only shared references (coupling) as plain lines in a
+second colour; the legend names both while a map is shown. A map turns edge events on for
+itself (the "Edge Events" setting stays as it was for entity graphs, where it is off by
+default), so a click on a link selects it: the properties panel then shows its kind, the
+direction in words ("A cites B") and, for coupling, how many references the papers share.
+Expanding a node adds that paper to the map's papers instead of expanding
+an entity (unless the node already is one of the chosen papers, by DOI, any of its
+attachment keys or structure id, which the WebUI says), and map nodes and edges are not editable. Both
 follow the graph on screen: it is marked as a map when it loads, so an entity graph left
 on screen by a failed map fetch stays editable. A map label against a server without the
 map (501, or 404 from an older server) shows one message and falls back to the papers'
