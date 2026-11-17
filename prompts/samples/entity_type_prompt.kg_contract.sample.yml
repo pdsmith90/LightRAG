@@ -1,0 +1,266 @@
+# Entity-type profile with an extraction contract, for a knowledge base of research papers
+# in geodesy, hydrology and space physics. Copy it to PROMPT_DIR/entity_type/ and name it in
+# ENTITY_TYPE_PROMPT_FILE; it needs ENTITY_EXTRACTION_USE_JSON=true.
+#
+# `relationship_types` switches the extraction contract on (lightrag/kg_contract.py): the list
+# is appended to the guidance below as `name = definition` lines with a read-it-back direction
+# check, and the JSON system prompt's naming, keyword and direction rules are replaced by the
+# contract's. Each definition says what SOURCE and TARGET must be; `related_to` is the answer
+# when no other type fits. `relationship_inverses` keeps the direction in the graph (below).
+# Print the matching request schema with
+#   python -m lightrag.kg_contract --schema --profile <this file>
+entity_types_guidance: |
+  Classify each entity using one of the following types. If no type fits, use `Other`.
+
+  - Concept: physical phenomena, processes, theories, theorems and principles (e.g. gravity wave momentum flux, terrestrial water storage, hydrostatic equilibrium, ill-posed problem, central limit theorem)
+  - Quantity: named physical parameters, coefficients, statistics, error terms and observables (e.g. C20 coefficient, total electron content, geoid height, K-band range rate, condition number, root-mean-square error)
+  - Method: algorithms, estimators, processing techniques, models and inversions (e.g. mascon solution, Kalman filter, radio occultation retrieval, spherical harmonic analysis, Tikhonov regularization, bootstrap)
+  - Mission: satellites, missions and constellations (e.g. GRACE, GRACE-FO, GOCE, CHAMP, TIMED, Swarm, GPS)
+  - Instrument: sensors, payloads and ground facilities (e.g. SABER, K-band ranging system, accelerometer, incoherent scatter radar, laser retroreflector array)
+  - Dataset: named data products, releases, reanalyses and reference models used as data (e.g. RL06 mascons, GLDAS, ERA5, EGM2008, IGRF-13, Level-1B data)
+  - Software: named codes, toolboxes and hardware platforms (e.g. GEODYN, GROOPS, a MATLAB toolbox)
+  - Organization: agencies, centers and consortia ONLY when they act in the text -- operate a mission, produce or distribute a data product, run a network (e.g. JPL, GFZ, CSR, NASA, ESA)
+  - Location: geographic or geophysical regions and layers under study (e.g. Greenland, High Plains Aquifer, Amazon basin, mesosphere-lower thermosphere, polar cap)
+  - Event: named natural or programmatic events and epochs (e.g. the 2011 Texas drought, the 2004 Sumatra earthquake, solar cycle 24, the 2017-2018 GRACE/GRACE-FO gap)
+
+  Naming. Name each entity once, with the spelling the text uses: acronyms in capitals (GRACE, GOCE, TEC); other names as the text's proper noun or in lower case. Never glue words into one identifier (write "scale height", never "ScaleHeight" or "scale_height"). Never add a second entity for the same thing with another capitalization or a qualifier such as "data", "mission", "satellites" or "observations" (write GRACE, not "GRACE data"). The one exception: when the text itself defines an acronym, as in "total electron content (TEC)", list both names as entities of the same type and join them with one `same_as` relationship.
+
+  Never extract the following as entities, under any type, not even `Other`.
+  - People (authors, co-authors, editors, cited researchers, acknowledged colleagues, reviewers). When the text says "Landerer and Swenson (2012) showed X", extract the concepts in X, never the names.
+  - Citation apparatus (reference-list entries, journal or publisher names, volume and page numbers, DOIs, URLs, report numbers).
+  - Mathematical notation (single letters, variable or symbol names such as A, x, f, a_n, f(x), subscripts, equation fragments and numbers). Name the quantity the symbol stands for instead, if the text gives it.
+  - Months, dates, years and time stamps; a named epoch belongs under Event only when the text studies it.
+  - Figure, table, equation, section and example labels (Table 1, Fig. 3, Eq. 12, Section 2.1) and the captions' generic words.
+  - Author affiliations and funding bodies that appear only in acknowledgements.
+  - Section headings and generic words ("data", "study", "results", "this paper", "the authors", "the model").
+relationship_types:
+  is_a: "SOURCE is a kind or an instance of TARGET (the specific thing is the source)"
+  part_of: "SOURCE is a component, member or subgroup of TARGET, or is contained in it (the smaller thing is the source)"
+  same_as: "SOURCE and TARGET name the same thing: an acronym and its expansion, a synonym"
+  measures: "SOURCE is an instrument, mission, network or survey that observes or records TARGET"
+  estimates: "SOURCE is a method, model or analysis that computes, retrieves or predicts TARGET, a quantity or field"
+  uses: "SOURCE is a method, model, study, system or organization that takes TARGET as input, data, tool or assumption"
+  applied_to: "SOURCE is a method, model or analysis and TARGET is the region, object, problem or data it is applied to"
+  produces: "SOURCE generates TARGET as its output: a data product, a result, a signal"
+  derived_from: "SOURCE is computed, adapted, extended or generalized from TARGET (the newer or derived thing is the source)"
+  operates: "SOURCE is an organization that builds, runs, maintains or distributes TARGET"
+  located_in: "SOURCE lies in, occurs in or is observed at TARGET, a region, layer, body or site"
+  affects: "SOURCE causes, drives, changes, biases or limits TARGET"
+  corrects: "SOURCE is a method, model or filter that removes or reduces TARGET, an error or unwanted signal"
+  compared_with: "SOURCE is compared with, validated against or benchmarked against TARGET"
+  depends_on: "SOURCE is a quantity, result or property whose value is determined by TARGET"
+  has_property: "TARGET is a quantity, parameter or metric that describes or evaluates SOURCE"
+  related_to: "the text links the two and no type above fits exactly"
+# The graph stores each pair once, in sorted order, so a relation the sort flips is stored
+# under the inverse name of its type ("GRACE part_of Constellation" becomes Constellation
+# has_part GRACE). The LLM never sees these names. A type not listed here is symmetric.
+relationship_inverses:
+  is_a: has_kind
+  part_of: has_part
+  measures: measured_by
+  estimates: estimated_by
+  uses: used_by
+  applied_to: target_of
+  produces: produced_by
+  derived_from: source_of
+  operates: operated_by
+  located_in: location_of
+  affects: affected_by
+  corrects: corrected_by
+  depends_on: determines
+  has_property: property_of
+entity_extraction_json_examples:
+  - |
+    Worked example 1 (an illustration of the format and of what to leave out: the citation, the label and the symbols in it produce no entity). Passage:
+    The GRACE mission measured changes in Earth's gravity field with its K-band ranging system. Monthly mascon solutions estimate terrestrial water storage (TWS) over the Amazon basin. A decorrelation filter removes the north-south stripes from the spherical harmonic solutions, and the TWS estimates were compared with GLDAS (Smith et al., 2010; Table 2).
+    Output:
+    {
+      "entities": [
+        {
+          "name": "GRACE",
+          "type": "Mission",
+          "description": "Satellite mission that measured changes in Earth's gravity field."
+        },
+        {
+          "name": "K-band ranging system",
+          "type": "Instrument",
+          "description": "Ranging instrument carried by GRACE."
+        },
+        {
+          "name": "gravity field",
+          "type": "Quantity",
+          "description": "Earth's gravity field, whose changes GRACE measured."
+        },
+        {
+          "name": "mascon solution",
+          "type": "Method",
+          "description": "Monthly solution that estimates terrestrial water storage."
+        },
+        {
+          "name": "TWS",
+          "type": "Quantity",
+          "description": "Terrestrial water storage estimated from the mascon solutions."
+        },
+        {
+          "name": "terrestrial water storage",
+          "type": "Quantity",
+          "description": "Water stored on and below the land surface; abbreviated TWS."
+        },
+        {
+          "name": "Amazon basin",
+          "type": "Location",
+          "description": "River basin over which terrestrial water storage is estimated."
+        },
+        {
+          "name": "decorrelation filter",
+          "type": "Method",
+          "description": "Filter that removes north-south stripes from spherical harmonic solutions."
+        },
+        {
+          "name": "north-south stripes",
+          "type": "Concept",
+          "description": "Correlated error pattern in spherical harmonic solutions."
+        },
+        {
+          "name": "spherical harmonic solution",
+          "type": "Method",
+          "description": "Gravity field solution affected by north-south stripes."
+        },
+        {
+          "name": "GLDAS",
+          "type": "Dataset",
+          "description": "Data set with which the TWS estimates were compared."
+        }
+      ],
+      "relationships": [
+        {
+          "source": "K-band ranging system",
+          "target": "GRACE",
+          "keywords": "part_of",
+          "description": "The K-band ranging system is an instrument of GRACE."
+        },
+        {
+          "source": "GRACE",
+          "target": "gravity field",
+          "keywords": "measures",
+          "description": "GRACE measured changes in Earth's gravity field."
+        },
+        {
+          "source": "mascon solution",
+          "target": "TWS",
+          "keywords": "estimates",
+          "description": "Monthly mascon solutions estimate terrestrial water storage."
+        },
+        {
+          "source": "TWS",
+          "target": "terrestrial water storage",
+          "keywords": "same_as",
+          "description": "The text defines TWS as terrestrial water storage."
+        },
+        {
+          "source": "mascon solution",
+          "target": "Amazon basin",
+          "keywords": "applied_to",
+          "description": "The mascon solutions are evaluated over the Amazon basin."
+        },
+        {
+          "source": "decorrelation filter",
+          "target": "north-south stripes",
+          "keywords": "corrects",
+          "description": "The decorrelation filter removes the north-south stripes."
+        },
+        {
+          "source": "north-south stripes",
+          "target": "spherical harmonic solution",
+          "keywords": "affects",
+          "description": "The stripes contaminate the spherical harmonic solutions."
+        },
+        {
+          "source": "TWS",
+          "target": "GLDAS",
+          "keywords": "compared_with",
+          "description": "The TWS estimates were compared with GLDAS."
+        }
+      ]
+    }
+  - |
+    Worked example 2 (an illustration of the format and of what to leave out: the citation, the label and the symbols in it produce no entity). Passage:
+    The Kalman filter is a recursive estimator of the state vector x_k of a linear system. Its gain K_k depends on the measurement noise covariance R, and the extended Kalman filter generalizes it to nonlinear models by linearizing about the current estimate (see Section 4.2).
+    Output:
+    {
+      "entities": [
+        {
+          "name": "Kalman filter",
+          "type": "Method",
+          "description": "Recursive estimator of the state vector of a linear system."
+        },
+        {
+          "name": "recursive estimator",
+          "type": "Method",
+          "description": "Class of estimators that update an estimate step by step."
+        },
+        {
+          "name": "state vector",
+          "type": "Quantity",
+          "description": "State of the linear system that the Kalman filter estimates."
+        },
+        {
+          "name": "Kalman gain",
+          "type": "Quantity",
+          "description": "Gain of the Kalman filter; it depends on the measurement noise covariance."
+        },
+        {
+          "name": "measurement noise covariance",
+          "type": "Quantity",
+          "description": "Covariance of the measurement noise that sets the Kalman gain."
+        },
+        {
+          "name": "extended Kalman filter",
+          "type": "Method",
+          "description": "Generalization of the Kalman filter to nonlinear models by linearization."
+        },
+        {
+          "name": "nonlinear model",
+          "type": "Concept",
+          "description": "Model class the extended Kalman filter is built for."
+        }
+      ],
+      "relationships": [
+        {
+          "source": "Kalman filter",
+          "target": "recursive estimator",
+          "keywords": "is_a",
+          "description": "The Kalman filter is a recursive estimator."
+        },
+        {
+          "source": "Kalman filter",
+          "target": "state vector",
+          "keywords": "estimates",
+          "description": "The Kalman filter estimates the state vector."
+        },
+        {
+          "source": "Kalman gain",
+          "target": "Kalman filter",
+          "keywords": "part_of",
+          "description": "The gain is a component of the Kalman filter."
+        },
+        {
+          "source": "Kalman gain",
+          "target": "measurement noise covariance",
+          "keywords": "depends_on",
+          "description": "The gain depends on the measurement noise covariance."
+        },
+        {
+          "source": "extended Kalman filter",
+          "target": "Kalman filter",
+          "keywords": "derived_from",
+          "description": "The extended Kalman filter generalizes the Kalman filter."
+        },
+        {
+          "source": "extended Kalman filter",
+          "target": "nonlinear model",
+          "keywords": "applied_to",
+          "description": "The extended Kalman filter handles nonlinear models."
+        }
+      ]
+    }

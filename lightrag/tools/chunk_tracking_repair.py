@@ -843,10 +843,12 @@ async def _accumulate_cached_attribution(
     rag,
     disk: _DiskPlan,
 ) -> tuple[int, int, int]:
+    from lightrag.kg_contract import chunk_result_from_records
     from lightrag.operate import (
         _get_cached_extraction_results,
         _rebuild_from_extraction_result,
     )
+    from lightrag.utils import read_chunk_kg_records
 
     with_cache = 0
     with_attribution = 0
@@ -860,7 +862,35 @@ async def _accumulate_cached_attribution(
             set(batch),
             text_chunks_storage=rag.text_chunks,
         )
+        # Fork (extraction contract): a chunk extracted with the contract or an
+        # extraction hook is attributed from the records its extraction
+        # accepted, which name what the graph got (a hook's renames included);
+        # it counts as a chunk with its cache. The others as before.
+        stored_records = await read_chunk_kg_records(
+            rag.text_chunks, batch, chunk_data_by_id
+        )
+        for chunk_id, stored in stored_records.items():
+            try:
+                entities, relationships = chunk_result_from_records(stored)
+            except ValueError as exc:
+                logger.warning(
+                    "Chunk tracking repair: unusable stored extraction records "
+                    f"for chunk {chunk_id}: {exc}"
+                )
+                continue
+            with_cache += 1
+            if entities or relationships:
+                with_attribution += 1
+            for entity_name in entities:
+                if disk.object_exists("entity_chunks", entity_name):
+                    disk.add_row("entity_chunks", entity_name, [chunk_id])
+            for src, tgt in relationships:
+                storage_key = make_relation_chunk_key(src, tgt)
+                if disk.object_exists("relation_chunks", storage_key):
+                    disk.add_row("relation_chunks", storage_key, [chunk_id])
         for chunk_id, results in cached_results.items():
+            if chunk_id in stored_records:
+                continue
             parsed_any = False
             attributed_any = False
             for extraction_result, timestamp in results:

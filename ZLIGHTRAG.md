@@ -29,6 +29,8 @@ starting with [README.md](./README.md), applies as written.
 | [Strict entity types](#strict-entity-types) | `ENTITY_TYPE_STRICT` | `false` |
 | [Symbol entity names](#symbol-entity-names) | `DROP_SYMBOL_ENTITIES` | `false` |
 | [Apparatus entity names](#apparatus-entity-names) | `DROP_JUNK_ENTITIES` | `false` |
+| [Extraction contract: closed relation types](#extraction-contract-closed-relation-types) | `relationship_types` (and `relationship_inverses`) in the `ENTITY_TYPE_PROMPT_FILE` profile; schema via `python -m lightrag.kg_contract --schema` | absent (off) |
+| [Extraction contract validator](#extraction-contract-validator) | `KG_CONTRACT_VALIDATOR` | `false` |
 | [Entity name fold](#entity-name-fold) | `ENTITY_NAME_FOLD`; lists and aliases via `ENTITY_NAME_FOLD_LISTS`, `ENTITY_NAME_ALIASES` | `false` |
 | [Sidecar relations](#sidecar-relations) | `SIDECAR_RELATIONS` | `all` (upstream behaviour) |
 | [Paper filter in the graph view](#paper-filter-in-the-graph-view) | none; reference lists via `ZOTERO_REFERENCES` | always active |
@@ -253,14 +255,304 @@ characters are left to `DROP_SYMBOL_ENTITIES`. Applied as each chunk's extractio
 is parsed, so existing apparatus entities stay until deleted. Reported in the `/health`
 configuration. Off by default.
 
+### Extraction contract: closed relation types
+
+An entity-type profile (`ENTITY_TYPE_PROMPT_FILE`) may declare `relationship_types`, a
+mapping of relation type name to definition in prompt order (`lightrag/kg_contract.py`).
+The names are lower-case snake case; each definition is one line, its whitespace
+collapsed. A profile that declares it switches the contract on:
+
+- the list is appended to the profile's entity-type guidance, one `name = definition`
+  line per type (never `- name:`, which `ENTITY_TYPE_STRICT` would read as an entity
+  type), followed by a read-it-back check of each relation's direction, and a sentence
+  that prefers `related_to` to a forced type when the list has `related_to`. The guidance
+  goes into both the system and the user prompt, as before;
+- the JSON extraction system prompt (`SYSTEM_PROMPT_EDITS`) follows the profile's naming
+  rule and the text's spelling instead of title case, says never to glue words into one
+  identifier, takes exactly one listed type in `keywords` instead of free keywords, makes
+  relations directed, and lists an entity only when the text states a relation for it.
+  The gleaning turn is sent with this contract system prompt and the unchanged gleaning
+  template, which carries none of these rules. A base template that no longer holds a
+  replaced passage the expected number of times fails startup rather than sending a
+  half-edited prompt.
+
+The contract needs `ENTITY_EXTRACTION_USE_JSON=true`; in text mode a profile with
+`relationship_types` is refused at startup. A profile without the key, with no validator
+and no new setting, sends exactly the prompts and writes exactly the graph, KV rows and
+vectors the base branch did: `tests/extraction/test_kg_contract_inert.py` compares both
+modes, with and without a profile, with `ENTITY_NAME_FOLD` unarmed and armed, through a
+gleaning turn that re-outputs names and pairs with longer, shorter and equal-length
+descriptions, three documents sharing entities, a deletion, a kept-summary deletion and
+the re-ingest, against digests recorded from the base branch's own tree. The extraction
+cache keys on the prompt, so switching the contract on re-extracts instead of reusing
+cached results.
+
+The JSON schema that constrains the extraction requests is set by the process in front
+of the LLM server, not here. `python -m lightrag.kg_contract --schema --profile PROFILE`
+prints it for a profile: the entity types its guidance lists, read as `ENTITY_TYPE_STRICT`
+reads them and in order, plus `Other`, and the profile's relation types, both as enums.
+`PROFILE` is what `ENTITY_TYPE_PROMPT_FILE` takes, a file name looked up in
+`PROMPT_DIR/entity_type` as the server looks it up (or in the current directory when it
+is not there), or a path; the command prints the file it used, and how it found it, on
+stderr, so stdout holds the schema only.
+
+Nothing here can make the front apply that schema (a missing or invalid schema file, or
+a model the front does not attach it to, leaves `keywords` a free string), so the parser
+checks every relation the LLM extracted against the list: the first pass and the gleaning
+turn (`check_relation_keywords`). A knowledge rebuild reads the records extraction
+stored and checks nothing (*Rebuilding from stored records*).
+A keyword that equals a declared type after trimming and case-folding is rewritten to
+the declared spelling (`Part_Of` to `part_of`; `part of` and `member of` match nothing);
+a field of several keywords keeps the declared types among them and loses the rest. With
+`relationship_inverses` (below), a field whose only names on the list are inverse names
+(`has_part`: the model wrote "B has_part A") is that relation read the other way round:
+the pair is swapped and the forward type stored (`A part_of B`); in a field that also
+names a declared type, an inverse name is an off-list keyword. A field with no declared
+type and no inverse name becomes `related_to` when the list declares it, and is
+otherwise dropped with its relation. A `keywords` field the model returned as a JSON
+list is read as its elements (without the contract it is stored as the string of the
+list, as before). Each change is counted: a document whose relations needed any logs one
+warning (also in the pipeline history) with the counts (`normalized`, `multi_type`,
+`inverse`, `related_to`, `dropped`, of `checked`), and `/health` shows the running totals
+as `kg_contract_relation_keywords`, under `extraction`. The totals are those of the
+worker process that answers (each gunicorn worker keeps its own), and they count every
+attempt: a document that fails after its extraction and is processed again is counted
+again. Any change counted means the schema is not being enforced upstream. Relations the code makes without the
+LLM (the sidecar fan-out) and relations a caller gives (`create_relation`,
+`edit_relation`, `insert_custom_kg`) are not checked. Without `relationship_types`
+nothing is checked or counted.
+
+A sample profile for a geoscience paper corpus, with relation list v3.1 (17 types, each
+defined by what its source and target must be, and their inverse names), is
+`prompts/samples/entity_type_prompt.kg_contract.sample.yml`. `/health` reports the
+active profile's counts as `kg_contract_profile` (`relationship_types`,
+`relationship_inverses`; 0 and 0 when the contract is off).
+
+#### Direction in the graph: inverse names
+
+The graph stores each pair of entities once, in sorted order (Python string order, by
+code point): the extraction merge sorts every extracted pair before merging,
+`PGTableGraphStorage` keeps `src_id < tgt_id` by the same order, and the Apache AGE
+storage keeps the direction the merge writes, which is that order. So "GRACE part_of
+Constellation" is stored as (Constellation, GRACE) with keywords `part_of`, and two chunks
+that give A `part_of` B and B `has_property` A merge into one edge with keywords
+`has_property,part_of`. Without more, the stored keywords do not say which node is the
+part: the direction survives only in the relation's description text.
+
+A profile may also declare `relationship_inverses`, a mapping of a directed type name to
+its inverse name; a type the mapping does not name is symmetric. It needs
+`relationship_types` in the same profile; each key must be a declared type, each inverse
+lower-case snake case, not a declared type and the inverse of one type only, or the
+profile is refused at load. With it, every write path below puts a relation into sorted
+order and, when that flips an extracted or given relation "A t B", stores the inverse name
+of `t`, so a stored edge (src, tgt) with keyword k reads "src k tgt" whenever k is a
+declared type or inverse name: Constellation `has_part` GRACE, and the two chunks above
+give `has_part,has_property`. Every keyword of an LLM-extracted relation is one, because
+the parser checks it against the list (above). A keyword that is neither, given by a
+caller (`create_relation`, `edit_relation`, `insert_custom_kg`), made by the code (the
+sidecar links), or stored before the profile declared the list, is kept as written and
+not inverted when its pair is flipped, so it can read backwards.
+In a keyword field that holds several comma-separated types after merges, each declared
+type or inverse name is rewritten on its own (exact match); symmetric types and any other
+keyword stay as they are. The LLM never sees an inverse name: the prompt, the guidance and
+the schema keep the forward list, and the rewrite is a deterministic storage-side step
+(`orient_relation` in `lightrag/kg_contract.py`). Without the key every write is what it
+was (`tests/extraction/test_kg_contract_direction.py`). The sample profile's inverses:
+
+| type | inverse | | type | inverse |
+|---|---|---|---|---|
+| `is_a` | `has_kind` | | `derived_from` | `source_of` |
+| `part_of` | `has_part` | | `operates` | `operated_by` |
+| `measures` | `measured_by` | | `located_in` | `location_of` |
+| `estimates` | `estimated_by` | | `affects` | `affected_by` |
+| `uses` | `used_by` | | `corrects` | `corrected_by` |
+| `applied_to` | `target_of` | | `depends_on` | `determines` |
+| `produces` | `produced_by` | | `has_property` | `property_of` |
+
+`same_as`, `compared_with` and `related_to` are symmetric.
+
+The write paths and what each does with the key:
+
+| path | with `relationship_inverses` |
+|---|---|
+| gleaning merge (`_merge_extraction_pass`) | within one chunk, a gleaning relation that states a first-pass relation's pair the other way round with a directed type (one the mapping names) removes each first-pass record of the reversed pair whose types are all directed and all restated (the gleaning turn is the correction). A symmetric type has no direction: when both sides are of symmetric types only, the reversed restatement is the same relation and the version with the longer description is kept, as for the same pair (a tie keeps the first pass). Any other reversed relation (another directed type, or a mix of directed and symmetric types) is a second relation and is kept beside the first |
+| extraction merge (`merge_nodes_and_edges`) | at the end of each chunk's extraction every relation record gets `reverse_keywords`, its keywords read the other way round (the inverse names, resolved with the table then; `add_reverse_keywords`); the merge puts each record into sorted order with `oriented_record`, which swaps the pair and takes `reverse_keywords` when the sort flips it, so the stored edge's keywords read in stored order |
+| rebuild after a deletion, the kept-summary rebuild and the rollback rebuild (`rebuild_knowledge_from_chunks`, `_rebuild_single_relationship`) | a chunk extracted under the contract has its stored records read (*Rebuilding from stored records*), each oriented by the same `oriented_record` from what the record carries, so the direction, a gleaning correction included, is what extraction stored whatever the profile says now; a chunk extracted without the contract is re-parsed from its cache as it was, without the rule and without inversion; the edge is written back in sorted order |
+| `ENTITY_NAME_FOLD` and `KG_CONTRACT_VALIDATOR` renames | no change needed: both rename endpoints before the merge and keep the extracted direction, so the merge orients the renamed pair |
+| entity rename (`edit_entity`), entity merge (`merge_entities`, and `edit_entity` with `allow_merge`) | the stored keywords read in the old sorted pair; the renamed or redirected pair is re-sorted, inverted when it flips, and written in sorted order before duplicates are joined |
+| `create_relation`, `edit_relation`, `insert_custom_kg` | keywords given with (source, target) read "source keywords target"; they are inverted when the stored order is the other way, and the edge is written in sorted order |
+
+Limits:
+
+- Turning the key on does not rewrite edges already in the graph: they keep their forward
+  names in whichever order the merge sorted them, and later merges add inverse names next
+  to them; a rebuild after a deletion re-reads the cached extractions of documents
+  extracted before as they were stored, forward names unchanged. Re-extract the
+  documents (delete and insert) for a graph that holds the invariant throughout.
+  Turning it off later leaves the inverse names in place.
+- The gleaning merge keeps, for one pair in one order, the record list with the longer
+  first description whatever its types (the rule extraction always had): a vaguer type
+  (`related_to`) with a longer description replaces a specific one stated in the same
+  order. A reversed relation of another directed type is kept beside the first, so two
+  contradictory directions can both be stored, and a first-pass record of several types
+  is never corrected. These are left as they are.
+- `edit_relation` reads the keywords in its request in the caller's order, while
+  `get_relation_info` and the graph view return the stored keywords with the pair as
+  asked or as stored; a caller that reads in the reversed order and writes the same
+  keywords back inverts them. Edit in the stored order (smaller name first), as the
+  graph view does.
+- Tools that copy or re-key edges outside these paths do not know the profile:
+  the graph migration tool (`lightrag/tools/migrate_graph_storage.py`) copies each
+  pair in the order the source lists it, so an AGE target can draw the arrow of a pair a
+  NetworkX source lists unsorted the other way round (the keywords still read in sorted
+  order); `PGTableGraphStorage`'s start-up normalization of reversed legacy rows swaps the
+  endpoints without touching keywords (only rows written before the storage kept sorted
+  order); and a bulk tool that renames entities directly in the database must apply
+  `kg_contract.orient_relation` to each edge it re-keys.
+- Sidecar links (`SIDECAR_RELATIONS=all`) are undirected containment links: their
+  keywords, `associated with, contained in`, say that the entity and the table, drawing
+  or equation occur together, whichever order the pair is stored in. They are not
+  declared types, so they are neither checked nor inverted; read them without a
+  direction, or filter them out by keyword or by the sidecar entity's type.
+- Readers take the keywords as text: the relation vector content (the keywords, the
+  sorted pair and the description), the web UI edge label and `get_relation_info` show
+  the stored keywords; the query context does not include keywords. None of them assumes
+  the forward list.
+
+### Extraction contract validator
+
+With `KG_CONTRACT_VALIDATOR=true` the API server passes
+`lightrag.kg_contract.kg_extraction_validator` as `kg_extraction_validator`, the hook that
+sees each chunk's parsed records before the merge (see *Extraction Quality Hook* in
+`docs/ProgramingWithCore.md`). It runs after `DROP_SYMBOL_ENTITIES` and
+`DROP_JUNK_ENTITIES` and does not need the relation list. Per chunk it
+
+- drops a name that is mathematical notation of three or more characters (`x_k`, `q_n(x)`,
+  `f(x)`, `x1*`, TeX characters) and every relation that names it; `L1`, `J2`, `C20`,
+  `F10.7` and `P(Y)` stay;
+- keeps a name glued from several words (`MetOp`) when the chunk text contains it, renames
+  it to the text's spelling of its words when the text has them (`ScaleHeight` to
+  `scale height`), drops it when a part is one or two characters, a Greek-letter or
+  accent word, carries a digit or is an `et al.` (`PhiTau`, `p_y_2`), and otherwise splits
+  it into lower-case words; relations follow the rename;
+- drops a relation whose endpoint is not an extracted entity of the chunk and is not in
+  the chunk text either, or is notation; a grounded undeclared endpoint is kept, and the
+  merge creates its node as before;
+- drops a relation whose two endpoints a rename joined.
+
+Names are looked up in the chunk text after the same normalization extraction applies to
+names, case-folded. The rename and the grounding depend on the chunk's text, so one name
+can be kept in one chunk and renamed in another.
+
+The hook runs once per chunk, at extraction. Its result (with the multimodal links added
+after it) is stored with the chunk, and the knowledge rebuild after a document deletion,
+the kept-summary rebuild of a re-ingest and the rollback purge read that and never call
+the hook (*Rebuilding from stored records*): a renamed or dropped name's records are
+found under the name the graph holds, so a deletion leaves the edge and its nodes with
+the surviving documents' chunk ids and text only, as without a hook, and a hook that is
+changed, removed or raising later changes nothing a deletion rebuilds. The
+`lightrag-repair-chunk-tracking` tool attributes such a chunk from its stored records.
+Reported in the `/health` configuration.
+Off by default.
+
+### Rebuilding from stored records
+
+A knowledge rebuild (after a document deletion, in the kept-summary rebuild of a
+re-ingest, in the rollback purge of a custom-chunk patch) and the
+`lightrag-repair-chunk-tracking` tool need what each surviving chunk contributed to the
+graph. On the base branch they re-parse the chunk's cached LLM output, which is all its
+extraction did to it. Under the extraction contract or an extraction hook, extraction does
+more (the keyword check, the gleaning direction rule, the inverse names, the hook), and
+re-running that later gives a different answer as soon as anything changed: the relation
+list, the inverse names, the hook, the code's rules, or the contract switched off. So
+extraction stores, with each chunk, the records it accepted, and the rebuild reads them.
+
+When. Only while the profile declares `relationship_types` or a `kg_extraction_validator`
+is set (`KG_CONTRACT_VALIDATOR`). Without either nothing is written, and the chunk rows
+and the rebuild are those of the base branch (for PostgreSQL see *Storages*).
+
+What. One chunk's records as extraction hands them to the merge: after the first-pass
+parse and its keyword check, the gleaning parse, its check and the gleaning merge with
+its direction rule, the hook, and the multimodal links (the base rebuild does not make
+those again, so they are stored too), and before `ENTITY_NAME_FOLD` (the rebuild files
+them under both spellings with `alias_chunk_result`, as it files cached results). What
+was accepted is what is stored: a truncated gleaning reply that was merged but not cached
+is in the records.
+
+Where. In the text-chunk row, field `kg_records` (`utils.CHUNK_KG_RECORDS_FIELD`), so it
+is deleted with the chunk. Its value has a fixed shape (no key varies per chunk):
+
+```
+{"format": 1,
+ "entities":  [{"entity_name", "entity_type", "description", "source_id",
+                "file_path", "timestamp"}, ...],
+ "relations": [{"src_id", "tgt_id", "keywords", "reverse_keywords",
+                "description", "weight", "source_id", "file_path",
+                "timestamp"}, ...]}
+```
+
+A record holds those keys only (the ones it has); `entity_name` and `src_id`/`tgt_id` are
+the name and the pair it is filed under, in the spelling the model wrote (or the hook
+gave). `keywords` read from `src_id` to `tgt_id`; `reverse_keywords` read from `tgt_id`
+to `src_id`, resolved with the inverse names at extraction (the same keywords without
+`relationship_inverses`). The graph stores each pair sorted: an edge (a, b) gets a
+relation's `keywords` when `src_id <= tgt_id` and its `reverse_keywords` otherwise
+(`kg_contract.oriented_record`; the extraction merge and the rebuild both use it), so the
+stored graph can be checked against the stored records without the profile. Measured on
+5,988 chunks of the production cache (7,918 first-pass and gleaning replies): 3.8 kB of
+JSON per chunk on average (median 3.5 kB, 95th percentile 10.9 kB, largest 49 kB), 1.2 kB
+as PostgreSQL stores it compressed.
+
+Storages. JSON, Redis and OpenSearch keep the field in the chunk document: a row read and
+written back keeps it, and the pipeline's upsert of a re-created chunk (a document
+processed again) replaces the document without it. MongoDB's chunk upsert is a `$set`, so
+it unsets the field when the row written does not carry it. `PGKVStorage` keeps it in a
+nullable JSONB column `kg_records` of `LIGHTRAG_DOC_CHUNKS` that only three statements
+name (write, read, clear); the general chunk reads and the upsert leave it alone, so the
+base branch keeps working on a table that has it. New tables get it in `CREATE TABLE`. On
+an existing table the start-up column lookup only notes whether it is there; it is added
+at start-up when the contract or a hook is on, with `ADD COLUMN IF NOT EXISTS` under a
+5 s lock timeout, three attempts; if it still cannot be added, start-up is refused with a
+message that says how to add it by hand. While the column is absent no statement names
+it. Because the PostgreSQL upsert leaves the column alone, extraction clears the column
+for a document's chunks before it extracts them, in every configuration, whenever the
+column exists (one statement per document), and a rebuild reads it with one statement.
+
+Lifecycle. A records write that fails fails that chunk's extraction, and so the document,
+which is retried as any failed document. A chunk extracted again with neither contract
+nor hook keeps no records (the document store replaced it; PostgreSQL cleared it) and is
+rebuilt from its cache.
+
+The rebuild. Each surviving chunk with stored records contributes them, whatever the
+configuration is now: nothing reads the current relation list, inverse table or hook for
+it, and it needs no extraction cache. Stored records of an unknown shape make the chunk
+unusable, as an unparseable cache does. A chunk without them is re-parsed from its cache
+as on the base branch. An entity or relation fed by both kinds gets each chunk's
+contribution its own way, which is how extraction merged them.
+
+Chunks extracted before. Every chunk extracted before this rule, with or without the
+contract (production has none with it), carries no records and is rebuilt from its
+cache, as the base branch rebuilds it: switching the contract or the hook on does not
+change what a deletion rebuilds for them. A chunk extracted with the contract by an
+earlier version of this branch (which recorded a contract fingerprint,
+`llm_cache_contract`, now ignored) is rebuilt by the plain re-parse too. Re-ingest those
+documents to give them records. Switching the contract or the hook on does not re-check,
+re-key or rename anything already in the graph; switching it off, or changing the list,
+the inverse names or the hook, changes nothing for chunks that have records. Tests:
+`tests/extraction/test_kg_contract_reproduce.py`,
+`tests/kg/test_chunk_kg_records_storage.py`, and
+`tests/kg/postgres_impl/test_pg_kg_records_smoke.py` for the PostgreSQL column
+(`pg_smoke`, below).
+
 ### Entity name fold
 
 With `ENTITY_NAME_FOLD=true`, every entity name an extraction produces is mapped to the
 spelling the graph already uses for the same fold key, or becomes that spelling when
 the key is new (`lightrag/entity_name_fold.py`). The extraction LLM spells one entity
 several ways across papers, and the merge keys on the exact string, so without it a
-concept's relations scatter over several nodes. The map is read from the Postgres/AGE
-graph in the background after the storages initialise (computed in a worker thread, so
+concept's relations scatter over several nodes. The map is read from the PostgreSQL
+graph (`PGGraphStorage`, Apache AGE, or `PGTableGraphStorage`, plain tables, for its own
+workspace and namespace) in the background after the storages initialise (computed in a worker thread, so
 the server keeps answering) until `ENTITY_NAME_FOLD armed: N name keys, A aliases, lists
 <source>, from M nodes in Xs` is logged. Extraction and the deletion and kept-summary
 rebuilds wait for it, for at most 300 s after startup; past that an error is logged and
@@ -318,7 +610,9 @@ changes keys: existing variant nodes are not merged by the switch itself.
 `SIDECAR_RELATIONS=none` keeps a table/equation/drawing sidecar entity but no longer
 links it to every entity extracted from its chunk with an "associated with, contained
 in" edge (upstream behaviour, `all`). On a paper corpus those edges were about a tenth
-of the graph, every one generic.
+of the graph, every one generic. The links carry no direction: with the extraction
+contract on they are stored in either order and their keywords are left as they are
+(see *Direction in the graph*).
 
 ### Paper filter in the graph view
 
@@ -692,12 +986,17 @@ The unit tests for these changes, including the upstream tests the branch modifi
 are marked `offline`, so upstream's
 [.github/workflows/tests.yml](./.github/workflows/tests.yml) runs them; on this branch it
 also triggers on pushes and pull requests to `zlightrag`, as does upstream's
-[.github/workflows/linting.yaml](./.github/workflows/linting.yaml). The exception is the Apache
+[.github/workflows/linting.yaml](./.github/workflows/linting.yaml). The exceptions are the Apache
 AGE integration test for the edge removal,
 `tests/kg/postgres_impl/test_postgres_remove_edges_age.py`, which needs
-`--run-integration` and a live AGE server, and the paper-structure smoke test
+`--run-integration` and a live AGE server; the paper-structure smoke test
 `tests/test_zotero_struct_pg_smoke.py`, which needs `--run-integration` and a scratch
-PostgreSQL; no workflow runs either.
+PostgreSQL; and the fold map build and the extraction contract's inverse names on the
+table graph storage, `tests/kg/pgtable_impl/test_pgtable_fold_map_smoke.py` and
+`tests/kg/pgtable_impl/test_pgtable_relation_direction_smoke.py`, and the extraction
+contract's text-chunk column, `tests/kg/postgres_impl/test_pg_kg_records_smoke.py`,
+marked `pg_smoke` like the storage's other live-PostgreSQL tests, which need
+`--run-integration` and `POSTGRES_PASSWORD`. No workflow on this branch runs them.
 
 ## `zotero-toolkit/`
 

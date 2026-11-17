@@ -5,6 +5,12 @@ from typing import Any, Mapping, TypedDict
 
 import yaml
 
+from lightrag.kg_contract import (
+    contract_system_prompt,
+    guidance_with_relationship_types,
+    normalize_relationship_inverses,
+    normalize_relationship_types,
+)
 from lightrag.utils import logger
 
 
@@ -523,7 +529,14 @@ PROMPTS["keywords_extraction_examples"] = [
 ]
 
 
-class EntityExtractionPromptProfile(TypedDict):
+class _EntityExtractionPromptProfileOptional(TypedDict, total=False):
+    # Fork (extraction contract): present only when the profile file declares
+    # it; see lightrag/kg_contract.py.
+    relationship_types: dict[str, str]
+    relationship_inverses: dict[str, str]
+
+
+class EntityExtractionPromptProfile(_EntityExtractionPromptProfileOptional):
     entity_types_guidance: str
     entity_extraction_examples: list[str]
     entity_extraction_json_examples: list[str]
@@ -805,6 +818,18 @@ def load_entity_extraction_prompt_profile(
                 raw_profile[field_name], field_name, profile_path
             )
 
+    if "relationship_types" in raw_profile:
+        profile["relationship_types"] = normalize_relationship_types(
+            raw_profile["relationship_types"],
+            f"ENTITY_TYPE_PROMPT_FILE '{profile_path}'",
+        )
+    if "relationship_inverses" in raw_profile:
+        profile["relationship_inverses"] = normalize_relationship_inverses(
+            raw_profile["relationship_inverses"],
+            profile.get("relationship_types"),
+            f"ENTITY_TYPE_PROMPT_FILE '{profile_path}'",
+        )
+
     return profile
 
 
@@ -845,7 +870,7 @@ def resolve_entity_extraction_prompt_profile(
             "addon_params['entity_types_guidance'] must be a non-empty string."
         )
 
-    return {
+    resolved: EntityExtractionPromptProfile = {
         "entity_types_guidance": guidance,
         "entity_extraction_examples": list(
             file_profile.get(
@@ -860,6 +885,32 @@ def resolve_entity_extraction_prompt_profile(
             )
         ),
     }
+
+    # Fork (extraction contract): a profile that declares a closed relation list
+    # gets it appended to the guidance, and extract_entities edits the JSON
+    # system prompt to match (lightrag/kg_contract.py).
+    relationship_types = file_profile.get("relationship_types")
+    if relationship_types:
+        if not use_json:
+            raise ValueError(
+                f"ENTITY_TYPE_PROMPT_FILE '{prompt_file}' declares "
+                "'relationship_types', which needs JSON entity extraction "
+                "(ENTITY_EXTRACTION_USE_JSON=true)."
+            )
+        # Fail at startup, not on every chunk, when the base template no longer
+        # holds the passages the contract replaces.
+        contract_system_prompt(PROMPTS["entity_extraction_json_system_prompt"])
+        resolved["entity_types_guidance"] = guidance_with_relationship_types(
+            guidance, relationship_types
+        )
+        resolved["relationship_types"] = dict(relationship_types)
+        # Storage side only: the prompt and the schema keep the forward list.
+        if file_profile.get("relationship_inverses"):
+            resolved["relationship_inverses"] = dict(
+                file_profile["relationship_inverses"]
+            )
+
+    return resolved
 
 
 def validate_entity_extraction_prompt_profile_for_mode(
@@ -887,7 +938,7 @@ def validate_entity_extraction_prompt_profile_for_mode(
             f"runs in {mode_name} mode."
         )
 
-    return {
+    validated: EntityExtractionPromptProfile = {
         "entity_types_guidance": str(prompt_profile["entity_types_guidance"]).rstrip(),
         "entity_extraction_examples": [
             str(example).rstrip()
@@ -898,3 +949,10 @@ def validate_entity_extraction_prompt_profile_for_mode(
             for example in prompt_profile["entity_extraction_json_examples"]
         ],
     }
+    if prompt_profile.get("relationship_types"):
+        validated["relationship_types"] = dict(prompt_profile["relationship_types"])
+    if prompt_profile.get("relationship_inverses"):
+        validated["relationship_inverses"] = dict(
+            prompt_profile["relationship_inverses"]
+        )
+    return validated

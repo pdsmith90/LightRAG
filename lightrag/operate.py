@@ -27,6 +27,9 @@ from lightrag.zotero_citations import (
 from lightrag.entity_name_guard import junk_entity_class
 from lightrag.entity_name_fold import alias_chunk_result, fold_chunk_result
 from lightrag.utils import (
+    clear_chunk_kg_records,
+    read_chunk_kg_records,
+    write_chunk_kg_records,
     logger,
     compute_mdhash_id,
     Tokenizer,
@@ -89,6 +92,18 @@ from lightrag.chunk_schema import (
     format_heading_context,
     format_parent_headings,
     strip_internal_multimodal_markup_for_extraction,
+)
+from lightrag.kg_contract import (
+    accepted_records,
+    add_reverse_keywords,
+    check_chunk_relation_keywords,
+    chunk_result_from_records,
+    contract_system_prompt,
+    inverse_table,
+    oriented_record,
+    record_relation_keyword_counts,
+    relation_keyword_changes,
+    stores_accepted_records,
 )
 from lightrag.prompt import PROMPTS, resolve_entity_extraction_prompt_profile
 from lightrag.constants import (
@@ -736,6 +751,15 @@ def entity_types_in_guidance(guidance: str) -> frozenset[str]:
     )
 
 
+def entity_type_names_in_guidance(guidance: str) -> list[str]:
+    """The type names a guidance text lists as ``- Name: ...`` lines, as written
+    and in order, one per normalised name (see ``entity_types_in_guidance``)."""
+    names: dict[str, str] = {}
+    for m in _TYPE_LINE_RE.finditer(guidance or ""):
+        names.setdefault(m.group(1).replace(" ", "").lower(), m.group(1))
+    return list(names.values())
+
+
 def _configure_entity_type_allowlist(
     global_config: dict, guidance: str
 ) -> frozenset[str] | None:
@@ -1107,6 +1131,7 @@ async def _process_json_extraction_result(
     timestamp: int,
     file_path: str = "unknown_source",
     parsed: dict[str, Any] | None = None,
+    join_keyword_lists: bool = False,
 ) -> tuple[dict, dict]:
     """Process a JSON-formatted extraction result from LLM.
 
@@ -1126,6 +1151,10 @@ async def _process_json_extraction_result(
             and cache rebuild has to tell those apart. ``None`` means "not
             supplied" and is unambiguous: the helper always returns a dict,
             so an unrecoverable payload still arrives here as ``{}``.
+        join_keyword_lists: Fork (extraction contract): read a relation whose
+            ``keywords`` field is a JSON list as its elements, comma-separated,
+            so the contract's keyword check sees the types. False (without the
+            contract) stores the string of the list, as before.
 
     Returns:
         tuple: (nodes_dict, edges_dict) containing the extracted entities and relationships
@@ -1266,8 +1295,11 @@ async def _process_json_extraction_result(
                 )
                 continue
 
+            raw_keywords = rel_data.get("keywords", "")
+            if join_keyword_lists and isinstance(raw_keywords, list):
+                raw_keywords = ",".join(str(keyword) for keyword in raw_keywords)
             edge_keywords = sanitize_and_normalize_extracted_text(
-                str(rel_data.get("keywords", "")), remove_inner_quotes=True
+                str(raw_keywords), remove_inner_quotes=True
             )
             edge_keywords = edge_keywords.replace("，", ",")
 
@@ -1319,6 +1351,107 @@ async def _process_json_extraction_result(
     if _DROP_JUNK_ENTITIES:
         _drop_junk_records(maybe_nodes, maybe_edges, chunk_key)
     return dict(maybe_nodes), dict(maybe_edges)
+
+
+def _keyword_types(record: dict) -> frozenset[str]:
+    """The comma-separated keywords of one relation record, trimmed."""
+    return frozenset(
+        token.strip()
+        for token in str(record.get("keywords") or "").split(",")
+        if token.strip()
+    )
+
+
+async def _merge_extraction_pass(
+    maybe_nodes: dict,
+    maybe_edges: dict,
+    pass_nodes: dict,
+    pass_edges: dict,
+    relation_inverses: dict[str, str] | None = None,
+) -> None:
+    """Merge the gleaning pass of one chunk into its first-pass records, in
+    place (``extract_entities``). A name or pair the pass shares with the
+    records so far keeps whichever record list has the longer first
+    description; a new one is added.
+
+    Fork (extraction contract): with ``relationship_inverses`` in the profile
+    (``relation_inverses`` is its two-way table) direction is the payload of the
+    types the table names, so a pass that states a pair the other way round
+    with such a type is a correction: each earlier record of the reversed pair
+    whose types are all directed and all restated by the pass is removed (the
+    pair with it, when none is left). A symmetric type (one the table does not
+    name) has no direction: when the pass's records of the pair and the earlier
+    records of the reversed pair are all of symmetric types, the two are the
+    same relation and the one with the longer first description is kept, as
+    for the same pair (a tie keeps the earlier one). Any other reversed pair
+    (another directed type, or a mix of directed and symmetric types) is a
+    second relation and stays beside the first. A pass that itself states both
+    orders of a pair corrects neither. Without the table the merge is the one
+    extraction always made."""
+    superseded: set[tuple[str, str]] = set()
+    if relation_inverses:
+
+        def symmetric(records: list[dict]) -> bool:
+            return all(
+                _keyword_types(r) and not _keyword_types(r) & relation_inverses.keys()
+                for r in records
+            )
+
+        for (src, tgt), records in pass_edges.items():
+            reverse = (tgt, src)
+            if reverse in pass_edges or not maybe_edges.get(reverse):
+                continue
+            restated = frozenset().union(*(_keyword_types(r) for r in records))
+            directed = restated & relation_inverses.keys()
+            kept = [
+                record
+                for record in maybe_edges[reverse]
+                if not (_keyword_types(record) and _keyword_types(record) <= directed)
+            ]
+            if not kept:
+                del maybe_edges[reverse]
+                continue
+            maybe_edges[reverse] = kept
+            if (src, tgt) not in maybe_edges and symmetric(records) and symmetric(kept):
+                kept_desc_len = len(kept[0].get("description", "") or "")
+                pass_desc_len = len(records[0].get("description", "") or "")
+                if pass_desc_len > kept_desc_len:
+                    del maybe_edges[reverse]
+                else:
+                    superseded.add((src, tgt))
+
+    for i, (entity_name, pass_entities) in enumerate(pass_nodes.items(), start=1):
+        if maybe_nodes.get(entity_name):
+            # Compare description lengths and keep the better one
+            original_desc_len = len(
+                maybe_nodes[entity_name][0].get("description", "") or ""
+            )
+            pass_desc_len = len(pass_entities[0].get("description", "") or "")
+            if pass_desc_len > original_desc_len:
+                maybe_nodes[entity_name] = list(pass_entities)
+            # Otherwise keep original version
+        else:
+            # New entity from this pass
+            maybe_nodes[entity_name] = list(pass_entities)
+        await _cooperative_yield(i, every=8)
+
+    for i, (edge_key, pass_edge_list) in enumerate(pass_edges.items(), start=1):
+        if edge_key in superseded:
+            # The earlier version of this symmetric relation was the better one.
+            pass
+        elif maybe_edges.get(edge_key):
+            # Compare description lengths and keep the better one
+            original_desc_len = len(
+                maybe_edges[edge_key][0].get("description", "") or ""
+            )
+            pass_desc_len = len(pass_edge_list[0].get("description", "") or "")
+            if pass_desc_len > original_desc_len:
+                maybe_edges[edge_key] = list(pass_edge_list)
+            # Otherwise keep original version
+        else:
+            # New edge from this pass
+            maybe_edges[edge_key] = list(pass_edge_list)
+        await _cooperative_yield(i, every=8)
 
 
 async def rebuild_knowledge_from_chunks(
@@ -1403,8 +1536,21 @@ async def rebuild_knowledge_from_chunks(
         all_referenced_chunk_ids,
         text_chunks_storage=text_chunks_storage,
     )
+    # Fork (extraction contract): a chunk extracted with the contract or an
+    # extraction hook carries the records that extraction accepted
+    # (kg_contract.accepted_records). They are what its extraction handed the
+    # merge, so the rebuild reads them and re-runs none of the post-processing:
+    # whatever the configuration is now, such a chunk contributes what it
+    # contributed then. A chunk without them (extracted with neither) is
+    # re-parsed from its cached LLM output below, which is all its extraction
+    # did. Its cache is then not needed.
+    stored_records = await read_chunk_kg_records(
+        text_chunks_storage, all_referenced_chunk_ids, chunk_data_by_id
+    )
 
-    missing_chunk_ids = all_referenced_chunk_ids - set(cached_results.keys())
+    missing_chunk_ids = (
+        all_referenced_chunk_ids - set(cached_results.keys()) - set(stored_records)
+    )
     report.missing_cache_chunk_ids.update(missing_chunk_ids)
     if missing_chunk_ids:
         status_message = (
@@ -1418,7 +1564,7 @@ async def rebuild_knowledge_from_chunks(
                 pipeline_status["latest_message"] = status_message
                 append_pipeline_history(pipeline_status, status_message)
 
-    if not cached_results:
+    if not cached_results and not stored_records:
         status_message = "No cached extraction results found"
         logger.warning(status_message)
         if pipeline_status is not None and pipeline_status_lock is not None:
@@ -1432,7 +1578,26 @@ async def rebuild_knowledge_from_chunks(
     chunk_entities = {}  # chunk_id -> {entity_name: [entity_data]}
     chunk_relationships = {}  # chunk_id -> {(src, tgt): [relationship_data]}
 
+    for chunk_id, stored in stored_records.items():
+        try:
+            entities, relationships = chunk_result_from_records(stored)
+        except Exception as e:
+            report.unusable_cache_chunk_ids.add(chunk_id)
+            status_message = (
+                f"Failed to read the stored extraction records of chunk {chunk_id}: {e}"
+            )
+            logger.warning(status_message)
+            status_logger.log(status_message)
+            continue
+        # Fork (ENTITY_NAME_FOLD): stored in the spelling the LLM wrote, before
+        # the fold; filed under the canonical name as well, as cached results.
+        chunk_entities[chunk_id], chunk_relationships[chunk_id] = alias_chunk_result(
+            entities, relationships
+        )
+
     for chunk_id, results in cached_results.items():
+        if chunk_id in stored_records:
+            continue
         try:
             # Handle multiple extraction results per chunk
             chunk_entities[chunk_id] = defaultdict(list)
@@ -2369,8 +2534,12 @@ async def _rebuild_single_relationship(
             # Check both (src, tgt) and (tgt, src) since relationships can be bidirectional
             for edge_key in [(src, tgt), (tgt, src)]:
                 if edge_key in chunk_relationships[chunk_id]:
+                    # Fork (extraction contract): as the extraction merge does,
+                    # a stored record is read in the stored pair's order
+                    # (kg_contract.oriented_record); a re-parsed one as it is.
                     all_relationship_data.extend(
-                        chunk_relationships[chunk_id][edge_key]
+                        oriented_record(record)
+                        for record in chunk_relationships[chunk_id][edge_key]
                     )
 
     degraded = not all_relationship_data
@@ -3927,10 +4096,13 @@ async def merge_nodes_and_edges(
         for entity_name, entities in maybe_nodes.items():
             all_nodes[entity_name].extend(entities)
 
-        # Collect edges with sorted keys for undirected graph
+        # Collect edges with sorted keys for undirected graph. Fork
+        # (extraction contract): a record that carries its keywords for the
+        # other reading order is put into that order when the sort flips it
+        # (kg_contract.oriented_record); any other record is taken as it is.
         for edge_key, edges in maybe_edges.items():
             sorted_edge_key = tuple(sorted(edge_key))
-            all_edges[sorted_edge_key].extend(edges)
+            all_edges[sorted_edge_key].extend(oriented_record(edge) for edge in edges)
         await _cooperative_yield(i, every=32)
 
     total_entities_count = len(all_nodes)
@@ -4309,6 +4481,18 @@ async def extract_entities(
     _configure_entity_type_allowlist(global_config, entity_types_guidance)
     _configure_symbol_entity_filter(global_config)
     _configure_junk_entity_filter(global_config)
+    # Fork (extraction contract): with relationship_types in the profile every
+    # parsed relation's keywords are checked against the list (first pass and
+    # gleaning, before they merge), and the changes are counted for the document;
+    # with relationship_inverses a gleaning turn can correct a direction
+    # (_merge_extraction_pass). Both None leave extraction as it was.
+    relationship_types = prompt_profile.get("relationship_types") or None
+    relation_inverses = inverse_table(prompt_profile.get("relationship_inverses"))
+    relation_keyword_counts: Counter = Counter()
+    # With the contract or a hook, each chunk's accepted records (what reaches
+    # the merge, before the name fold) are stored with the chunk, and a
+    # knowledge rebuild reads them instead of re-running this post-processing.
+    store_records = stores_accepted_records(relationship_types, kg_extraction_validator)
 
     max_total_records = global_config["entity_extract_max_records"]
     max_entity_records = global_config["entity_extract_max_entities"]
@@ -4358,9 +4542,13 @@ async def extract_entities(
         and max_extract_input_tokens > 0
     )
     if use_json_extraction:
-        entity_extraction_system_prompt = PROMPTS[
-            "entity_extraction_json_system_prompt"
-        ].format(**context_base)
+        system_template = PROMPTS["entity_extraction_json_system_prompt"]
+        if prompt_profile.get("relationship_types"):
+            # Fork (extraction contract): the profile declares a closed relation
+            # list, so the template's naming, keyword and direction rules are
+            # replaced by the contract's (lightrag/kg_contract.py).
+            system_template = contract_system_prompt(system_template)
+        entity_extraction_system_prompt = system_template.format(**context_base)
         json_continue_extraction_user_prompt = PROMPTS[
             "entity_continue_extraction_json_user_prompt"
         ].format(**context_base)
@@ -4530,6 +4718,7 @@ async def extract_entities(
                 chunk_key,
                 timestamp,
                 file_path,
+                join_keyword_lists=bool(relationship_types),
             )
         else:
             maybe_nodes, maybe_edges = await _process_extraction_result(
@@ -4539,6 +4728,13 @@ async def extract_entities(
                 file_path,
                 tuple_delimiter=context_base["tuple_delimiter"],
                 completion_delimiter=context_base["completion_delimiter"],
+            )
+        if relationship_types:
+            maybe_edges = check_chunk_relation_keywords(
+                maybe_edges,
+                relationship_types,
+                relation_keyword_counts,
+                relation_inverses,
             )
 
         # Process additional gleaning results only 1 time when entity_extract_max_gleaning is greater than zero.
@@ -4605,6 +4801,7 @@ async def extract_entities(
                     chunk_key,
                     timestamp,
                     file_path,
+                    join_keyword_lists=bool(relationship_types),
                 )
             else:
                 glean_nodes, glean_edges = await _process_extraction_result(
@@ -4616,44 +4813,18 @@ async def extract_entities(
                     completion_delimiter=context_base["completion_delimiter"],
                 )
 
+            if relationship_types:
+                glean_edges = check_chunk_relation_keywords(
+                    glean_edges,
+                    relationship_types,
+                    relation_keyword_counts,
+                    relation_inverses,
+                )
+
             # Merge results - compare description lengths to choose better version
-            for i, (entity_name, glean_entities) in enumerate(
-                glean_nodes.items(), start=1
-            ):
-                if entity_name in maybe_nodes:
-                    # Compare description lengths and keep the better one
-                    original_desc_len = len(
-                        maybe_nodes[entity_name][0].get("description", "") or ""
-                    )
-                    glean_desc_len = len(glean_entities[0].get("description", "") or "")
-
-                    if glean_desc_len > original_desc_len:
-                        maybe_nodes[entity_name] = list(glean_entities)
-                    # Otherwise keep original version
-                else:
-                    # New entity from gleaning stage
-                    maybe_nodes[entity_name] = list(glean_entities)
-                await _cooperative_yield(i, every=8)
-
-            for i, (edge_key, glean_edge_list) in enumerate(
-                glean_edges.items(), start=1
-            ):
-                if edge_key in maybe_edges:
-                    # Compare description lengths and keep the better one
-                    original_desc_len = len(
-                        maybe_edges[edge_key][0].get("description", "") or ""
-                    )
-                    glean_desc_len = len(
-                        glean_edge_list[0].get("description", "") or ""
-                    )
-
-                    if glean_desc_len > original_desc_len:
-                        maybe_edges[edge_key] = list(glean_edge_list)
-                    # Otherwise keep original version
-                else:
-                    # New edge from gleaning stage
-                    maybe_edges[edge_key] = list(glean_edge_list)
-                await _cooperative_yield(i, every=8)
+            await _merge_extraction_pass(
+                maybe_nodes, maybe_edges, glean_nodes, glean_edges, relation_inverses
+            )
 
         # No end-of-chunk cache-key attach here, by design. Each extract cache
         # row is attached to this chunk BEFORE it is written, inside
@@ -4785,6 +4956,20 @@ async def extract_entities(
                             }
                         )
 
+        # Fork (extraction contract): what this chunk hands the merge is final
+        # here (the name fold comes later, for all chunks at once). Each
+        # relation gets its keywords for the other reading order, resolved now,
+        # and the records are stored with the chunk for the knowledge rebuild.
+        # A failed write fails the chunk.
+        if store_records:
+            add_reverse_keywords(maybe_edges, relation_inverses)
+            if text_chunks_storage is not None:
+                await write_chunk_kg_records(
+                    text_chunks_storage,
+                    chunk_key,
+                    accepted_records(maybe_nodes, maybe_edges),
+                )
+
         processed_chunks += 1
         entities_count = len(maybe_nodes)
         relations_count = len(maybe_edges)
@@ -4838,6 +5023,34 @@ async def extract_entities(
         )
         logger.warning(cache_skip_message)
         status_logger.log(cache_skip_message)
+
+    def _publish_relation_keyword_summary() -> None:
+        """Fork (extraction contract): one warning per document when the
+        keyword check changed anything, and the counts into the running totals
+        /health shows. Called from the same ``finally`` as the summaries above,
+        under the same rules. A no-op without ``relationship_types``."""
+        if not relation_keyword_counts:
+            return
+        record_relation_keyword_counts("extraction", relation_keyword_counts)
+        changes = relation_keyword_changes(relation_keyword_counts)
+        if changes is None:
+            return
+        first_chunk = ordered_chunks[0][1]
+        message = (
+            f"Warning: {changes} in "
+            f"{first_chunk.get('file_path', 'unknown_source')} "
+            f"({first_chunk.get('full_doc_id', ordered_chunks[0][0])}); the "
+            "extraction request schema is not keeping keywords on the list"
+        )
+        logger.warning(message)
+        status_logger.log(message)
+
+    # Fork (extraction contract): records an earlier extraction stored with
+    # these chunks are not this one's. Only PostgreSQL keeps them across the
+    # pipeline's re-creation of the chunk rows (a no-op elsewhere, and while
+    # its column does not exist).
+    if text_chunks_storage is not None:
+        await clear_chunk_kg_records(text_chunks_storage, list(chunks))
 
     # Get max async tasks limit from global_config
     chunk_max_async = global_config.get("llm_model_max_async", 4)
@@ -4950,6 +5163,7 @@ async def extract_entities(
         # already been recorded. Await-free, called exactly once.
         _publish_truncation_summary()
         _publish_cache_skip_summary()
+        _publish_relation_keyword_summary()
 
     # Fork (ENTITY_NAME_FOLD): canonical spellings before the results reach the
     # write-ahead anchors and the merge, which must name the same nodes.

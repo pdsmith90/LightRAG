@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import time
 import asyncio
-from typing import Any, Awaitable, Callable, cast
+from typing import Any, Awaitable, Callable, Mapping, cast
 
 from .base import DeletionResult
 from .exceptions import CommitBookkeepingError
 from .kg.shared_storage import get_storage_keyed_lock
 from .constants import GRAPH_FIELD_SEP, RELATION_NO_EVIDENCE_SOURCE_IDS
 from .operate import _truncate_vdb_content
+from .kg_contract import invert_keywords, orient_relation
 from .utils import (
     VectorStorageConsistencyError,
     _consume_future_exception,
@@ -1167,6 +1168,7 @@ async def _edit_entity_impl(
     *,
     entity_chunks_storage=None,
     relation_chunks_storage=None,
+    relation_inverse_table: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Internal helper that edits an entity without acquiring storage locks.
 
@@ -1181,6 +1183,10 @@ async def _edit_entity_impl(
         updated_data: Dictionary containing updated attributes (including optional entity_name for renaming)
         entity_chunks_storage: Optional KV storage for tracking chunks
         relation_chunks_storage: Optional KV storage for tracking relation chunks
+        relation_inverse_table: Fork (extraction contract): the two-way table of
+            the profile's ``relationship_inverses`` (``kg_contract.inverse_table``).
+            With it, a renamed edge is written in storage (sorted) order and its
+            directed keywords are inverted when the rename flips that order.
 
     Returns:
         Dictionary containing updated entity information
@@ -1253,6 +1259,19 @@ async def _edit_entity_impl(
                     renamed_target = (
                         new_entity_name if target == entity_name else target
                     )
+                    if relation_inverse_table:
+                        # Fork (extraction contract): the stored keywords read in
+                        # the old pair's sorted order; rename that reading and put
+                        # it into storage order, inverting a flipped one.
+                        old_src, old_tgt = sorted((source, target))
+                        renamed_source, renamed_target, keywords = orient_relation(
+                            new_entity_name if old_src == entity_name else old_src,
+                            new_entity_name if old_tgt == entity_name else old_tgt,
+                            edge_data.get("keywords") or "",
+                            relation_inverse_table,
+                        )
+                        if keywords:
+                            edge_data["keywords"] = keywords
                     await chunk_entity_relation_graph.upsert_edge(
                         renamed_source, renamed_target, edge_data
                     )
@@ -1748,6 +1767,8 @@ async def aedit_entity(
     allow_merge: bool = False,
     entity_chunks_storage=None,
     relation_chunks_storage=None,
+    *,
+    relation_inverse_table: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Asynchronously edit entity information.
 
@@ -1774,6 +1795,7 @@ async def aedit_entity(
         allow_merge: Whether to merge into an existing entity when renaming to an existing name, defaults to False
         entity_chunks_storage: Optional KV storage for tracking chunks that reference this entity
         relation_chunks_storage: Optional KV storage for tracking chunks that reference relations
+        relation_inverse_table: Fork (extraction contract): see ``_edit_entity_impl``.
 
     Returns:
         Dictionary containing updated entity information and operation summary with the following structure:
@@ -1945,6 +1967,7 @@ async def aedit_entity(
                                 non_name_updates,
                                 entity_chunks_storage=entity_chunks_storage,
                                 relation_chunks_storage=relation_chunks_storage,
+                                relation_inverse_table=relation_inverse_table,
                             )
                             non_name_updates_applied = True
                         except Exception as update_error:
@@ -1966,6 +1989,7 @@ async def aedit_entity(
                             target_entity_data=None,
                             entity_chunks_storage=entity_chunks_storage,
                             relation_chunks_storage=relation_chunks_storage,
+                            relation_inverse_table=relation_inverse_table,
                         )
 
                         # Merge succeeded
@@ -2032,6 +2056,7 @@ async def aedit_entity(
                 updated_data,
                 entity_chunks_storage=entity_chunks_storage,
                 relation_chunks_storage=relation_chunks_storage,
+                relation_inverse_table=relation_inverse_table,
             )
             operation_summary["operation_status"] = "success"
             return {**edit_result, "operation_summary": operation_summary}
@@ -2049,6 +2074,8 @@ async def aedit_relation(
     target_entity: str,
     updated_data: dict[str, Any],
     relation_chunks_storage=None,
+    *,
+    relation_inverse_table: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Asynchronously edit relation information.
 
@@ -2074,6 +2101,10 @@ async def aedit_relation(
             the same edit when assigning a fractional weight below the
             previous evidence count.
         relation_chunks_storage: Optional KV storage for tracking chunks that reference this relation
+        relation_inverse_table: Fork (extraction contract): the two-way table of
+            the profile's ``relationship_inverses``. With it, ``keywords`` in
+            ``updated_data`` read "source_entity keywords target_entity"; when the
+            pair is stored the other way round, their directed types are inverted.
 
     Returns:
         Dictionary containing updated relation information
@@ -2142,6 +2173,19 @@ async def aedit_relation(
             # also the VDB identity `acreate_relation` writes, and resolution
             # can reorder a pair (`Ｂ公司` sorts after `C公司`, `B公司` before).
             source_entity, target_entity = sorted([resolved_source, resolved_target])
+            # Fork (extraction contract): the caller's keywords read in the
+            # caller's order; the stored ones read in the sorted order.
+            if (
+                relation_inverse_table
+                and resolved_source > resolved_target
+                and isinstance(updated_data.get("keywords"), str)
+            ):
+                updated_data = {
+                    **updated_data,
+                    "keywords": invert_keywords(
+                        updated_data["keywords"], relation_inverse_table
+                    ),
+                }
 
             # 1. Get current relation information
             edge_exists = await chunk_entity_relation_graph.has_edge(
@@ -2719,6 +2763,7 @@ async def acreate_relation(
     relation_chunks_storage=None,
     *,
     before_create: Callable[[], Awaitable[None]] | None = None,
+    relation_inverse_table: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Asynchronously create a new relation between entities.
 
@@ -2745,6 +2790,10 @@ async def acreate_relation(
             empty string and permits a non-negative fractional weight.
         relation_chunks_storage: Optional KV storage for tracking chunks that reference this relation
         before_create: Optional migration hook, awaited after validation and before writes
+        relation_inverse_table: Fork (extraction contract): the two-way table of
+            the profile's ``relationship_inverses``. With it, ``keywords`` read
+            "source_entity keywords target_entity"; the edge is written in storage
+            (sorted) order, its directed types inverted when that flips the pair.
 
     Returns:
         Dictionary containing created relation information
@@ -2847,6 +2896,17 @@ async def acreate_relation(
                 "file_path": relation_data.get("file_path", "manual_creation"),
                 "created_at": int(time.time()),
             }
+            graph_src, graph_tgt = source_entity, target_entity
+            if relation_inverse_table:
+                # Fork (extraction contract): keywords read "source keywords
+                # target"; write the pair in storage (sorted) order, inverted
+                # when that flips it.
+                graph_src, graph_tgt, edge_data["keywords"] = orient_relation(
+                    source_entity,
+                    target_entity,
+                    edge_data["keywords"],
+                    relation_inverse_table,
+                )
 
             # Normalize entity order for the VDB record's identity — kept
             # separate from source_entity/target_entity used for the graph
@@ -2925,7 +2985,7 @@ async def acreate_relation(
 
             # Add relation to knowledge graph
             await chunk_entity_relation_graph.upsert_edge(
-                source_entity, target_entity, edge_data
+                graph_src, graph_tgt, edge_data
             )
 
             # Update vector database
@@ -2966,6 +3026,7 @@ async def _merge_entities_impl(
     target_entity_data: dict[str, Any] = None,
     entity_chunks_storage=None,
     relation_chunks_storage=None,
+    relation_inverse_table: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Internal helper that merges entities without acquiring storage locks.
 
@@ -2982,6 +3043,10 @@ async def _merge_entities_impl(
         target_entity_data: Dictionary of specific values to set for target entity (optional)
         entity_chunks_storage: Optional KV storage for tracking chunks
         relation_chunks_storage: Optional KV storage for tracking relation chunks
+        relation_inverse_table: Fork (extraction contract): the two-way table of
+            the profile's ``relationship_inverses``. With it, a redirected edge
+            is written in storage (sorted) order and its directed keywords are
+            inverted when the redirect flips that order.
 
     Returns:
         Dictionary containing the merged entity information
@@ -3100,6 +3165,20 @@ async def _merge_entities_impl(
         if new_src == new_tgt:
             logger.info(f"Entity Merge: skipping `{src}`~`{tgt}` to avoid self-loop")
             continue
+
+        if relation_inverse_table:
+            # Fork (extraction contract): the stored keywords read in the old
+            # pair's sorted order; redirect that reading and put it into storage
+            # order, inverting a flipped one, before duplicates are joined.
+            old_src, old_tgt = sorted((src, tgt))
+            new_src, new_tgt, keywords = orient_relation(
+                target_entity if old_src in source_entities else old_src,
+                target_entity if old_tgt in source_entities else old_tgt,
+                edge_data.get("keywords") or "",
+                relation_inverse_table,
+            )
+            if keywords:
+                edge_data = {**edge_data, "keywords": keywords}
 
         # Normalize entity order for consistent duplicate detection (undirected relationships)
         normalized_src, normalized_tgt = sorted([new_src, new_tgt])
@@ -3702,6 +3781,8 @@ async def amerge_entities(
     target_entity_data: dict[str, Any] = None,
     entity_chunks_storage=None,
     relation_chunks_storage=None,
+    *,
+    relation_inverse_table: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Asynchronously merge multiple entities into one entity.
 
@@ -3822,6 +3903,7 @@ async def amerge_entities(
                 target_entity_data=target_entity_data,
                 entity_chunks_storage=entity_chunks_storage,
                 relation_chunks_storage=relation_chunks_storage,
+                relation_inverse_table=relation_inverse_table,
             )
         except Exception as e:
             logger.error(f"Error merging entities: {e}")

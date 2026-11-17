@@ -91,7 +91,13 @@ from lightrag.kg.shared_storage import (
     finalize_share_data,
     get_pipeline_ingress,
 )
-from lightrag import entity_name_fold, pipeline_metrics, zotero_add, zotero_struct
+from lightrag import (
+    entity_name_fold,
+    kg_contract,
+    pipeline_metrics,
+    zotero_add,
+    zotero_struct,
+)
 from lightrag.utils_pipeline import describe_doc_status_capabilities
 from fastapi.security import OAuth2PasswordRequestForm
 from lightrag.api.auth import auth_handler
@@ -2646,6 +2652,12 @@ def create_app(args):
     try:
         rag = LightRAG(
             **({"chunking_func": selected_chunker} if selected_chunker else {}),
+            # Fork (KG_CONTRACT_VALIDATOR): the extraction contract's checks.
+            **(
+                {"kg_extraction_validator": kg_contract.kg_extraction_validator}
+                if args.kg_contract_validator
+                else {}
+            ),
             working_dir=args.working_dir,
             workspace=args.workspace,
             llm_model_func=create_llm_model_func(args.llm_binding),
@@ -3212,6 +3224,15 @@ def create_app(args):
                         "entity_type_strict": args.entity_type_strict,
                         "drop_symbol_entities": args.drop_symbol_entities,
                         "drop_junk_entities": args.drop_junk_entities,
+                        "kg_contract_validator": args.kg_contract_validator,
+                        "kg_contract_profile": kg_contract.profile_status(
+                            getattr(rag, "_entity_extraction_prompt_profile", None)
+                        ),
+                        # Running totals of this worker process: relation
+                        # keywords the parser found off the declared list.
+                        "kg_contract_relation_keywords": (
+                            kg_contract.relation_keyword_totals()
+                        ),
                         "entity_name_fold": args.entity_name_fold,
                         "entity_name_fold_lists": args.entity_name_fold_lists,
                         "entity_name_aliases": args.entity_name_aliases,

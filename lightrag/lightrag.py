@@ -165,6 +165,11 @@ from lightrag.base import (
 from lightrag.namespace import NameSpace
 from lightrag.query_validation import validate_query_not_empty, validate_rag_query
 from lightrag.chunker import chunking_by_token_size
+from lightrag.kg_contract import (
+    inverse_table,
+    orient_relation,
+    stores_accepted_records,
+)
 from lightrag.operate import (
     KGRebuildReport,
     _configure_junk_entity_filter,
@@ -225,6 +230,7 @@ from lightrag.exceptions import (
 )
 from lightrag.utils import (
     Tokenizer,
+    ensure_chunk_kg_records_field,
     cancellation_was_deferred,
     mark_cancellation_deferred,
     TiktokenTokenizer,
@@ -1908,6 +1914,26 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         self._cached_entity_extraction_use_json = self.entity_extraction_use_json
         self._addon_params_dirty = False
 
+    def _relation_inverse_table(self) -> dict[str, str] | None:
+        """Fork (extraction contract): the two-way inverse-name table of the
+        active profile's ``relationship_inverses``, or None without it (and on
+        an instance built without ``__init__``, which has no profile state)."""
+        if getattr(self, "_addon_params", None) is None:
+            return None
+        self._ensure_addon_params_cache()
+        return inverse_table(
+            self._entity_extraction_prompt_profile.get("relationship_inverses")
+        )
+
+    def _stores_kg_records(self) -> bool:
+        """Fork (extraction contract): whether extraction stores each chunk's
+        accepted records (``kg_contract.stores_accepted_records``)."""
+        self._ensure_addon_params_cache()
+        return stores_accepted_records(
+            self._entity_extraction_prompt_profile.get("relationship_types"),
+            self.kg_extraction_validator,
+        )
+
     def _ensure_addon_params_cache(self) -> None:
         if (
             not self._addon_params_dirty
@@ -2904,6 +2930,14 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             await flush_configuration_storage(
                 self.configuration_storage, "the startup claims"
             )
+            # Fork (extraction contract): with the contract or an extraction
+            # hook, every chunk extracted stores its accepted records, and a
+            # chunk whose records cannot be written fails. A storage that needs
+            # a schema change for them (PostgreSQL: the kg_records column) gets
+            # it now, or start-up is refused here rather than every document
+            # failing later.
+            if self._stores_kg_records():
+                await ensure_chunk_kg_records_field(self.text_chunks)
         except BaseException as failure:
             # Sticky (see the top of this method), cancellation included: a
             # CancelledError here leaves the status INITIALIZED with the checks
@@ -5638,7 +5672,27 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                 # Relationship storage is undirected, so keep only the last update
                 # for each endpoint pair regardless of order.
                 deduped_relationships: dict[tuple[str, str], dict[str, Any]] = {}
+                # Fork (extraction contract): with relationship_inverses in the
+                # profile, a relation's keywords read "src_id keywords tgt_id";
+                # the pair is written in storage (sorted) order, under the inverse
+                # names when that flips it (lightrag/kg_contract.py).
+                relation_inverses = self._relation_inverse_table()
                 for relationship_data in normalized_relationships:
+                    if relation_inverses and isinstance(
+                        relationship_data.get("keywords"), str
+                    ):
+                        src_id, tgt_id, keywords = orient_relation(
+                            relationship_data["src_id"],
+                            relationship_data["tgt_id"],
+                            relationship_data["keywords"],
+                            relation_inverses,
+                        )
+                        relationship_data = {
+                            **relationship_data,
+                            "src_id": src_id,
+                            "tgt_id": tgt_id,
+                            "keywords": keywords,
+                        }
                     src_id = relationship_data["src_id"]
                     tgt_id = relationship_data["tgt_id"]
                     relation_key = tuple(sorted((src_id, tgt_id)))
@@ -9485,6 +9539,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                 allow_merge,
                 self.entity_chunks,
                 self.relation_chunks,
+                relation_inverse_table=self._relation_inverse_table(),
             )
 
     def edit_entity(
@@ -9535,6 +9590,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                 target_entity,
                 updated_data,
                 self.relation_chunks,
+                relation_inverse_table=self._relation_inverse_table(),
             )
 
     def edit_relation(
@@ -9619,6 +9675,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                 relation_data,
                 before_create=self._migrate_chunk_tracking_before_creation,
                 relation_chunks_storage=self.relation_chunks,
+                relation_inverse_table=self._relation_inverse_table(),
             )
 
     def create_relation(
@@ -9677,6 +9734,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                 target_entity_data,
                 self.entity_chunks,
                 self.relation_chunks,
+                relation_inverse_table=self._relation_inverse_table(),
             )
 
     def merge_entities(

@@ -71,8 +71,8 @@ plural next to its Titlecase form) may now get different keys; the map also
 keeps each legacy key's canonical, consulted for a name that is not symbolic
 when its own key misses the aliases and the map. Symbolic names never use it.
 
-The map is built from the graph once the storages are up (Postgres graph
-storage only) and is armed when complete; until then names pass unchanged, so
+The map is built from the graph once the storages are up (the PostgreSQL graph
+storages only: Apache AGE or the plain-table one) and is armed when complete; until then names pass unchanged, so
 the pipeline waits for it (``ARM_WAIT_S``) before folding or rebuilding. A
 missing or malformed lists file arms the map with the default lists, an
 unreadable alias file arms it without aliases (both logged as errors); the
@@ -920,11 +920,11 @@ def _env_path(name: str, default: str) -> str:
     return path
 
 
-async def _query_with_retries(graph, sql: str):
+async def _query_with_retries(run):
     attempts = len(_QUERY_RETRY_DELAYS) + 1
     for attempt in range(1, attempts + 1):
         try:
-            return await graph._query(sql)
+            return await run()
         except Exception as e:
             if attempt == attempts:
                 raise
@@ -936,10 +936,54 @@ async def _query_with_retries(graph, sql: str):
             await asyncio.sleep(delay)
 
 
+# The plain-table graph storage (PGTableGraphStorage). It keeps one row per
+# undirected edge, in canonical order (src_id < tgt_id), so counting a node's
+# appearances in both endpoint columns is its degree, as the AGE query counts
+# the start_id and end_id of its DIRECTED edges. A node's name is its id: the
+# storage writes entity_id = id on every upsert.
+_PGTABLE_FOLD_SQL = """SELECT n.id AS name,
+       coalesce(n.properties->>'entity_type', '') AS type,
+       coalesce(d.n, 0) AS degree
+FROM lightrag_graph_nodes n
+LEFT JOIN (SELECT id, count(*) AS n FROM (
+             SELECT src_id AS id FROM lightrag_graph_edges
+             WHERE workspace = $1 AND namespace = $2
+             UNION ALL
+             SELECT tgt_id FROM lightrag_graph_edges
+             WHERE workspace = $1 AND namespace = $2) x
+           GROUP BY id) d ON d.id = n.id
+WHERE n.workspace = $1 AND n.namespace = $2"""
+
+
+def _age_fold_sql(graph_name: str) -> str:
+    return f"""SELECT (b.properties::text)::jsonb->>'entity_id' AS name,
+                     coalesce((b.properties::text)::jsonb->>'entity_type', '') AS type,
+                     coalesce(d.n, 0) AS degree
+              FROM "{graph_name}".base b
+              LEFT JOIN (SELECT id, count(*) AS n FROM (
+                           SELECT start_id AS id FROM "{graph_name}"."DIRECTED"
+                           UNION ALL SELECT end_id FROM "{graph_name}"."DIRECTED") x
+                         GROUP BY id) d ON d.id = b.id"""
+
+
+def _fold_rows_reader(graph):
+    """A coroutine function that reads every node's name, type and degree from
+    ``graph``, or None when the storage is not supported."""
+    from lightrag.kg.pgtable_impl import PGTableGraphStorage
+
+    if isinstance(graph, PGTableGraphStorage):
+        return lambda: graph._fetch(_PGTABLE_FOLD_SQL, graph.workspace, graph.namespace)
+    graph_name = getattr(graph, "graph_name", None)
+    if graph_name is not None and hasattr(graph, "_query"):
+        sql = _age_fold_sql(graph_name)
+        return lambda: graph._query(sql)
+    return None
+
+
 async def build_fold_map(graph) -> int | None:
     """Load the exception lists (env ``ENTITY_NAME_FOLD_LISTS``) and the alias
     table (env ``ENTITY_NAME_ALIASES``), read every node's name, type and degree
-    from a Postgres/AGE graph storage and arm the map. Returns the key count, or
+    from a PostgreSQL graph storage (Apache AGE or plain tables) and arm the map. Returns the key count, or
     None when the storage is not supported (folding then stays off).
 
     A missing or malformed lists file arms the map with the DEFAULT lists (an
@@ -950,12 +994,13 @@ async def build_fold_map(graph) -> int | None:
     kept in ``fold_state``."""
     global _STATE
     _STATE = {"state": "pending"}
-    graph_name = getattr(graph, "graph_name", None)
-    if graph_name is None or not hasattr(graph, "_query"):
+    read_rows = _fold_rows_reader(graph)
+    if read_rows is None:
         logger.warning(
-            "ENTITY_NAME_FOLD ignored: it needs the Postgres (AGE) graph storage"
+            "ENTITY_NAME_FOLD ignored: it needs a PostgreSQL graph storage "
+            "(PGGraphStorage or PGTableGraphStorage)"
         )
-        _STATE["state"] = "failed:it needs the Postgres (AGE) graph storage"
+        _STATE["state"] = "failed:it needs a PostgreSQL graph storage"
         return None
     started = time.monotonic()
     lists_path = _env_path("ENTITY_NAME_FOLD_LISTS", DEFAULT_ENTITY_NAME_FOLD_LISTS)
@@ -981,16 +1026,8 @@ async def build_fold_map(graph) -> int | None:
         load_aliases(None)
         n_aliases = 0
     _STATE.update(lists=source, aliases=n_aliases)
-    sql = f"""SELECT (b.properties::text)::jsonb->>'entity_id' AS name,
-                     coalesce((b.properties::text)::jsonb->>'entity_type', '') AS type,
-                     coalesce(d.n, 0) AS degree
-              FROM "{graph_name}".base b
-              LEFT JOIN (SELECT id, count(*) AS n FROM (
-                           SELECT start_id AS id FROM "{graph_name}"."DIRECTED"
-                           UNION ALL SELECT end_id FROM "{graph_name}"."DIRECTED") x
-                         GROUP BY id) d ON d.id = b.id"""
     try:
-        rows = await _query_with_retries(graph, sql) or []
+        rows = await _query_with_retries(read_rows) or []
         new, legacy = await asyncio.to_thread(
             lambda: _compute_fold_map(
                 (r.get("name"), r.get("type"), r.get("degree")) for r in rows

@@ -19,6 +19,7 @@ import copy
 import logging
 import time
 from contextlib import asynccontextmanager
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -187,6 +188,21 @@ async def test_the_graph_query_is_retried(caplog):
     with caplog.at_level(logging.WARNING, logger="lightrag"):
         assert await fold_mod.build_fold_map(graph) == 3
     assert graph.calls == 3
+    assert "graph query failed (attempt 1/4" in caplog.text
+
+
+async def test_the_table_graph_query_is_retried(caplog):
+    from lightrag.kg.pgtable_impl import PGTableGraphStorage
+
+    graph = object.__new__(PGTableGraphStorage)
+    graph.workspace, graph.namespace = "ws", "chunk_entity_relation"
+    rows = [{"name": n, "type": t, "degree": d} for n, t, d in NODES]
+    graph._fetch = AsyncMock(
+        side_effect=[ConnectionError("graph not reachable yet")] * 2 + [rows]
+    )
+    with caplog.at_level(logging.WARNING, logger="lightrag"):
+        assert await fold_mod.build_fold_map(graph) == 3
+    assert graph._fetch.await_count == 3
     assert "graph query failed (attempt 1/4" in caplog.text
 
 
@@ -510,7 +526,7 @@ async def _merged_graph():
 
 
 async def _rebuild_merged(monkeypatch):
-    async def cached(llm_response_cache, chunk_ids, text_chunks_storage):
+    async def cached(llm_response_cache, chunk_ids, text_chunks_storage, **_kwargs):
         return {c: [(c, 1)] for c in sorted(chunk_ids) if c in CACHED}, {}
 
     async def parsed(*, chunk_id, **_kwargs):

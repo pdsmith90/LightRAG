@@ -1336,3 +1336,70 @@ def test_plan_sync_hands_os_fsync_a_descriptor_opened_for_writing(
     assert sync_flags[0] & (os.O_WRONLY | os.O_RDWR), (
         "os.fsync on a read-only descriptor raises EBADF on Windows"
     )
+
+
+async def test_a_chunk_with_stored_records_is_attributed_from_them():
+    """Fork (extraction contract): a chunk extracted with the contract or a
+    hook is attributed to the names its stored accepted records carry (here a
+    hook renamed the LLM's ``ScaleHeight`` to ``scale height``, the name the
+    graph holds), not to its cached LLM output; it needs no cache. Bad stored
+    records add nothing."""
+    from lightrag.utils import CHUNK_KG_RECORDS_FIELD
+
+    stored = {
+        "format": 1,
+        "entities": [
+            {"entity_name": "scale height", "description": "d", "source_id": "c1"},
+            {"entity_name": "thermosphere", "description": "d", "source_id": "c1"},
+        ],
+        "relations": [
+            {
+                "src_id": "scale height",
+                "tgt_id": "thermosphere",
+                "keywords": "located_in",
+                "reverse_keywords": "location_of",
+                "description": "d",
+                "source_id": "c1",
+            }
+        ],
+    }
+    chunks = {
+        "c1": {
+            "content": "The scale height of the thermosphere.",
+            "llm_cache_list": ["cache-1"],
+            CHUNK_KG_RECORDS_FIELD: stored,
+        },
+        "c2": {
+            "content": "No cache.",
+            "llm_cache_list": [],
+            CHUNK_KG_RECORDS_FIELD: {},
+        },
+    }
+    cache = {
+        "cache-1": {
+            "cache_type": "extract",
+            "chunk_id": "c1",
+            "return": _extraction_payload(
+                entities=["ScaleHeight", "thermosphere"],
+                relationships=[("ScaleHeight", "thermosphere")],
+            ),
+            "create_time": 1,
+        }
+    }
+    graph = _Graph(
+        ["ScaleHeight", "scale height", "thermosphere"],
+        [("ScaleHeight", "thermosphere"), ("scale height", "thermosphere")],
+    )
+    repairer = _Repairer(
+        docs={"doc-1": _Doc(["c1", "c2"])}, chunks=chunks, cache=cache, graph=graph
+    )
+
+    # ScaleHeight, the LLM's spelling, gets no row: no extraction stored it
+    await _repair(repairer, allow_missing_rows=True)
+
+    assert repairer.entity_chunks.data["scale height"]["chunk_ids"] == ["c1"]
+    assert repairer.entity_chunks.data["thermosphere"]["chunk_ids"] == ["c1"]
+    assert "ScaleHeight" not in repairer.entity_chunks.data
+    assert repairer.relation_chunks.data[
+        make_relation_chunk_key("scale height", "thermosphere")
+    ]["chunk_ids"] == ["c1"]
