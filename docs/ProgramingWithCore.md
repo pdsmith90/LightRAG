@@ -767,26 +767,16 @@ Contract:
 - **Coverage.** Every path that extracts goes through it: the document pipeline
   and `ainsert_custom_chunks` alike. `ainsert_custom_kg` does not extract — the
   caller supplies the graph directly — so it is not filtered.
-- **The knowledge rebuild runs it again** (fork). Extraction records which hook
-  (and extraction contract) each chunk was post-processed under, as a
-  fingerprint beside the chunk's cache references. After a document deletion
-  (and in the kept-summary and rollback rebuilds) each surviving chunk
-  extracted under the current hook has its cached extraction re-parsed, its
-  passes merged as at extraction, and the hook called on the result with the
-  same `chunk_text`, rebuilt from the stored chunk, so the rebuild finds the
-  records under the names the hook gave them. A hook must therefore decide the
-  same way for the same chunk and records. A chunk extracted without a hook is
-  re-parsed as it was, without calling the hook. A hook is identified by the
-  module and qualified name of its function or class, plus its
-  `kg_validator_version` attribute when it has one: set or bump that attribute
-  when the hook's rules change without its name changing. A chunk extracted
-  under another hook (or none, after the hook is removed), a hook that raises
-  in the rebuild, or a chunk without its text, makes that chunk unreproducible
-  (`KGRebuildReport.unreproducible_chunk_ids`): the deletion still completes,
-  every entity or relation the chunk then gives no record for keeps its stored
-  description with its provenance repaired, and the deletion's message says it
-  completed with unreproducible items. See *Rebuilding from cached
-  extractions* in `ZLIGHTRAG.md`.
+- **It runs once per chunk, at extraction** (fork). With a hook set, extraction
+  stores with each chunk the records the hook returned (with the multimodal
+  links added after it), in the text-chunk field `kg_records`. The knowledge
+  rebuild after a document deletion (and the kept-summary and rollback
+  rebuilds) reads those records and never calls the hook, so a hook that is
+  changed, removed or raising later does not change what a deletion rebuilds,
+  and a hook need not decide the same way twice. A chunk extracted without a
+  hook (and without the extraction contract) stores nothing and is rebuilt
+  from its cached LLM output, as before. A failure to store the records fails
+  the chunk. See *Rebuilding from stored records* in `ZLIGHTRAG.md`.
 - **Multimodal entities are not shown to the hook.** For a drawing / table /
   equation chunk, LightRAG synthesizes one entity from the sidecar and links it
   to the chunk's surviving entities. That injection happens *after* the hook, so

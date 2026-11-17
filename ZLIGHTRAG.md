@@ -294,8 +294,9 @@ stderr, so stdout holds the schema only.
 
 Nothing here can make the front apply that schema (a missing or invalid schema file, or
 a model the front does not attach it to, leaves `keywords` a free string), so the parser
-checks every relation the LLM extracted against the list: the first pass, the gleaning
-turn, and the cached results a knowledge rebuild re-parses (`check_relation_keywords`).
+checks every relation the LLM extracted against the list: the first pass and the gleaning
+turn (`check_relation_keywords`). A knowledge rebuild reads the records extraction
+stored and checks nothing (*Rebuilding from stored records*).
 A keyword that equals a declared type after trimming and case-folding is rewritten to
 the declared spelling (`Part_Of` to `part_of`; `part of` and `member of` match nothing);
 a field of several keywords keeps the declared types among them and loses the rest. With
@@ -308,13 +309,11 @@ otherwise dropped with its relation. A `keywords` field the model returned as a 
 list is read as its elements (without the contract it is stored as the string of the
 list, as before). Each change is counted: a document whose relations needed any logs one
 warning (also in the pipeline history) with the counts (`normalized`, `multi_type`,
-`inverse`, `related_to`, `dropped`, of `checked`), a rebuild that re-parsed such records
-logs one too, and `/health` shows the running totals as `kg_contract_relation_keywords`,
-under `extraction` and `rebuild`. The totals are those of the worker process that
-answers (each gunicorn worker keeps its own), and they count every attempt: a document
-that fails after its extraction and is processed again is counted again, and a rebuild
-re-counts records an extraction already counted. Any change counted under `extraction`
-means the schema is not being enforced upstream. Relations the code makes without the
+`inverse`, `related_to`, `dropped`, of `checked`), and `/health` shows the running totals
+as `kg_contract_relation_keywords`, under `extraction`. The totals are those of the
+worker process that answers (each gunicorn worker keeps its own), and they count every
+attempt: a document that fails after its extraction and is processed again is counted
+again. Any change counted means the schema is not being enforced upstream. Relations the code makes without the
 LLM (the sidecar fan-out) and relations a caller gives (`create_relation`,
 `edit_relation`, `insert_custom_kg`) are not checked. Without `relationship_types`
 nothing is checked or counted.
@@ -373,8 +372,8 @@ The write paths and what each does with the key:
 | path | with `relationship_inverses` |
 |---|---|
 | gleaning merge (`_merge_extraction_pass`) | within one chunk, a gleaning relation that states a first-pass relation's pair the other way round with a directed type (one the mapping names) removes each first-pass record of the reversed pair whose types are all directed and all restated (the gleaning turn is the correction). A symmetric type has no direction: when both sides are of symmetric types only, the reversed restatement is the same relation and the version with the longer description is kept, as for the same pair (a tie keeps the first pass). Any other reversed relation (another directed type, or a mix of directed and symmetric types) is a second relation and is kept beside the first |
-| extraction merge (`merge_nodes_and_edges`) | the records of a pair the sort flips get the inverse names before the merge; the stored edge's keywords already read in stored order |
-| rebuild after a deletion, the kept-summary rebuild and the rollback rebuild (`rebuild_knowledge_from_chunks`, `_rebuild_single_relationship`) | a chunk extracted under the current contract has its cached first pass and gleaning merged by the gleaning rule above, so a direction correction is reproduced, and its records filed under the reversed pair are inverted; a chunk extracted without the contract is re-parsed as it was, without the rule and without inversion (see *Rebuilding from cached extractions*); the edge is written back in sorted order |
+| extraction merge (`merge_nodes_and_edges`) | at the end of each chunk's extraction every relation record gets `reverse_keywords`, its keywords read the other way round (the inverse names, resolved with the table then; `add_reverse_keywords`); the merge puts each record into sorted order with `oriented_record`, which swaps the pair and takes `reverse_keywords` when the sort flips it, so the stored edge's keywords read in stored order |
+| rebuild after a deletion, the kept-summary rebuild and the rollback rebuild (`rebuild_knowledge_from_chunks`, `_rebuild_single_relationship`) | a chunk extracted under the contract has its stored records read (*Rebuilding from stored records*), each oriented by the same `oriented_record` from what the record carries, so the direction, a gleaning correction included, is what extraction stored whatever the profile says now; a chunk extracted without the contract is re-parsed from its cache as it was, without the rule and without inversion; the edge is written back in sorted order |
 | `ENTITY_NAME_FOLD` and `KG_CONTRACT_VALIDATOR` renames | no change needed: both rename endpoints before the merge and keep the extracted direction, so the merge orients the renamed pair |
 | entity rename (`edit_entity`), entity merge (`merge_entities`, and `edit_entity` with `allow_merge`) | the stored keywords read in the old sorted pair; the renamed or redirected pair is re-sorted, inverted when it flips, and written in sorted order before duplicates are joined |
 | `create_relation`, `edit_relation`, `insert_custom_kg` | keywords given with (source, target) read "source keywords target"; they are inverted when the stored order is the other way, and the edge is written in sorted order |
@@ -441,112 +440,104 @@ Names are looked up in the chunk text after the same normalization extraction ap
 names, case-folded. The rename and the grounding depend on the chunk's text, so one name
 can be kept in one chunk and renamed in another.
 
-The knowledge rebuild re-parses each surviving chunk extracted with the hook (after a
-document deletion, in the kept-summary rebuild of a re-ingest and in the rollback purge)
-and runs the configured `kg_extraction_validator`, this one or any other, on it again:
-on the chunk's first pass and gleaning merged as extraction merged them, with the text
-the hook received at extraction, rebuilt from the stored chunk (markup stripped and
-sanitized the same way), before the `ENTITY_NAME_FOLD` aliases. So a renamed or dropped
-name's records are found under the name the graph holds, and a deletion leaves the edge
-and its nodes with the surviving documents' chunk ids and text only, as without a
-hook. The hook must therefore decide the same way given the same chunk and records (a
-rule of the name and the chunk text does). Chunks extracted without the hook are
-re-parsed as they were, and a hook that raises in the rebuild or a chunk without its
-text is handled as described in *Rebuilding from cached extractions* below. The
-`lightrag-repair-chunk-tracking` tool applies the hook (from `KG_CONTRACT_VALIDATOR`) the
-same way when it attributes chunks.
-
-The rebuild runs the hook once per surviving chunk the deletion touches, in the event
-loop, with no cap on how many chunks one entity or relation has (only the kept-summary
-rebuild leaves hubs of over 100 chunks to the merge). The shipped validator took 0.5 to
-0.9 ms per chunk of about 900 words with about 40 entities and 40 relations in two
-measurements, so a hub with thousands of chunks costs seconds of event-loop time per
-deletion; a costly custom hook costs proportionally more.
+The hook runs once per chunk, at extraction. Its result (with the multimodal links added
+after it) is stored with the chunk, and the knowledge rebuild after a document deletion,
+the kept-summary rebuild of a re-ingest and the rollback purge read that and never call
+the hook (*Rebuilding from stored records*): a renamed or dropped name's records are
+found under the name the graph holds, so a deletion leaves the edge and its nodes with
+the surviving documents' chunk ids and text only, as without a hook, and a hook that is
+changed, removed or raising later changes nothing a deletion rebuilds. The
+`lightrag-repair-chunk-tracking` tool attributes such a chunk from its stored records.
 Reported in the `/health` configuration.
 Off by default.
 
-### Rebuilding from cached extractions: the contract fingerprint
+### Rebuilding from stored records
 
 A knowledge rebuild (after a document deletion, in the kept-summary rebuild of a
 re-ingest, in the rollback purge of a custom-chunk patch) and the
-`lightrag-repair-chunk-tracking` tool re-parse each surviving chunk's cached extraction
-to find what that chunk contributed. That only reproduces what extraction stored if each
-chunk is post-processed the way it was when it was extracted, and the extraction
-contract changes that post-processing: the keyword check and the inverse names
-(`relationship_types`, `relationship_inverses`) and the hook (`kg_extraction_validator`,
-`KG_CONTRACT_VALIDATOR`). So extraction records, with each extraction cache reference a
-chunk row holds, a contract fingerprint (`kg_contract.contract_fingerprint`): a 16-hex
-digest of the declared relation type names, the inverse mapping, the hook's identity and
-the rules versions (`CONTRACT_RULES_VERSION`, `VALIDATOR_RULES_VERSION`, bumped whenever
-the contract's own post-processing or the shipped validator's rules change). It is kept
-per cache key in the chunk row's `llm_cache_contract` mapping, beside `llm_cache_list`,
-rather than in the cache row: a cache row is keyed on the prompt, and the hook and the
-inverse mapping are not in the prompt, so one row can be shared by chunks (identical
-text, or the same chunk extracted again) post-processed under different
-configurations. Without a contract and a hook there is no fingerprint, and nothing is
-written: the chunk rows are those of the base branch. `PGKVStorage` stores the mapping in
-a nullable JSONB column `llm_cache_contract` of `LIGHTRAG_DOC_CHUNKS`, which the storage
-adds at start-up (`ALTER TABLE ... ADD COLUMN`, NULL on every existing row) and leaves
-NULL for rows without a mapping, which read back without the key.
+`lightrag-repair-chunk-tracking` tool need what each surviving chunk contributed to the
+graph. On the base branch they re-parse the chunk's cached LLM output, which is all its
+extraction did to it. Under the extraction contract or an extraction hook, extraction does
+more (the keyword check, the gleaning direction rule, the inverse names, the hook), and
+re-running that later gives a different answer as soon as anything changed: the relation
+list, the inverse names, the hook, the code's rules, or the contract switched off. So
+extraction stores, with each chunk, the records it accepted, and the rebuild reads them.
 
-The hook's identity is the module and qualified name of its function (through
-`functools.partial`) or of its class, plus its `kg_validator_version` attribute when it
-has one. A caller that changes what its hook does without renaming it must set or bump
-that attribute; the rebuild cannot otherwise tell the old output from the new.
+When. Only while the profile declares `relationship_types` or a `kg_extraction_validator`
+is set (`KG_CONTRACT_VALIDATOR`). Without either nothing is written, and the chunk rows
+and the rebuild are those of the base branch (for PostgreSQL see *Storages*).
 
-Each chunk whose cached extraction a rebuild reads is then re-parsed one of three ways
-(`_cached_extraction_mode`):
+What. One chunk's records as extraction hands them to the merge: after the first-pass
+parse and its keyword check, the gleaning parse, its check and the gleaning merge with
+its direction rule, the hook, and the multimodal links (the base rebuild does not make
+those again, so they are stored too), and before `ENTITY_NAME_FOLD` (the rebuild files
+them under both spellings with `alias_chunk_result`, as it files cached results). What
+was accepted is what is stored: a truncated gleaning reply that was merged but not cached
+is in the records.
 
-- no fingerprint on any of its cache keys (extracted without a contract and a hook, or
-  before fingerprints were recorded): the plain re-parse of the base branch, with no
-  keyword check, no direction rule and no hook, which is all extraction did to it;
-- the current configuration's fingerprint on all of them: the current post-processing in
-  extraction's order (each pass parsed and its keywords checked, the passes merged by
-  the gleaning rules, the hook on the merged records, then the `ENTITY_NAME_FOLD`
-  aliases, which extraction too applies last);
-- any other fingerprint, or several (a chunk that holds caches of extraction runs under
-  different configurations): unreproducible. It gets the plain re-parse, and every
-  entity or relation for which such a chunk then yields no record gets the structural
-  repair: its stored description, type, keywords and weight are kept and its provenance
-  (`source_id`, `file_path`, the chunk-tracking row) is rewritten to the surviving
-  chunks, instead of a description rebuilt without that chunk's contribution.
+Where. In the text-chunk row, field `kg_records` (`utils.CHUNK_KG_RECORDS_FIELD`), so it
+is deleted with the chunk. Its value has a fixed shape (no key varies per chunk):
 
-A chunk the current post-processing fails on (the hook raises, a pass cannot be parsed,
-or the hook needs the chunk text and the row has none) is unreproducible too; none of its
-records are used, so no record the hook has not judged reaches the graph, and the items
-it touches get the structural repair. The deletion is not failed for it: the fork's
-rebuild policies already treat missing or unusable extraction material as a semantic
-degradation repaired structurally, and a deterministic failure (a hook bug, a chunk row
-without text) would otherwise block every deletion that touches that chunk, and the
-kept-summary rebuild would retry it after every batch. The cost is that a transient hook
-failure leaves those items with their stored descriptions (which still carry the deleted
-document's text) until their documents are re-ingested; the deletion says so.
+```
+{"format": 1,
+ "entities":  [{"entity_name", "entity_type", "description", "source_id",
+                "file_path", "timestamp"}, ...],
+ "relations": [{"src_id", "tgt_id", "keywords", "reverse_keywords",
+                "description", "weight", "source_id", "file_path",
+                "timestamp"}, ...]}
+```
 
-The rebuild counts these chunks (`KGRebuildReport.unreproducible_chunk_ids`) and lists
-the repaired items with the other degraded ones (`degraded_entities`,
-`degraded_relationships`), logs one line with the counts and reasons to the pipeline
-history, and a deletion that met any returns `status="success"` with a message that ends
-`completed with unreproducible items: N surviving chunk(s) could not be re-processed ...;
-E entities and R relations kept their stored descriptions with their chunk provenance
-repaired (re-ingest their documents to rebuild them)`. A rollback purge records the
-chunks in its persisted `kg_recovery_warnings` (`unreproducible_chunks`). The repair tool
-counts them in its plan report (`chunks_unreproducible`: attributed from the plain
-re-parse, which can miss names the old hook renamed; `chunks_reprocess_failed`: no
-attribution) with a warning each. A chunk's caches of several extraction runs under the
-same configuration (a chunk extracted again after a prompt change) are still merged as
-one run, as the base branch merges them.
+A record holds those keys only (the ones it has); `entity_name` and `src_id`/`tgt_id` are
+the name and the pair it is filed under, in the spelling the model wrote (or the hook
+gave). `keywords` read from `src_id` to `tgt_id`; `reverse_keywords` read from `tgt_id`
+to `src_id`, resolved with the inverse names at extraction (the same keywords without
+`relationship_inverses`). The graph stores each pair sorted: an edge (a, b) gets a
+relation's `keywords` when `src_id <= tgt_id` and its `reverse_keywords` otherwise
+(`kg_contract.oriented_record`; the extraction merge and the rebuild both use it), so the
+stored graph can be checked against the stored records without the profile. Measured on
+5,988 chunks of the production cache (7,918 first-pass and gleaning replies): 3.8 kB of
+JSON per chunk on average (median 3.5 kB, 95th percentile 10.9 kB, largest 49 kB), 1.2 kB
+as PostgreSQL stores it compressed.
 
-What switching the contract or the hook on does for an existing graph, then: new and
-re-ingested documents are extracted and post-processed under it; documents extracted
-before keep their nodes, edges and keywords, and a deletion rebuilds them exactly as it
-did before the switch. It does not re-check, re-key or rename anything already in the
-graph; re-ingest the documents for that. Switching it off, or changing the relation
-list, the inverse mapping or the hook afterwards, makes the chunks extracted under the
-old configuration unreproducible: their items are rebuilt from the plain re-parse where
-it finds them (with the keywords the model wrote) and structurally repaired where it does
-not, and the deletion reports them. Tests:
-`tests/extraction/test_kg_contract_reproduce.py`, and
-`tests/kg/postgres_impl/test_pg_chunk_cache_contract_smoke.py` for the PostgreSQL column
+Storages. JSON, Redis and OpenSearch keep the field in the chunk document: a row read and
+written back keeps it, and the pipeline's upsert of a re-created chunk (a document
+processed again) replaces the document without it. MongoDB's chunk upsert is a `$set`, so
+it unsets the field when the row written does not carry it. `PGKVStorage` keeps it in a
+nullable JSONB column `kg_records` of `LIGHTRAG_DOC_CHUNKS` that only three statements
+name (write, read, clear); the general chunk reads and the upsert leave it alone, so the
+base branch keeps working on a table that has it. New tables get it in `CREATE TABLE`. On
+an existing table the start-up column lookup only notes whether it is there; it is added
+at start-up when the contract or a hook is on, with `ADD COLUMN IF NOT EXISTS` under a
+5 s lock timeout, three attempts; if it still cannot be added, start-up is refused with a
+message that says how to add it by hand. While the column is absent no statement names
+it. Because the PostgreSQL upsert leaves the column alone, extraction clears the column
+for a document's chunks before it extracts them, in every configuration, whenever the
+column exists (one statement per document), and a rebuild reads it with one statement.
+
+Lifecycle. A records write that fails fails that chunk's extraction, and so the document,
+which is retried as any failed document. A chunk extracted again with neither contract
+nor hook keeps no records (the document store replaced it; PostgreSQL cleared it) and is
+rebuilt from its cache.
+
+The rebuild. Each surviving chunk with stored records contributes them, whatever the
+configuration is now: nothing reads the current relation list, inverse table or hook for
+it, and it needs no extraction cache. Stored records of an unknown shape make the chunk
+unusable, as an unparseable cache does. A chunk without them is re-parsed from its cache
+as on the base branch. An entity or relation fed by both kinds gets each chunk's
+contribution its own way, which is how extraction merged them.
+
+Chunks extracted before. Every chunk extracted before this rule, with or without the
+contract (production has none with it), carries no records and is rebuilt from its
+cache, as the base branch rebuilds it: switching the contract or the hook on does not
+change what a deletion rebuilds for them. A chunk extracted with the contract by an
+earlier version of this branch (which recorded a contract fingerprint,
+`llm_cache_contract`, now ignored) is rebuilt by the plain re-parse too. Re-ingest those
+documents to give them records. Switching the contract or the hook on does not re-check,
+re-key or rename anything already in the graph; switching it off, or changing the list,
+the inverse names or the hook, changes nothing for chunks that have records. Tests:
+`tests/extraction/test_kg_contract_reproduce.py`,
+`tests/kg/test_chunk_kg_records_storage.py`, and
+`tests/kg/postgres_impl/test_pg_kg_records_smoke.py` for the PostgreSQL column
 (`pg_smoke`, below).
 
 ### Entity name fold
@@ -876,7 +867,7 @@ AGE integration test for the edge removal,
 contract's inverse names on the table graph storage,
 `tests/kg/pgtable_impl/test_pgtable_fold_map_smoke.py` and
 `tests/kg/pgtable_impl/test_pgtable_relation_direction_smoke.py`, and the extraction
-contract's text-chunk column, `tests/kg/postgres_impl/test_pg_chunk_cache_contract_smoke.py`,
+contract's text-chunk column, `tests/kg/postgres_impl/test_pg_kg_records_smoke.py`,
 marked `pg_smoke` like the storage's other live-PostgreSQL tests, which need
 `--run-integration` and `POSTGRES_PASSWORD`. No workflow on this branch runs them.
 
