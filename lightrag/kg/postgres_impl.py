@@ -2497,19 +2497,16 @@ class PostgreSQLDB:
                 WHERE table_name = 'lightrag_doc_chunks'
                   AND column_name = ANY($1)
                 """,
-                # Fork (extraction contract): the same lookup tells whether the
-                # kg_records column exists; it is added only when needed
-                # (ensure_chunk_kg_records_column).
-                [[c for c, _ in columns_to_add] + ["kg_records"]],
+                [[c for c, _ in columns_to_add]],
                 multirows=True,
             )
             existing_names = {row["column_name"] for row in (existing or [])}
-            self.chunk_kg_records_column = "kg_records" in existing_names
         except Exception as e:
             logger.warning(
                 f"Failed to inspect LIGHTRAG_DOC_CHUNKS columns for migration: {e}"
             )
             existing_names = set()
+        await self._probe_chunk_kg_records_column()
 
         for col_name, col_type in columns_to_add:
             if col_name in existing_names:
@@ -2528,6 +2525,31 @@ class PostgreSQLDB:
                 logger.error(
                     f"Failed to add column {col_name} to LIGHTRAG_DOC_CHUNKS: {e}"
                 )
+
+    async def _probe_chunk_kg_records_column(self) -> None:
+        """Fork (extraction contract): set ``chunk_kg_records_column`` from the
+        table an unqualified LIGHTRAG_DOC_CHUNKS resolves to through the
+        session's search path, which is how the statements that name the column
+        resolve it. A same-named table in another schema does not count. The
+        column is added only when needed (ensure_chunk_kg_records_column); if
+        the probe fails it counts as absent."""
+        try:
+            row = await self.query(
+                """
+                SELECT EXISTS (
+                    SELECT 1 FROM pg_attribute
+                    WHERE attrelid = to_regclass('lightrag_doc_chunks')
+                      AND attname = 'kg_records'
+                      AND NOT attisdropped
+                ) AS present
+                """
+            )
+            self.chunk_kg_records_column = bool(row and row["present"])
+        except Exception as e:
+            logger.warning(
+                f"Failed to probe LIGHTRAG_DOC_CHUNKS for the kg_records column: {e}"
+            )
+            self.chunk_kg_records_column = False
 
     # Fork (extraction contract): adding kg_records to an existing chunk table.
     # ADD COLUMN of a nullable column without a default changes only the
