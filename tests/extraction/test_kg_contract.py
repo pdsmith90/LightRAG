@@ -71,9 +71,13 @@ def prompt_dir(tmp_path, monkeypatch):
     return tmp_path
 
 
-async def _sent_prompts(use_json: bool, addon_params: dict) -> list[tuple]:
+async def _sent_prompts(
+    use_json: bool, addon_params: dict, cached_profile: bool = False
+) -> list[tuple]:
     """(user prompt, system prompt) of every LLM call one chunk's extraction
-    makes, with one gleaning pass."""
+    makes, with one gleaning pass. ``cached_profile`` hands extraction the
+    profile the way ``LightRAG`` caches it (``_entity_extraction_prompt_profile``,
+    resolved and validated once) instead of letting it resolve its own."""
     reply = '{"entities": [], "relationships": []}' if use_json else "<|COMPLETE|>"
     llm = AsyncMock(return_value=reply)
     global_config = {
@@ -87,6 +91,14 @@ async def _sent_prompts(use_json: bool, addon_params: dict) -> list[tuple]:
         "llm_model_max_async": 1,
         "entity_extraction_use_json": use_json,
     }
+    if cached_profile:
+        global_config["_entity_extraction_prompt_profile"] = (
+            validate_entity_extraction_prompt_profile_for_mode(
+                resolve_entity_extraction_prompt_profile(addon_params, use_json),
+                use_json,
+                addon_params.get("entity_type_prompt_file"),
+            )
+        )
     chunks = {
         "chunk-1": {
             "tokens": len(CHUNK_TEXT),
@@ -140,10 +152,11 @@ def _expected_prompts(use_json: bool, profile: dict) -> list[tuple]:
 # ------------------------------------------------------------ default unchanged
 
 
+@pytest.mark.parametrize("cached_profile", [False, True], ids=["resolved", "cached"])
 @pytest.mark.parametrize("use_json", [True, False])
 @pytest.mark.parametrize("profile_file", [None, "plain.yml"])
 async def test_a_profile_without_relationship_types_sends_the_untouched_prompts(
-    prompt_dir, use_json, profile_file
+    prompt_dir, use_json, profile_file, cached_profile
 ):
     addon = {"entity_type_prompt_file": profile_file} if profile_file else {}
     profile = (
@@ -152,7 +165,7 @@ async def test_a_profile_without_relationship_types_sends_the_untouched_prompts(
         else get_default_entity_extraction_prompt_profile()
     )
     assert "relationship_types" not in profile
-    sent = await _sent_prompts(use_json, addon)
+    sent = await _sent_prompts(use_json, addon, cached_profile)
     assert sent == _expected_prompts(use_json, profile)
     assert "Relationship types." not in sent[0][1]
 
@@ -404,6 +417,14 @@ def test_the_schema_command_needs_a_relation_list(capsys):
     assert "declares no relationship_types" in capsys.readouterr().err
 
 
+def test_the_schema_command_reports_a_missing_profile_file(tmp_path, capsys):
+    missing = tmp_path / "absent.yml"
+    assert kg_contract.main(["--schema", "--profile", str(missing)]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "does not exist" in captured.err and str(missing) in captured.err
+
+
 def test_the_schema_command_needs_the_schema_flag():
     with pytest.raises(SystemExit) as exc:
         kg_contract.main(["--profile", str(CONTRACT_SAMPLE)])
@@ -526,6 +547,19 @@ def test_a_rename_that_joins_both_endpoints_drops_the_self_loop():
     assert list(out_nodes) == ["scale height"]
     assert len(out_nodes["scale height"]) == 2  # both records, one name
     assert out_edges == {} and stats["self_loop"] == 1
+
+
+def test_grounding_reads_the_chunk_text_as_extraction_normalizes_names():
+    """Extraction removes the curly apostrophe from a name (Earth's -> Earths);
+    the endpoint is still found in the chunk text, normalized the same way."""
+    text = "Glorbon maps Earth\u2019s gravity field."
+    nodes = {"Glorbon": _node("Glorbon")}
+    edges = {
+        ("Glorbon", "Earths gravity field"): _edge("Glorbon", "Earths gravity field")
+    }
+    _n, out_edges, stats = validate_chunk(text, nodes, edges)
+    assert set(out_edges) == {("Glorbon", "Earths gravity field")}
+    assert stats["undeclared_kept"] == 1 and stats["undeclared_dropped"] == 0
 
 
 def test_relation_direction_is_kept():
