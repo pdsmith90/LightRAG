@@ -201,9 +201,10 @@ async def test_a_broken_helper_never_breaks_the_endpoint(monkeypatch):
     def _boom(*args, **kwargs):
         raise RuntimeError("helper bug")
 
-    async with _status_session(
-        monkeypatch, helper=_boom
-    ) as (endpoint, pipeline_status):
+    async with _status_session(monkeypatch, helper=_boom) as (
+        endpoint,
+        pipeline_status,
+    ):
         response = await endpoint()
 
     assert response.history_messages == [EXISTING_LINE]
