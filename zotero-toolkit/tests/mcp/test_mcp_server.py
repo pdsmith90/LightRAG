@@ -692,6 +692,48 @@ def test_invalid_modes_fall_back_to_naive(fake_lightrag, load_server, mode):
     assert {c["json"]["mode"] for c in fake_lightrag.calls("/query")} == {"naive"}
 
 
+@pytest.mark.parametrize("answer", [False, True])
+@pytest.mark.parametrize("include_graph,tokens", [(False, 1), (True, 1000)])
+def test_naive_search_keeps_its_graph_budgets(
+    fake_lightrag, load_server, answer, include_graph, tokens
+):
+    # a naive search takes no graph passages: the budgets stay minimal unless the graph is asked for
+    load_server().search_library(
+        "q", mode="naive", answer=answer, include_graph=include_graph
+    )
+    body = fake_lightrag.calls("/query")[0]["json"]
+    assert (body["max_entity_tokens"], body["max_relation_tokens"]) == (tokens, tokens)
+
+
+@pytest.mark.parametrize("mode", ["mix", "hybrid", "local", "global"])
+@pytest.mark.parametrize("answer", [False, True])
+@pytest.mark.parametrize("include_graph", [False, True])
+def test_graph_modes_send_the_servers_own_graph_budgets(
+    fake_lightrag, load_server, mode, answer, include_graph
+):
+    # a 1-token budget leaves no entities or relations, hence no graph-derived passages
+    load_server().search_library(
+        "q", mode=mode, answer=answer, include_graph=include_graph
+    )
+    body = fake_lightrag.calls("/query")[0]["json"]
+    assert "max_entity_tokens" not in body and "max_relation_tokens" not in body
+    assert body["mode"] == mode
+
+
+def test_a_graph_mode_still_renders_passages_only_unless_the_graph_is_asked_for(
+    fake_lightrag, load_server
+):
+    fake_lightrag.routes[("POST", "/query")] = _answer_route(
+        _context_text(CHUNKS), REFERENCES[:2]
+    )
+    srv = load_server()
+    plain = srv.search_library("q", mode="mix")
+    assert "Knowledge Graph Data" not in plain and "Identity shortcuts" in plain
+    assert "Knowledge Graph Data" in srv.search_library(
+        "q", mode="mix", include_graph=True
+    )
+
+
 @pytest.mark.parametrize(
     "requested,sent", [(10, 10), (40, 40), (41, 40), (5000, 40), (0, 1), (-3, 1)]
 )
@@ -725,6 +767,7 @@ def test_api_key_travels_in_header_never_in_url(fake_lightrag, load_server, api_
         "/query/data",
         "/graph/papers/search",
         "/documents/text",
+        "/documents/pipeline_status",  # health checks the key with one keyed call
         "/health",
     }
     for r in fake_lightrag.requests:

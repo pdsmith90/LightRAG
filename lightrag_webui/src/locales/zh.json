@@ -420,6 +420,38 @@
       "refreshCurrentLabelTooltip": "刷新当前页面图数据",
       "refreshingTooltip": "正在刷新数据..."
     },
+    "paperFilter": {
+      "modeSharedMapTooltip": "仅显示所选论文与其引用论文共有的内容。点击显示论文地图：通过引用和文献耦合相连的周边论文",
+      "modeCommonMapTooltip": "显示至少两篇所选论文贡献的内容。点击显示论文地图：通过引用和文献耦合相连的周边论文",
+      "modeMapTooltip": "论文地图：通过引用和文献耦合连接的所选论文周边论文，按领域着色。点击显示论文贡献的全部内容",
+      "mapOneHopTooltip": "显示一步之内的论文。点击扩展到两步（最强连接优先，最多 {{limit}} 篇）",
+      "mapTwoHopsTooltip": "显示两步之内的论文（最强连接优先，最多 {{limit}} 篇）。点击仅显示一步",
+      "mapSummary": "论文地图：找到并显示 {{nodes}} 篇论文（一步 {{hop1}} 篇，两步 {{hop2}} 篇）",
+      "mapSummaryLimited": "论文地图：找到 {{found}} 篇论文，显示 {{nodes}} 篇（上限 {{limit}}；一步 {{hop1}} 篇，两步 {{hop2}} 篇）",
+      "mapShowMore": "显示更多论文（共 {{found}} 篇，已显示 {{shown}} 篇，下一上限 {{limit}}）",
+      "mapMoreSuffix": "。点击“显示更多论文”可提高上限。",
+      "someNotInStructure": "所选论文中有 {{count}} 篇不在引用结构中",
+      "mapLinksThinned": "显示 {{found}} 条链接中的 {{shown}} 条：每篇论文最强的链接",
+      "mapUnavailable": "此服务器没有论文地图（论文结构未启用或缺失），改为显示论文自身的图谱",
+      "mapAlreadyChosen": "这篇论文已是地图的论文之一",
+      "mapAddPaperTooltip": "将这篇论文加入地图的论文",
+      "legendCitation": "引用（箭头由引用方指向被引用方；无箭头：互相引用）",
+      "legendCoupling": "共同参考文献（无箭头）",
+      "linkKind": "连接",
+      "linkCitation": "引用",
+      "linkCitationBoth": "互相引用",
+      "linkCoupling": "共同参考文献",
+      "linkDirection": "方向",
+      "linkDirectionCites": "{{source}} 引用 {{target}}",
+      "linkDirectionMutual": "{{source}} 与 {{target}} 互相引用",
+      "linkDirectionNone": "无：两篇论文引用了部分相同的参考文献",
+      "linkSharedRefs": "共同参考文献数",
+      "reason": {
+        "not_in_structure": "这篇论文不在引用结构中",
+        "not_in_structure_many": "所选论文都不在引用结构中",
+        "no_links": "没有引用或耦合连接：仅显示所选论文"
+      }
+    },
     "emptyGraph": "无数据(请重载图形数据)"
   },
   "retrievePanel": {

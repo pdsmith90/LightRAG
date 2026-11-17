@@ -420,6 +420,38 @@
       "refreshCurrentLabelTooltip": "Refresh data graf halaman saat ini",
       "refreshingTooltip": "Memperbarui data..."
     },
+    "paperFilter": {
+      "modeSharedMapTooltip": "Hanya menampilkan apa yang dibagi makalah dengan makalah yang dikutipnya. Klik untuk peta makalah: makalah di sekitarnya lewat sitasi dan kopling bibliografis",
+      "modeCommonMapTooltip": "Menampilkan apa yang disumbangkan setidaknya dua makalah terpilih. Klik untuk peta makalah: makalah di sekitarnya lewat sitasi dan kopling bibliografis",
+      "modeMapTooltip": "Peta makalah: makalah di sekitar yang terpilih lewat sitasi dan kopling bibliografis, diwarnai menurut bidang. Klik untuk menampilkan semua yang disumbangkan makalah",
+      "mapOneHopTooltip": "Menampilkan makalah satu langkah. Klik untuk dua langkah (tautan terkuat dulu, paling banyak {{limit}} makalah)",
+      "mapTwoHopsTooltip": "Menampilkan makalah hingga dua langkah (tautan terkuat dulu, paling banyak {{limit}} makalah). Klik untuk satu langkah saja",
+      "mapSummary": "Peta makalah: {{nodes}} makalah ditemukan dan ditampilkan ({{hop1}} satu langkah, {{hop2}} dua langkah)",
+      "mapSummaryLimited": "Peta makalah: {{found}} makalah ditemukan, {{nodes}} ditampilkan (batas {{limit}}; {{hop1}} satu langkah, {{hop2}} dua langkah)",
+      "mapShowMore": "Tampilkan lebih banyak makalah ({{shown}} dari {{found}}, batas berikutnya {{limit}})",
+      "mapMoreSuffix": ". “Tampilkan lebih banyak makalah” menaikkan batas.",
+      "someNotInStructure": "{{count}} makalah terpilih tidak ada dalam struktur sitasi",
+      "mapLinksThinned": "menampilkan {{shown}} dari {{found}} tautan: yang terkuat untuk setiap makalah",
+      "mapUnavailable": "Server ini tidak memiliki peta makalah (struktur makalahnya mati atau tidak ada). Menampilkan graf makalah itu sendiri",
+      "mapAlreadyChosen": "Makalah ini sudah termasuk makalah peta",
+      "mapAddPaperTooltip": "Tambahkan makalah ini ke makalah peta",
+      "legendCitation": "Sitasi (panah dari makalah yang mengutip ke makalah yang dikutip; tanpa panah: saling mengutip)",
+      "legendCoupling": "Referensi bersama (tanpa panah)",
+      "linkKind": "Tautan",
+      "linkCitation": "Sitasi",
+      "linkCitationBoth": "Sitasi dua arah",
+      "linkCoupling": "Referensi bersama",
+      "linkDirection": "Arah",
+      "linkDirectionCites": "{{source}} mengutip {{target}}",
+      "linkDirectionMutual": "{{source}} dan {{target}} saling mengutip",
+      "linkDirectionNone": "Tidak ada: kedua makalah mengutip sebagian referensi yang sama",
+      "linkSharedRefs": "Jumlah referensi bersama",
+      "reason": {
+        "not_in_structure": "Makalah ini tidak ada dalam struktur sitasi",
+        "not_in_structure_many": "Tidak satu pun makalah terpilih ada dalam struktur sitasi",
+        "no_links": "Tidak ada tautan sitasi atau kopling: hanya makalah terpilih yang ditampilkan"
+      }
+    },
     "emptyGraph": "Graf Kosong (Coba Muat Ulang)"
   },
   "retrievePanel": {

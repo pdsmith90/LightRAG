@@ -535,6 +535,8 @@ HEALTH = {
     },
 }
 TAIL = "verbose=True returns the full server report (several KB of configuration)."
+# the fake server has no /documents/pipeline_status, which health asks to check the key
+KEY_LINE = "API key: not checked (HTTP 404)"
 
 
 def _health_route(fake_lightrag, code, payload):
@@ -547,6 +549,7 @@ def test_health_default_is_a_short_summary(fake_lightrag, load_server):
     out = srv.health()
     assert out == (
         "200 healthy · LightRAG core 1.4.9 (api 0300) · pipeline busy, scanning · 3 pending enqueues\n"
+        f"{KEY_LINE}\n"
         "queues (queued/running): extract 2/1; keyword 0/0; query 0/0; vlm 0/0; "
         "embedding 5/2, failed 3; rerank 0/0 UNAVAILABLE\n"
         "models: llm chat-model, embedding embed-model, rerank rerank-model, "
@@ -557,7 +560,9 @@ def test_health_default_is_a_short_summary(fake_lightrag, load_server):
 
 def test_health_verbose_is_the_whole_report(fake_lightrag, load_server):
     _health_route(fake_lightrag, 200, HEALTH)
-    assert load_server().health(verbose=True) == f"200: {json.dumps(HEALTH)}"
+    assert (
+        load_server().health(verbose=True) == f"200: {json.dumps(HEALTH)}\n{KEY_LINE}"
+    )
 
 
 def test_health_pipeline_states(fake_lightrag, load_server):
@@ -600,7 +605,10 @@ def test_health_leaves_out_fields_the_server_dropped(fake_lightrag, load_server,
 
 def test_health_with_only_a_status_and_a_version(fake_lightrag, load_server):
     _health_route(fake_lightrag, 200, {"status": "healthy", "core_version": "1.4.9"})
-    assert load_server().health() == "200 healthy · LightRAG core 1.4.9\n" + TAIL
+    assert (
+        load_server().health()
+        == f"200 healthy · LightRAG core 1.4.9\n{KEY_LINE}\n" + TAIL
+    )
 
 
 def test_health_cuts_long_fields_and_ignores_a_boolean_failure_count(
@@ -626,11 +634,14 @@ def test_health_not_200_or_not_an_object_is_shown_as_it_came(
 ):
     srv = load_server()
     _health_route(fake_lightrag, 503, {"detail": "x" * 500})
-    assert srv.health() == "503: " + json.dumps({"detail": "x" * 500})[:300]
+    assert (
+        srv.health()
+        == "503: " + json.dumps({"detail": "x" * 500})[:300] + f"\n{KEY_LINE}"
+    )
     _health_route(fake_lightrag, 200, "plain text, not an object")
-    assert srv.health() == '200: "plain text, not an object"'
+    assert srv.health() == f'200: "plain text, not an object"\n{KEY_LINE}'
     _health_route(fake_lightrag, 200, b"<html>not json</html>")
-    assert srv.health() == "200: <html>not json</html>"
+    assert srv.health() == f"200: <html>not json</html>\n{KEY_LINE}"
     deep = "[" * 100000 + "]" * 100000
     assert srv._health_summary(200, deep) == "200: " + deep[:300]
 
@@ -650,4 +661,4 @@ def test_health_takes_verbose_as_a_tool_argument(fake_lightrag, load_server):
     tools, short, full = anyio.run(main)
     assert tools["health"].input_schema["properties"]["verbose"]["type"] == "boolean"
     assert short.content[0].text.startswith("200 healthy")
-    assert full.content[0].text == f"200: {json.dumps(HEALTH)}"
+    assert full.content[0].text == f"200: {json.dumps(HEALTH)}\n{KEY_LINE}"

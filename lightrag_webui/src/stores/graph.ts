@@ -2,6 +2,7 @@ import { create } from 'zustand'
 import { createSelectors } from '@/lib/utils'
 import { DirectedGraph } from 'graphology'
 import MiniSearch from 'minisearch'
+import type { PaperSummary } from '@/api/lightrag'
 import { resolveNodeColor, DEFAULT_NODE_COLOR } from '@/utils/graphColor'
 
 // Minimal imperative handle the store needs to own a running layout: enough to
@@ -61,6 +62,12 @@ export class RawGraph {
   edgeIdMap: Record<string, number> = {}
   // edgeDynamicIdMap: map edge dynamic id to index in edges array (SigmaGraph has DynamicId as key)
   edgeDynamicIdMap: Record<string, number> = {}
+  // Fork: true for a paper map (nodes are papers, edges citations or coupling), set when it is
+  // loaded, so what is edited or expanded follows the graph on screen, not the query label.
+  isPaperMap = false
+  // Fork: the paper map's own summary (papers found and shown, the limit), for the control that
+  // asks for more papers.
+  paperSummary?: PaperSummary
 
   getNode = (nodeId: string) => {
     const nodeIndex = this.nodeIdMap[nodeId]

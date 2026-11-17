@@ -8,6 +8,12 @@ import { useTranslation } from 'react-i18next'
 import { GitBranchPlus, Scissors, Lock } from 'lucide-react'
 import EditablePropertyRow from './EditablePropertyRow'
 import { useSourceLabels } from '@/hooks/useSourceLabels'
+import { mapLinkKind } from '@/lib/paperFilter'
+
+// Fork: the paper map's nodes are papers and its edges citations or coupling,
+// not entities and relations, so they are not edited. The graph on screen says
+// whether it is a map (marked when it was loaded), not the query label.
+const usePaperMapShown = (): boolean => useGraphStore.use.rawGraph()?.isPaperMap === true
 
 /**
  * Component that view properties of elements in graph.
@@ -203,6 +209,8 @@ const PropertyRow = ({
     if (typeof value === 'string') {
       return value.replace(/<SEP>/g, ';\n')
     }
+    // a paper's attachment keys: one line
+    if (Array.isArray(value) && value.every((v) => typeof v === 'string')) return value.join(', ')
     return typeof value === 'string' ? value : JSON.stringify(value, null, 2)
   }
 
@@ -264,6 +272,7 @@ const PropertyRow = ({
 
 const NodePropertiesView = ({ node, pipelineBusy }: { node: NodeType; pipelineBusy: boolean }) => {
   const { t } = useTranslation()
+  const paperMap = usePaperMapShown()
 
   const handleExpandNode = () => {
     useGraphStore.getState().triggerNodeExpand(node.id)
@@ -297,7 +306,11 @@ const NodePropertiesView = ({ node, pipelineBusy }: { node: NodeType; pipelineBu
             variant="ghost"
             className="h-7 w-7 border border-gray-400 hover:bg-gray-200 dark:border-gray-600 dark:hover:bg-gray-700"
             onClick={handleExpandNode}
-            tooltip={t('graphPanel.propertiesView.node.expandNode')}
+            tooltip={t(
+              paperMap
+                ? 'graphPanel.paperFilter.mapAddPaperTooltip'
+                : 'graphPanel.propertiesView.node.expandNode'
+            )}
           >
             <GitBranchPlus className="h-4 w-4 text-gray-700 dark:text-gray-300" />
           </Button>
@@ -337,7 +350,10 @@ const NodePropertiesView = ({ node, pipelineBusy }: { node: NodeType; pipelineBu
                 nodeId={String(node.id)}
                 entityId={node.properties['entity_id']}
                 entityType="node"
-                isEditable={name === 'description' || name === 'entity_id' || name === 'entity_type'}
+                isEditable={
+                  !paperMap &&
+                  (name === 'description' || name === 'entity_id' || name === 'entity_type')
+                }
                 truncate={node.properties['truncate']}
                 pipelineBusy={pipelineBusy}
               />
@@ -369,8 +385,42 @@ const NodePropertiesView = ({ node, pipelineBusy }: { node: NodeType; pipelineBu
   )
 }
 
+// What a paper-map link means, in words: its kind, the direction of a citation, and how many
+// references two papers share. The server sends the edge from the citing paper.
+const MapLinkRows = ({ edge }: { edge: EdgeType }) => {
+  const { t } = useTranslation()
+  const k = (key: string) => `graphPanel.paperFilter.${key}`
+  const link = mapLinkKind(edge.properties)
+  const names = {
+    source: edge.sourceNode ? edge.sourceNode.labels.join(', ') : edge.source,
+    target: edge.targetNode ? edge.targetNode.labels.join(', ') : edge.target
+  }
+  const kind = [
+    link.cites === 'one' ? t(k('linkCitation')) : link.cites === 'both' ? t(k('linkCitationBoth')) : '',
+    link.coupled ? t(k('linkCoupling')) : ''
+  ]
+    .filter(Boolean)
+    .join(' · ')
+  const direction =
+    link.cites === 'one'
+      ? t(k('linkDirectionCites'), names)
+      : link.cites === 'both'
+        ? t(k('linkDirectionMutual'), names)
+        : t(k('linkDirectionNone'))
+  return (
+    <>
+      <PropertyRow name={t(k('linkKind'))} value={kind} />
+      <PropertyRow name={t(k('linkDirection'))} value={direction} />
+      {link.sharedRefs !== null && (
+        <PropertyRow name={t(k('linkSharedRefs'))} value={link.sharedRefs} />
+      )}
+    </>
+  )
+}
+
 const EdgePropertiesView = ({ edge, pipelineBusy }: { edge: EdgeType; pipelineBusy: boolean }) => {
   const { t } = useTranslation()
+  const paperMap = usePaperMapShown()
   return (
     <div className="flex flex-col gap-2">
       <div className="flex justify-between items-center">
@@ -407,6 +457,7 @@ const EdgePropertiesView = ({ edge, pipelineBusy }: { edge: EdgeType; pipelineBu
             useGraphStore.getState().setSelectedNode(edge.target, true)
           }}
         />
+        {paperMap && <MapLinkRows edge={edge} />}
       </div>
       <h3 className="text-md pl-1 font-bold tracking-wide text-amber-700">{t('graphPanel.propertiesView.edge.properties')}</h3>
       <div className="bg-primary/5 max-h-96 overflow-auto rounded p-1">
@@ -424,7 +475,7 @@ const EdgePropertiesView = ({ edge, pipelineBusy }: { edge: EdgeType; pipelineBu
                 entityType="edge"
                 sourceId={edge.sourceNode?.properties['entity_id'] || edge.source}
                 targetId={edge.targetNode?.properties['entity_id'] || edge.target}
-                isEditable={name === 'description' || name === 'keywords'}
+                isEditable={!paperMap && (name === 'description' || name === 'keywords')}
                 truncate={edge.properties['truncate']}
                 pipelineBusy={pipelineBusy}
               />

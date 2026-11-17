@@ -420,6 +420,38 @@
       "refreshCurrentLabelTooltip": "現在のページのグラフデータを更新",
       "refreshingTooltip": "データを更新中..."
     },
+    "paperFilter": {
+      "modeSharedMapTooltip": "選択した論文が引用先と共有するものだけを表示中。クリックで論文マップ（引用と書誌結合でつながる周辺の論文）を表示",
+      "modeCommonMapTooltip": "選択した論文のうち2本以上が寄与したものを表示中。クリックで論文マップ（引用と書誌結合でつながる周辺の論文）を表示",
+      "modeMapTooltip": "論文マップ：選択した論文の周辺を引用と書誌結合でたどり、分野ごとに色分け。クリックで論文が寄与したすべてを表示",
+      "mapOneHopTooltip": "1ステップ先の論文を表示中。クリックで2ステップまで表示（強いつながり順、最大{{limit}}本）",
+      "mapTwoHopsTooltip": "2ステップ先までの論文を表示中（強いつながり順、最大{{limit}}本）。クリックで1ステップのみ表示",
+      "mapSummary": "論文マップ：{{nodes}} 本を検出し全て表示（1ステップ {{hop1}} 本、2ステップ {{hop2}} 本）",
+      "mapSummaryLimited": "論文マップ：{{found}} 本を検出、{{nodes}} 本を表示（上限 {{limit}}、1ステップ {{hop1}} 本、2ステップ {{hop2}} 本）",
+      "mapShowMore": "論文をさらに表示（{{found}} 本中 {{shown}} 本、次の上限 {{limit}}）",
+      "mapMoreSuffix": "。「論文をさらに表示」で上限を引き上げられます。",
+      "someNotInStructure": "選択した論文のうち {{count}} 本は引用構造にありません",
+      "mapLinksThinned": "{{found}} 本のリンクのうち {{shown}} 本を表示：各論文の強いリンク",
+      "mapUnavailable": "このサーバーには論文マップがありません（論文構造がオフか未設定です）。代わりに論文自体のグラフを表示します",
+      "mapAlreadyChosen": "この論文はすでにマップの論文です",
+      "mapAddPaperTooltip": "この論文をマップの論文に追加",
+      "legendCitation": "引用（引用元から引用先への矢印、矢印なし：相互に引用）",
+      "legendCoupling": "共通の参考文献（矢印なし）",
+      "linkKind": "リンク",
+      "linkCitation": "引用",
+      "linkCitationBoth": "相互引用",
+      "linkCoupling": "共通の参考文献",
+      "linkDirection": "方向",
+      "linkDirectionCites": "{{source}} が {{target}} を引用",
+      "linkDirectionMutual": "{{source}} と {{target}} は互いに引用",
+      "linkDirectionNone": "なし：2本の論文が同じ参考文献の一部を引用",
+      "linkSharedRefs": "共通の参考文献数",
+      "reason": {
+        "not_in_structure": "この論文は引用構造にありません",
+        "not_in_structure_many": "選択した論文はどれも引用構造にありません",
+        "no_links": "引用・書誌結合のつながりがありません：選択した論文のみ表示しています"
+      }
+    },
     "emptyGraph": "空（再読み込みをお試しください）"
   },
   "retrievePanel": {

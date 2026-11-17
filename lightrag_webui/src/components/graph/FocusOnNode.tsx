@@ -26,7 +26,11 @@ const FocusOnNode = ({ node, move }: { node: string | null; move?: boolean }) =>
       } else {
         // If no node is selected but move is true, reset to default view
         sigma.setCustomBBox(null);
-        sigma.getCamera().animate({ x: 0.5, y: 0.5, ratio: 1 }, { duration: 0 });
+        // Set the state, do not animate with duration 0: sigma divides the elapsed time by the
+        // duration, so within one millisecond the camera becomes NaN until the next frame. The
+        // container copies a camera's state into the instance it rebuilds (a paper map turns
+        // edge events on for itself once its graph is loaded), and would keep the NaN.
+        sigma.getCamera().setState({ x: 0.5, y: 0.5, ratio: 1 });
       }
       useGraphStore.getState().setMoveToSelectedNode(false);
     } else if (node && graph.hasNode(node)) {

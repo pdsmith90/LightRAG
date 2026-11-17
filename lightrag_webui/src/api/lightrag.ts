@@ -105,6 +105,8 @@ export type LightragStatus = {
     related_chunk_number: number
     /** True when uploads are added to the Zotero library instead of indexed. */
     zotero_upload?: boolean
+    /** Fork: present while ZOTERO_STRUCT_SCHEMA is set; true when the paper structure can be read (the paper map). */
+    zotero_struct?: boolean
     role_llm_config?: Record<string, LightragRoleLLMConfig>
     vlm_process_enable?: boolean
     parser_routing?: string
@@ -633,8 +635,23 @@ export type PaperSummary = {
   n_refs: number | null
   n_cited: number | null
   n_cited_in_kb: number | null
-  mode?: 'paper' | 'shared' | 'common'
+  mode?: 'paper' | 'shared' | 'common' | 'map'
   context?: 'own' | 'kb' | 'linked'
+  // The paper map: its reach and how many papers it found and shows at one and two hops.
+  hops?: number
+  n_hop1?: number
+  n_hop2?: number
+  shown_hop1?: number
+  shown_hop2?: number
+  // Papers found, papers shown, the limit applied and the server's ceiling for it.
+  n_papers?: number
+  shown_papers?: number
+  max_nodes?: number
+  max_nodes_cap?: number
+  // Links among the papers shown: found, and drawn after the server thinned them.
+  n_links?: number
+  shown_links?: number
+  links_thinned?: boolean
   references_available?: boolean
   cited_sharing?: number
   n_linking?: number
@@ -659,6 +676,17 @@ export const queryPaperGraph = async (
   const response = await axiosInstance.get(
     `/graphs/paper?${ids}&mode=${mode}&context=${context}&max_nodes=${maxNodes}`
   )
+  return response.data
+}
+
+// The papers around a few papers over citations and coupling (fork; the paper map).
+export const queryPaperMap = async (
+  papers: string[],
+  hops: 1 | 2,
+  maxNodes: number
+): Promise<LightragGraphType & { is_truncated?: boolean; paper: PaperSummary }> => {
+  const ids = papers.map((paper) => `paper=${encodeURIComponent(paper)}`).join('&')
+  const response = await axiosInstance.get(`/graphs/paper/map?${ids}&hops=${hops}&max_nodes=${maxNodes}`)
   return response.data
 }
 

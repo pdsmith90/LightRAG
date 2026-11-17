@@ -126,6 +126,9 @@ cd zotero-toolkit
    `/graph/papers/passages` routes; against a stock LightRAG Server they fall back to
    `zotero_metadata.json` and a plain query (see
    [mcp/README.md](mcp/README.md#one-papers-passages-and-the-paper-lookup)).
+   `related_papers`, `papers_by_topic` and `connect_papers` answer only from a fork server
+   with its paper structure loaded (`ZOTERO_STRUCT_SCHEMA`; see
+   [mcp/README.md](mcp/README.md#paper-structure)).
 
 4. **Optional.** Put [`fronts/`](fronts/README.md) between LightRAG and its model servers
    if you have a second place to run a model. Run
@@ -152,7 +155,7 @@ Every component is configured with command-line flags or environment variables.
 | Component | Configured by | Main settings | Reference |
 | --- | --- | --- | --- |
 | corpus | command-line flags | `--zotero`, `--out`, `--meta`, `--jobs`, `--ocr`, `--denylist` | [corpus/README.md](corpus/README.md#settings) |
-| mcp | environment variables in the MCP client's server entry | `LIGHTRAG_BASE_URL`, `LIGHTRAG_API_KEY`, `ZOTERO_METADATA`, `ZOTERO_STORAGE`, `LIGHTRAG_MCP_MAX_TOP_K`, timeouts | [mcp/README.md](mcp/README.md#configuration) |
+| mcp | environment variables in the MCP client's server entry | `LIGHTRAG_BASE_URL`, `LIGHTRAG_API_KEY`, `LIGHTRAG_MCP_ENV_FILE`, `ZOTERO_METADATA`, `ZOTERO_STORAGE`, `LIGHTRAG_MCP_MAX_TOP_K`, timeouts | [mcp/README.md](mcp/README.md#configuration) |
 | maintenance | flags, then the environment, then `--env-file` (LightRAG's own `.env` works unchanged) | `POSTGRES_*`, `POSTGRES_WORKSPACE`/`WORKSPACE`, `EMBEDDING_MODEL` + `EMBEDDING_DIM`, `LIGHTRAG_BASE_URL`, `LIGHTRAG_API_KEY` | [maintenance/README.md](maintenance/README.md#configuration) |
 | fronts | environment variables, optionally from an env file the launcher sources | `LLM_FO_PRIMARY`, `LLM_FO_FALLBACK`, `LLM_FO_FALLBACK_API`, `RERANK_FO_PRIMARY`, `RERANK_FO_FALLBACK`, timeouts, breaker | [fronts/README.md](fronts/README.md#settings-llm_failoverpy) |
 
@@ -163,7 +166,10 @@ Two settings are shared:
   uses `~/Zotero/zotero_metadata.json`, which agree for the default `--zotero ~/Zotero`.
   If your data directory is elsewhere, set it to one absolute path so all three agree.
 - **`LIGHTRAG_API_KEY`** is the value from the LightRAG server's `.env`. The MCP server and
-  the maintenance idle check send it only as the `X-API-Key` header, never in a URL.
+  the maintenance idle check send it only as the `X-API-Key` header, never in a URL. With
+  `LIGHTRAG_MCP_ENV_FILE` naming an env file that holds a `LIGHTRAG_API_KEY=` line, the MCP
+  server re-reads the key from it after a 401 or 403 and retries once, so a rotated key needs
+  no client restart (see [mcp/README.md](mcp/README.md#key-rotation)).
 
 ## Requirements
 

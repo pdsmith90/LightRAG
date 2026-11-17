@@ -10,19 +10,28 @@ into real bibliographic citations using Zotero metadata. The LLM never writes th
 
 | Tool | What it returns |
 |---|---|
-| `search_library(query, mode="mix", top_k=10, answer=False, include_graph=False, passages=8)` | Compiled citations **first**, then the retrieved passages as plain text, each headed `[n] Family Year · section` (see [Retrieved passages](#retrieved-passages)). No answer is generated, so it is faster. `passages` sets how many are retrieved. `include_graph=True` appends the knowledge-graph entities and relations. |
+| `search_library(query, mode="naive", top_k=10, answer=False, include_graph=False, passages=10)` | Compiled citations **first**, then the retrieved passages as plain text, each headed `[n] Family Year · section` (see [Retrieved passages](#retrieved-passages)). No answer is generated, so it is faster. `passages` sets how many are retrieved. `include_graph=True` appends the knowledge-graph entities and relations. |
 | `search_library(..., answer=True)` | The server's synthesized answer. Any reference section the model wrote is stripped, and a `### Sources (compiled from retrieval)` list is appended. |
 | `paper_passages(paper, question)` | Up to 3 passages of **one** paper ranked against `question`, under that paper's citation and, when this host has it, the path of the paper's file in Zotero's storage folder. `paper` is a Zotero key, a DOI, or words that must all occur in the title, authors or year. If no indexed paper, several, or only near matches fit, it lists them instead of querying. |
 | `paper_equation(paper, number, page=0)` | One numbered display equation of **one** paper as `$…$` LaTeX with its printed number as `\tag{N}`, read from the paper's own PDF (see [Equations and tables from the PDF](#equations-and-tables-from-the-pdf)), with the PDF's text layer for the same box, the page and the sentence that cites it. Without an OCR model the answer is the text layer, labelled as such. |
 | `paper_table(paper, number)` | One numbered table of **one** paper as a Markdown table with its caption and page, read from the PDF's text layer by the layout converter. No OCR model. |
 | `find_paper(paper)` | A lookup with the same `paper` forms: the matching papers that are indexed, then the Zotero items that match but are not, then near matches when nothing has every word. A lookup that finds nothing also says how old the Zotero item list is. With one lookup per line (up to 40) it answers one line per lookup instead: its first match and the counts (see [One paper's passages and the paper lookup](#one-papers-passages-and-the-paper-lookup)). No retrieval and no LLM. |
+| `related_papers(paper, relations="all", limit=15)` | The library papers linked to **one** paper by its citation structure: those it cites, those citing it, its bibliographic-coupling partners (shared references and a score) and papers sharing an author, ranked, each with why and whether it is indexed (`indexed as KEY`, for `paper_passages`). Needs the server's paper structure (see [Paper structure](#paper-structure)). |
+| `papers_by_topic(topic, limit=15, primary_only=False, topics_only=False)` | The library papers under an OpenAlex topic at any level (domain, field, subfield, topic), named by whole words of its name (a word of four letters or more may be the start of one) or by id, ranked; `topics_only=True` lists the matching topics with paper counts instead. |
+| `connect_papers(a, b, paths=3)` | What connects two papers: the direct links (citation, coupling, shared authors, same topic, papers citing both), then up to `paths` routes over citations and coupling, cheapest first, hub papers costing more, each step labelled. |
 | `add_note(text, description="")` | Inserts a text note into the knowledge base (`POST /documents/text`) under a unique document name (see below). |
-| `health(verbose=False)` | A few lines from the server's `/health` report: status, versions, pipeline state, the queues (queued/running) and the models, or `unreachable at <url>: <error>`. A status other than 200, or a body that is not a JSON object, is shown as it came (the first 300 characters). `verbose=True` returns the whole report as `<status code>: <body>`. |
+| `health(verbose=False)` | A few lines from the server's `/health` report: status, an `API key:` line (whether the key is accepted), versions, pipeline state, the queues (queued/running) and the models, or `unreachable at <url>: <error>`. A status other than 200, or a body that is not a JSON object, is shown as it came (the first 300 characters). `verbose=True` returns the whole report as `<status code>: <body>`. |
 
-`mode` is one of `mix` (default: knowledge graph + vectors), `hybrid`, `local`, `global` or
-`naive`. Any other value, including LightRAG's `bypass`, falls back to `mix`. `top_k` is
+`mode` is one of `naive` (default: vector search only, the fastest; best for checking a claim
+against the papers), `mix` (knowledge graph + vectors; about twice as slow, and finds a few
+more), `hybrid`, `local` or `global`. Any other value, including LightRAG's `bypass`, falls
+back to `naive`. In every mode
+but `naive` the request carries no entity or relation token budget, so the server uses its own
+(`MAX_ENTITY_TOKENS`, `MAX_RELATION_TOKENS`) and retrieves the passages that come through the
+graph; the result still holds the passages only unless `include_graph=True`. A `naive`
+search sends 1-token budgets (1000 with `include_graph`), since it takes no graph passages. `top_k` is
 clamped to `1..LIGHTRAG_MCP_MAX_TOP_K` (see below). It sizes the knowledge-graph legs of
-retrieval, not the result: `passages` (default 8, clamped to `1..12`) is sent as the
+retrieval, not the result: `passages` (default 10, clamped to `1..14`) is sent as the
 request's `chunk_top_k` and decides how many passages come back, at about 4 KB each.
 `answer=True` does not send it.
 
@@ -239,6 +248,38 @@ here; it is sent as the `X-API-Key` header, never in a URL. A server protected o
 account login (`AUTH_ACCOUNTS` without `LIGHTRAG_API_KEY`) needs a session token, which
 this proxy does not obtain.
 
+### Key rotation
+
+The key is read once, when the client launches the proxy, so after the server's key is
+rotated a running proxy keeps sending the old one and every keyed call gets 403 while the
+client still shows the server as connected. The reload is off unless `LIGHTRAG_MCP_ENV_FILE`
+is set: without it the proxy never reads the key again, and the client has to relaunch it
+after a rotation. With `LIGHTRAG_MCP_ENV_FILE` set, a 401 or 403
+makes the proxy read the file's last `LIGHTRAG_API_KEY=` line again (quotes stripped) and,
+when that key differs from the one this request used, send the request once more; every
+request the tools send, the three paper-structure tools included, goes through it. The
+retry is safe because the server refuses a bad key before it does any work, and parallel
+calls all recover with one reload. One line on stderr says the key was reloaded, never the
+value. A file that holds the same key, or no file, leaves the 403 as the answer. `health()`
+adds a line after the status, from one keyed call to `GET /documents/pipeline_status`
+(the server's `/health` answers with any key): `API key: accepted`, `accepted (reloaded from
+LIGHTRAG_MCP_ENV_FILE ...)`, `REJECTED (HTTP 403: ...)` or `not checked (...)`.
+
+### Paper structure
+
+`related_papers`, `papers_by_topic` and `connect_papers` call the zlightrag fork's
+`GET /graph/papers/related`, `/graph/papers/topics`, `/graph/papers/by_topic` and
+`/graph/papers/connect`. The server answers them only with `ZOTERO_STRUCT_SCHEMA` set
+to a loaded structure schema (see the fork's `ZLIGHTRAG.md`); otherwise it answers 501,
+and a stock or older server 404, and the tools say so in a sentence instead of failing.
+The proxy never reads the structure itself. `paper` takes a Zotero key, a DOI, a
+structure id (`doi:…`, `zot:…`) as they are; words are looked up as for
+`paper_passages`, and exactly one paper must fit. `limit` is clamped to 1..50 and
+`paths` to 1..5 (a value below 1 counts as 1). `connect_papers` searches up to 6
+steps and says, when it finds no route, that none of at most that many steps over
+citations (either direction) and coupling exists; its step labels are told apart within
+one answer ("Okafor 2010a" and "Okafor 2010b").
+
 ## Install
 
 Python 3.10 or newer. From the `zotero-toolkit/` directory:
@@ -260,6 +301,7 @@ Every setting is an environment variable, set in the MCP client's server entry.
 |---|---|---|
 | `LIGHTRAG_BASE_URL` | `http://localhost:9621` | LightRAG Server base URL. A trailing `/` is ignored. |
 | `LIGHTRAG_API_KEY` | *(empty: no header sent)* | Must equal `LIGHTRAG_API_KEY` in the server's `.env`. Sent as `X-API-Key`. |
+| `LIGHTRAG_MCP_ENV_FILE` | *(unset: no reload)* | An env file with a `LIGHTRAG_API_KEY=` line. After a 401 or 403 the proxy reads the key from it again and, when it differs from the one in use, sends the request once more (see [Key rotation](#key-rotation)). `~` is expanded. |
 | `ZOTERO_METADATA` | `~/Zotero/zotero_metadata.json` | Path to the metadata file. Unset or empty means the corpus builder's default output. A relative path resolves against the **working directory the client launches the server in**, which you usually do not control, so use an absolute path. `~` is expanded. |
 | `ZOTERO_STORAGE` | `~/Zotero/storage` | Zotero's attachment folders (`storage/<key>/`). `paper_passages` names a paper's file there (the metadata's `filename`) when it exists; nothing is read from it. `~` is expanded. |
 | `LIGHTRAG_MCP_TIMEOUT` | `300` | Seconds allowed for `/query` and `/documents/text` requests. |
@@ -354,10 +396,11 @@ of error`), mode validation, the `top_k` clamp and `passages`, the `X-API-Key` h
 unique note names for `add_note` (the fake refuses a repeated name with 409, as LightRAG
 does), folding and the paper lookup (key confirmation, cache, ranking, cut lists, near
 matches), the batch lookup (statuses, order, the 40-line limit, a failing or stalled lookup,
-the age note, the locks around the shared metadata), the short `health` answer, both
+the age note, the locks around the shared metadata), the short `health` answer, the key
+reload (`test_mcp_key_reload.py`: every request path, parallel calls, `health`), both
 `paper_passages` paths and their local file line, the header strip
 (checked against `corpus/build_corpus.py` when it imports), the section-heading cleanup,
-duplicate passages, and the stdio tool listing
+duplicate passages, the paper-structure tools (requests, wording, 501 and 404), and the stdio tool listing
 with text-only results. `test_mcp_paper_tools.py` covers `paper_equation` and `paper_table`
 (which paper and file, the helper's failures, the wording of every answer, stdio) against a
 stand-in helper; `test_mcp_pdf_tools.py` covers the helper (numbers, LaTeX pairing, citing

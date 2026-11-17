@@ -420,6 +420,38 @@
       "refreshCurrentLabelTooltip": "현재 페이지 그래프 데이터 새로고침",
       "refreshingTooltip": "데이터 새로고침 중..."
     },
+    "paperFilter": {
+      "modeSharedMapTooltip": "선택한 논문이 인용한 논문과 공유하는 것만 표시 중. 클릭하면 논문 지도(인용과 서지 결합으로 연결된 주변 논문)를 표시",
+      "modeCommonMapTooltip": "선택한 논문 중 두 편 이상이 기여한 것을 표시 중. 클릭하면 논문 지도(인용과 서지 결합으로 연결된 주변 논문)를 표시",
+      "modeMapTooltip": "논문 지도: 선택한 논문 주변을 인용과 서지 결합으로 연결하고 분야별로 색칠. 클릭하면 논문이 기여한 모든 것을 표시",
+      "mapOneHopTooltip": "한 단계 떨어진 논문 표시 중. 클릭하면 두 단계까지 표시(강한 연결 우선, 최대 {{limit}}편)",
+      "mapTwoHopsTooltip": "두 단계까지 떨어진 논문 표시 중(강한 연결 우선, 최대 {{limit}}편). 클릭하면 한 단계만 표시",
+      "mapSummary": "논문 지도: 논문 {{nodes}}편을 찾아 모두 표시 (한 단계 {{hop1}}편, 두 단계 {{hop2}}편)",
+      "mapSummaryLimited": "논문 지도: 논문 {{found}}편을 찾음, {{nodes}}편 표시 (한도 {{limit}}편, 한 단계 {{hop1}}편, 두 단계 {{hop2}}편)",
+      "mapShowMore": "논문 더 보기 ({{found}}편 중 {{shown}}편 표시, 다음 한도 {{limit}}편)",
+      "mapMoreSuffix": ". '논문 더 보기'를 누르면 한도가 올라갑니다.",
+      "someNotInStructure": "선택한 논문 중 {{count}}편은 인용 구조에 없습니다",
+      "mapLinksThinned": "링크 {{found}}개 중 {{shown}}개 표시: 논문별로 가장 강한 링크",
+      "mapUnavailable": "이 서버에는 논문 지도가 없습니다(논문 구조가 꺼져 있거나 없습니다). 대신 논문 자체의 그래프를 표시합니다",
+      "mapAlreadyChosen": "이 논문은 이미 지도의 논문입니다",
+      "mapAddPaperTooltip": "이 논문을 지도의 논문에 추가",
+      "legendCitation": "인용(인용한 논문에서 인용된 논문으로 향하는 화살표, 화살표 없음: 서로 인용)",
+      "legendCoupling": "공통 참고문헌(화살표 없음)",
+      "linkKind": "링크",
+      "linkCitation": "인용",
+      "linkCitationBoth": "상호 인용",
+      "linkCoupling": "공통 참고문헌",
+      "linkDirection": "방향",
+      "linkDirectionCites": "{{source}}이(가) {{target}}을(를) 인용",
+      "linkDirectionMutual": "{{source}}와(과) {{target}}은(는) 서로 인용",
+      "linkDirectionNone": "없음: 두 논문이 같은 참고문헌 일부를 인용",
+      "linkSharedRefs": "공통 참고문헌 수",
+      "reason": {
+        "not_in_structure": "이 논문은 인용 구조에 없습니다",
+        "not_in_structure_many": "선택한 논문 중 인용 구조에 있는 논문이 없습니다",
+        "no_links": "인용이나 서지 결합 연결이 없습니다: 선택한 논문만 표시합니다"
+      }
+    },
     "emptyGraph": "데이터 없음(새로고침을 시도해보세요)"
   },
   "retrievePanel": {
