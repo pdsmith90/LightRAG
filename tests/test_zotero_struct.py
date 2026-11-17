@@ -7,9 +7,12 @@ of another workspace and unprocessed documents that must not count. Fixtures
 are invented.
 """
 
+import asyncio
 import importlib
 import json
 import sys
+import threading
+import zlib
 from types import SimpleNamespace
 
 import pytest
@@ -171,6 +174,11 @@ META = {
 }
 
 
+def _owner(row):
+    """The paper a row of a chunked table belongs to."""
+    return row.get("paper_id") or row.get("citing_paper_id") or row["paper_a"]
+
+
 class _DB:
     """The PostgreSQL pool as zotero_struct sees it."""
 
@@ -179,6 +187,8 @@ class _DB:
         self.schema = schema
         self.calls: list[tuple[str, list | None]] = []
         self.filenode = 1
+        # table name -> the errors its next reads raise, one per read
+        self.fail: dict[str, list[Exception]] = {}
 
     async def query(self, sql, params=None, multirows=False):
         tag = sql.split("\n", 1)[0]
@@ -200,7 +210,13 @@ class _DB:
                 if w == workspace and s == status
             ]
         assert f'"{self.schema}".' in sql
-        return [dict(r) for r in self.tables[name]]
+        if self.fail.get(name):
+            raise self.fail[name].pop(0)
+        rows = self.tables[name]
+        if name in zs._CHUNKED:  # one slice of rows, papers kept together
+            chunks, k = params
+            rows = [r for r in rows if zlib.crc32(_owner(r).encode()) % chunks == k]
+        return [dict(r) for r in rows]
 
     def names(self):
         return [n for n, _ in self.calls]
@@ -230,6 +246,26 @@ def structure(tmp_path, monkeypatch):
 
 def _by_id(items, key="paper_id"):
     return {item[key]: item for item in items}
+
+
+def _graph_tables(papers, cites=(), coupled=(), year=2010):
+    """Tables of just these papers (DOI ``10.1/<name>``) and links."""
+    tables = {name: [] for name in TABLES}
+    tables["papers"] = [_paper(f"doi:10.1/{n}", n, year) for n in papers]
+    tables["cites"] = [
+        {"citing_paper_id": f"doi:10.1/{a}", "cited_paper_id": f"doi:10.1/{b}"}
+        for a, b in cites
+    ]
+    tables["coupled"] = [
+        {
+            "paper_a": f"doi:10.1/{a}",
+            "paper_b": f"doi:10.1/{b}",
+            "shared_refs": 3,
+            "score": score,
+        }
+        for a, b, score in coupled
+    ]
+    return tables
 
 
 # --- availability -----------------------------------------------------------
@@ -280,6 +316,43 @@ async def test_available_checks_the_tables_only():
     assert db.names() == ["fingerprint"]
 
 
+async def test_available_asks_the_catalog_once_per_interval(monkeypatch):
+    db = _DB()
+    rag = _rag(db)
+    for _ in range(3):
+        assert await zs.available(rag)
+    assert db.names() == ["fingerprint"]
+    # a load counts as a check too
+    await zs.related_papers(rag, "10.1/a")
+    assert await zs.available(rag)
+    assert db.names().count("fingerprint") == 2
+    monkeypatch.setattr(zs, "_CHECK_INTERVAL", 0.0)
+    assert await zs.available(rag)
+    assert db.names().count("fingerprint") == 3
+
+
+async def test_a_failing_pool_answers_false_and_is_not_asked_every_poll():
+    class Down(_DB):
+        async def query(self, sql, params=None, multirows=False):
+            self.calls.append(("fingerprint", params))
+            raise ConnectionError("pool is down")
+
+    db = Down()
+    rag = _rag(db)
+    assert [await zs.available(rag) for _ in range(3)] == [False, False, False]
+    assert len(db.calls) == 1
+
+
+async def test_a_hanging_pool_cannot_hold_the_health_answer(monkeypatch):
+    monkeypatch.setattr(zs, "_AVAILABLE_TIMEOUT", 0.05)
+
+    class Hung(_DB):
+        async def query(self, sql, params=None, multirows=False):
+            await asyncio.sleep(30)
+
+    assert await asyncio.wait_for(zs.available(_rag(Hung())), 2) is False
+
+
 # --- loading and refresh ----------------------------------------------------
 
 
@@ -297,6 +370,71 @@ async def test_the_structure_is_read_once_and_again_after_a_rebuild(monkeypatch)
     db.filenode = 2  # dropped and loaded again
     await zs.related_papers(rag, "10.1/a")
     assert db.names().count("papers") == 2
+
+
+async def test_concurrent_first_calls_cause_one_load_and_convert_off_the_loop(
+    monkeypatch,
+):
+    db = _DB()
+    rag = _rag(db)
+    threads = []
+    real = zs._build
+
+    def spy(rows, fingerprint):
+        threads.append(threading.get_ident())
+        return real(rows, fingerprint)
+
+    monkeypatch.setattr(zs, "_build", spy)
+    await asyncio.gather(*(zs.related_papers(rag, "10.1/a") for _ in range(5)))
+    assert db.names().count("papers") == 1
+    assert threads and threading.get_ident() not in threads
+    # the big tables come in slices that cover every row once
+    assert db.names().count("cites") == zs._CHUNKS
+    st = await zs._structure(rag)
+    assert sum(len(c) for c in st.cites_out) == len(TABLES["cites"])
+
+
+async def test_a_table_that_vanishes_during_the_load_is_unavailable(monkeypatch):
+    db = _DB()
+    rag = _rag(db)
+    db.fail["cites"] = [RuntimeError("relation does not exist")] * 2
+    with pytest.raises(zs.Unavailable) as e:
+        await zs.related_papers(rag, "10.1/a")
+    assert e.value.reason == "no_schema"
+    # one retry under a fresh fingerprint, and nothing half-loaded is kept
+    assert db.names().count("fingerprint") == 2
+    assert zs._state["struct"] is None
+    assert not await zs.available(rag)
+    # the failure stands for the check interval, without reading again
+    calls = len(db.calls)
+    with pytest.raises(zs.Unavailable):
+        await zs.paper_map(rag, ["10.1/a"])
+    assert len(db.calls) == calls
+    # and the structure comes back with the tables
+    monkeypatch.setattr(zs, "_CHECK_INTERVAL", 0.0)
+    assert (await zs.related_papers(rag, "10.1/a"))["paper"]["paper_id"] == "doi:10.1/a"
+
+
+async def test_one_failed_read_is_retried():
+    db = _DB()
+    db.fail["coupled"] = [RuntimeError("connection reset")]
+    result = await zs.related_papers(_rag(db), "10.1/a")
+    assert result["totals"]["coupled"] == 2
+    assert db.names().count("fingerprint") == 2
+
+
+async def test_a_schema_dropped_during_the_load_is_unavailable():
+    class Dropped(_DB):
+        async def query(self, sql, params=None, multirows=False):
+            if "zotero_struct:cites" in sql:
+                self.schema = "gone"  # the fingerprint now finds no tables
+                raise RuntimeError("relation does not exist")
+            return await super().query(sql, params, multirows)
+
+    with pytest.raises(zs.Unavailable) as e:
+        await zs.related_papers(_rag(Dropped()), "10.1/a")
+    assert e.value.reason == "no_schema"
+    assert zs._state["struct"] is None
 
 
 async def test_only_processed_documents_of_the_servers_workspace_count():
@@ -479,6 +617,64 @@ async def test_unconnected_unknown_and_identical_papers_say_so():
 async def test_max_hops_bounds_the_search():
     result = await zs.connect_papers(_rag(), "10.1/b", "10.1/e", max_hops=1)
     assert result["reason"] == "not_connected"
+    assert result["max_hops"] == 1
+    assert "at most 1 steps over citations (either direction)" in result["message"]
+    assert "bibliographic coupling" in result["message"]
+
+
+def _long_cheap_chain_tables():
+    """a to b in three steps through the hub q (costly: 255 links), or in four
+    through the two quiet papers p1 and p2. Both routes meet at v, which the
+    cheaper chain reaches in three steps and the hub in two."""
+    papers = ["a", "b", "q", "v", "p1", "p2"] + [f"fan{i}" for i in range(255)]
+    cites = [("a", "q"), ("q", "v"), ("v", "b"), ("a", "p1"), ("p1", "p2"), ("p2", "v")]
+    cites += [(f"fan{i}", "q") for i in range(255)]
+    return _graph_tables(papers, cites)
+
+
+async def test_a_hop_limit_does_not_hide_a_costlier_shorter_route():
+    # Settling each paper once by cost reached v by the cheap chain (three
+    # steps), could not go on to b within three, and never tried the hub route.
+    rag = _rag(_DB(_long_cheap_chain_tables()))
+    short = await zs.connect_papers(rag, "10.1/a", "10.1/b", max_paths=1, max_hops=3)
+    assert [p["hops"] for p in short["paths"]] == [3]
+    assert [p["paper_id"] for p in short["paths"][0]["papers"]] == [
+        "doi:10.1/q",
+        "doi:10.1/v",
+    ]
+    # with room for four steps the cheaper chain wins
+    long = await zs.connect_papers(rag, "10.1/a", "10.1/b", max_paths=1, max_hops=4)
+    assert [p["paper_id"] for p in long["paths"][0]["papers"]] == [
+        "doi:10.1/p1",
+        "doi:10.1/p2",
+        "doi:10.1/v",
+    ]
+    assert long["paths"][0]["cost"] < short["paths"][0]["cost"]
+    # alternatives are searched the same way: after the chain, the hub route
+    both = await zs.connect_papers(rag, "10.1/a", "10.1/b", max_paths=2, max_hops=4)
+    assert [p["hops"] for p in both["paths"]] == [4]  # both routes need v
+    two = await zs.connect_papers(rag, "10.1/a", "10.1/b", max_paths=2, max_hops=2)
+    assert two["reason"] == "not_connected"
+
+
+async def test_steps_of_equal_label_papers_are_told_apart():
+    tables = _graph_tables(
+        ["a", "x", "c", "e"],
+        cites=[("a", "c"), ("c", "e")],
+        coupled=[("a", "x", 0.2)],
+    )
+    tables["authors"] = [
+        {"paper_id": f"doi:10.1/{n}", "author_id": "oa:1", "display_name": "Ada Okafor"}
+        for n in ("a", "x")
+    ]
+    result = await zs.connect_papers(_rag(_DB(tables)), "10.1/x", "10.1/e", 1)
+    path = result["paths"][0]
+    labels = [path["steps"][0]["from"]] + [s["to"] for s in path["steps"]]
+    # x, a, c, e: the two Okafor 2010 papers differ, the others read as before
+    assert labels[:2] == ["Okafor 2010b", "Okafor 2010a"]
+    assert result["a"]["label"] == "Okafor 2010b"
+    assert [p["label"] for p in path["papers"]][0] == "Okafor 2010a"
+    assert len(set(labels)) == len(labels)
 
 
 # --- paper map --------------------------------------------------------------
@@ -593,6 +789,96 @@ async def test_equal_labels_are_told_apart(monkeypatch):
     assert _node(result, "10.1/x")["labels"] == ["Okafor 2010b"]
 
 
+# --- map links: thinned, and encoded off the loop -----------------------------
+
+N_AROUND = 20
+
+
+def _crowd_tables():
+    """Seed s cites twenty papers n00..n19, which are coupled in every pair
+    with a different score each (about 0.02 to 0.4, so below a citation)."""
+    names = [f"n{i:02d}" for i in range(N_AROUND)]
+    coupled = [
+        (names[i], names[j], (i * N_AROUND + j) / 1000)
+        for i in range(N_AROUND)
+        for j in range(i + 1, N_AROUND)
+    ]
+    return _graph_tables(["s"] + names, [("s", n) for n in names], coupled)
+
+
+def _pairs(result):
+    return {frozenset((e["source"], e["target"])) for e in result["edges"]}
+
+
+async def test_map_links_keep_every_seed_link_and_each_papers_strongest():
+    result = await zs.paper_map(_rag(_DB(_crowd_tables())), ["10.1/s"])
+    view = result["paper"]
+    total = N_AROUND + N_AROUND * (N_AROUND - 1) // 2
+    assert (view["n_links"], view["shown_links"]) == (total, len(result["edges"]))
+    assert view["shown_links"] < total and result["is_truncated"]
+    pairs = _pairs(result)
+    assert len(pairs) == len(result["edges"])  # an edge kept for both ends: once
+    assert all(
+        frozenset(("10.1/s", f"10.1/n{i:02d}")) in pairs for i in range(N_AROUND)
+    )
+    # each paper's five strongest links to the others (its sixth is the seed)
+    for i in range(N_AROUND):
+        score = lambda j: (min(i, j) * N_AROUND + max(i, j)) / 1000  # noqa: E731
+        best = sorted((j for j in range(N_AROUND) if j != i), key=score)[::-1][:5]
+        for j in best:
+            assert frozenset((f"10.1/n{i:02d}", f"10.1/n{j:02d}")) in pairs
+    # nothing in the result is random
+    again = await zs.paper_map(_rag(_DB(_crowd_tables())), ["10.1/s"])
+    assert [e["id"] for e in again["edges"]] == [e["id"] for e in result["edges"]]
+
+
+async def test_the_edge_total_is_capped_and_the_weakest_other_links_go_first(
+    monkeypatch,
+):
+    rag = _rag(_DB(_crowd_tables()))
+    full = await zs.paper_map(rag, ["10.1/s"], max_nodes=N_AROUND + 1)
+    monkeypatch.setattr(zs, "_EDGE_CAP_FACTOR", 1)  # 21 links for 21 papers
+    capped = await zs.paper_map(rag, ["10.1/s"], max_nodes=N_AROUND + 1)
+    assert len(capped["edges"]) == N_AROUND + 1
+    assert capped["paper"]["n_links"] == full["paper"]["n_links"]
+    assert capped["is_truncated"]
+    seed_links = {e["id"] for e in capped["edges"] if "10.1/s" in e["id"].split("-")}
+    assert len(seed_links) == N_AROUND  # the seed's links stay
+    dropped = [
+        e for e in full["edges"] if e["id"] not in {x["id"] for x in capped["edges"]}
+    ]
+    other = [e for e in capped["edges"] if e["id"] not in seed_links]
+    assert len(other) == 1
+    assert other[0]["properties"]["weight"] >= max(
+        e["properties"]["weight"] for e in dropped
+    )
+
+
+async def test_a_map_with_few_links_is_not_thinned():
+    result = await zs.paper_map(_rag(), ["10.1/a"])
+    assert result["paper"]["n_links"] == result["paper"]["shown_links"] == 5
+    assert not result["is_truncated"]
+
+
+async def test_the_map_is_encoded_in_the_worker_thread(monkeypatch):
+    threads = []
+    real = zs.json.dumps
+
+    def spy(*args, **kwargs):
+        threads.append(threading.get_ident())
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(zs, "json", SimpleNamespace(dumps=spy))
+    rag = _rag()
+    body = await zs.paper_map(rag, ["10.1/a"], encode=True)
+    assert isinstance(body, bytes) and threads
+    assert threading.get_ident() not in threads
+    assert json.loads(body) == await zs.paper_map(rag, ["10.1/a"])
+    # the too-many answer is encoded too
+    many = await zs.paper_map(rag, [f"10.1/fan{i}" for i in range(11)], encode=True)
+    assert json.loads(many)["paper"]["reason"] == "too_many_papers"
+
+
 # --- routes -----------------------------------------------------------------
 
 
@@ -602,19 +888,33 @@ def _client(rag):
     return TestClient(app), {"X-API-Key": "test-key"}
 
 
+ROUTES = (
+    "/graph/papers/related?paper=10.1/a",
+    "/graph/papers/topics?q=gravity",
+    "/graph/papers/by_topic?topic=gravity",
+    "/graph/papers/connect?a=10.1/a&b=10.1/b",
+    "/graphs/paper/map?paper=10.1/a",
+)
+# more papers than a map takes: the answer must not depend on the setting
+MANY_PAPERS = "/graphs/paper/map?" + "&".join(f"paper=10.1/p{i}" for i in range(11))
+
+
 def test_routes_answer_501_while_the_structure_is_off(monkeypatch):
     monkeypatch.delenv(zs.SCHEMA_ENV)
-    client, headers = _client(_rag())
-    for url in (
-        "/graph/papers/related?paper=10.1/a",
-        "/graph/papers/topics?q=gravity",
-        "/graph/papers/by_topic?topic=gravity",
-        "/graph/papers/connect?a=10.1/a&b=10.1/b",
-        "/graphs/paper/map?paper=10.1/a",
-    ):
+    db = _DB()
+    client, headers = _client(_rag(db))
+    for url in (*ROUTES, MANY_PAPERS):
         r = client.get(url, headers=headers)
         assert r.status_code == 501, url
         assert "ZOTERO_STRUCT_SCHEMA is not set" in r.json()["detail"]
+    assert db.calls == []
+
+
+def test_too_many_papers_is_an_answer_only_while_the_structure_is_on():
+    client, headers = _client(_rag())
+    r = client.get(MANY_PAPERS, headers=headers)
+    assert r.status_code == 200
+    assert r.json()["paper"]["reason"] == "too_many_papers"
 
 
 @pytest.mark.parametrize(
@@ -640,9 +940,23 @@ def test_routes_refuse_bad_input_before_reading(url):
     assert db.calls == []
 
 
-def test_routes_need_the_api_key():
-    client, _ = _client(_rag())
-    assert client.get("/graph/papers/related?paper=10.1/a").status_code in (401, 403)
+@pytest.mark.parametrize("url", ROUTES)
+def test_every_route_needs_the_api_key(url):
+    db = _DB()
+    client, _ = _client(_rag(db))
+    assert client.get(url).status_code in (401, 403)
+    assert client.get(url, headers={"X-API-Key": "wrong"}).status_code in (401, 403)
+    assert db.calls == []
+
+
+def test_the_map_answers_json_with_the_shape_of_the_function():
+    rag = _rag()
+    client, headers = _client(rag)
+    r = client.get("/graphs/paper/map?paper=10.1/a", headers=headers)
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "application/json"
+    expected = asyncio.run(zs.paper_map(rag, ["10.1/a"]))
+    assert r.json() == expected
 
 
 def test_routes_pass_their_options():

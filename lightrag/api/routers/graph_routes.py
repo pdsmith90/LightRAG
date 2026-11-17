@@ -589,7 +589,8 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
         Returns ``a``, ``b``, ``links`` (citation, coupling, shared authors,
         same topic / subfield / field, papers citing both, library papers
         both cite) and ``paths`` (cheapest first, hub papers penalised, each
-        step labelled with its relation). Shared entities are not part of
+        step labelled with its relation; at most ``max_hops`` steps, and
+        ``reason: not_connected`` says so when there is none). Shared entities are not part of
         it: ``/graphs/paper?mode=common`` shows them.
         """
         return await _struct_call(
@@ -611,16 +612,22 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
         Returns the ``/graphs`` structure (papers as nodes, ``entity_type``
         the field of their primary topic) plus ``paper``, the chosen papers'
         summaries and the view's counts; ``paper.reason`` says why a graph
-        is empty or has no edges.
+        is empty or has no edges. Links are thinned: all of a chosen paper's,
+        the strongest few of every other paper, at most 4 x the node limit in
+        all (``paper.n_links`` found, ``paper.shown_links`` drawn;
+        ``is_truncated`` when links or papers were dropped).
         """
         if any(len(p) > 300 for p in paper):
             raise HTTPException(status_code=422, detail="a paper id is too long")
-        return await _struct_call(
+        # The JSON is made in the worker thread that builds the map, so the
+        # event loop never serialises a large graph.
+        body = await _struct_call(
             f"getting the paper map for '{paper}'",
             zotero_struct.paper_map(
-                rag, paper, hops, min(max_nodes, rag.max_graph_nodes)
+                rag, paper, hops, min(max_nodes, rag.max_graph_nodes), encode=True
             ),
         )
+        return Response(content=body, media_type="application/json")
 
     @router.get("/graph/entity/exists", dependencies=[Depends(combined_auth)])
     async def check_entity_exists(

@@ -82,8 +82,9 @@ def init_shared_storage():
 async def rag(monkeypatch):
     from lightrag.kg.postgres_impl import PGDocStatusStorage
 
-    workspace = f"smoke_{uuid.uuid4().hex[:8]}"
-    schema = f"zs_smoke_{uuid.uuid4().hex[:8]}"
+    tag = uuid.uuid4().hex[:8]
+    workspace = f"smoke_{tag}"
+    schema = f"zs_smoke_{tag}"
     store = PGDocStatusStorage(
         namespace="doc_status",
         workspace=workspace,
@@ -92,31 +93,44 @@ async def rag(monkeypatch):
     )
     await store.initialize()
     db = store.db
-    for statement in DDL.format(s=schema).split(";"):
-        if statement.strip():
-            await db.execute(statement)
-    rows = [
-        (store.workspace, "doc-a", "AAAA0001__alpha.md", "processed"),
-        (store.workspace, "doc-c", "CCCC0001__charlie.md", "failed"),
-        (store.workspace + "_other", "doc-b", "BBBB0001__bravo.md", "processed"),
-    ]
-    for w, doc_id, path, status in rows:
-        await db.execute(
-            "INSERT INTO LIGHTRAG_DOC_STATUS (workspace, id, file_path, status) "
-            "VALUES ($1, $2, $3, $4)",
-            {"workspace": w, "id": doc_id, "file_path": path, "status": status},
+    if store.workspace != workspace:
+        # POSTGRES_WORKSPACE (environment, .env or config.ini) overrides the
+        # storage's workspace: the rows below would land in, and be deleted
+        # from, that workspace.
+        await store.finalize()
+        pytest.skip(
+            "POSTGRES_WORKSPACE is set, so the storage ignores this test's own "
+            "workspace; unset it to run the smoke test"
         )
+    # rows of two workspaces, with ids of this test's own
+    rows = [
+        (store.workspace, f"{tag}-doc-a", "AAAA0001__alpha.md", "processed"),
+        (store.workspace, f"{tag}-doc-c", "CCCC0001__charlie.md", "failed"),
+        (store.workspace + "_other", f"{tag}-doc-b", "BBBB0001__bravo.md", "processed"),
+    ]
+    inserted = []
     monkeypatch.setenv(zs.SCHEMA_ENV, schema)
     zs._reset_for_tests()
     try:
+        for statement in DDL.format(s=schema).split(";"):
+            if statement.strip():
+                await db.execute(statement)
+        for w, doc_id, path, status in rows:
+            await db.execute(
+                "INSERT INTO LIGHTRAG_DOC_STATUS (workspace, id, file_path, status) "
+                "VALUES ($1, $2, $3, $4)",
+                {"workspace": w, "id": doc_id, "file_path": path, "status": status},
+            )
+            inserted.append((w, doc_id))
         yield SimpleNamespace(doc_status=store, schema=schema, db=db)
     finally:
         zs._reset_for_tests()
-        await db.execute(f"DROP SCHEMA {schema} CASCADE")
-        await db.execute(
-            "DELETE FROM LIGHTRAG_DOC_STATUS WHERE workspace IN ($1, $2)",
-            {"a": store.workspace, "b": store.workspace + "_other"},
-        )
+        await db.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+        for w, doc_id in inserted:  # only the rows inserted above
+            await db.execute(
+                "DELETE FROM LIGHTRAG_DOC_STATUS WHERE workspace = $1 AND id = $2",
+                {"workspace": w, "id": doc_id},
+            )
         await store.finalize()
 
 

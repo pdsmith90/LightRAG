@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import heapq
+import json
 import math
 import os
 import re
@@ -60,6 +61,8 @@ _TABLES = (
 )
 _CHECK_INTERVAL = 60.0
 _DOCS_TTL = 300.0
+# how long /health waits for the catalog check before answering "not available"
+_AVAILABLE_TIMEOUT = 3.0
 
 RELATIONS = ("cites", "cited_by", "coupled", "coauthor")
 LEVELS = ("domain", "field", "subfield", "topic")
@@ -80,8 +83,12 @@ _AUTHOR_CAP = 4
 # links costs about as much as two more ordinary steps.
 _HUB_PENALTY = 0.5
 # paper_map: a two-hop paper reached through u gains strength(u) * w(u, v)
-# / log2(2 + links of u).
+# / log2(2 + links of u). Links shown: every link of a chosen paper, the
+# _EDGES_PER_PAPER strongest of every other shown paper, and at most
+# _EDGE_CAP_FACTOR x the node limit in all.
 _AUTHORS_SHOWN = 10
+_EDGES_PER_PAPER = 6
+_EDGE_CAP_FACTOR = 4
 
 
 class Unavailable(Exception):
@@ -107,15 +114,19 @@ SELECT attachment_key, paper_id FROM "{s}".paper_attachments WHERE paper_id IS N
     "authors": """-- zotero_struct:authors
 SELECT pa.paper_id, pa.author_id, a.display_name
 FROM "{s}".paper_authors pa LEFT JOIN "{s}".authors a ON a.author_id = pa.author_id
+WHERE mod(hashtext(pa.paper_id) & 2147483647, $1) = $2
 ORDER BY pa.paper_id, pa.position""",
     "topics": """-- zotero_struct:topics
 SELECT topic_id, display_name, level, parent_id FROM "{s}".topics""",
     "paper_topics": """-- zotero_struct:paper_topics
-SELECT paper_id, topic_id, is_primary FROM "{s}".paper_topics""",
+SELECT paper_id, topic_id, is_primary FROM "{s}".paper_topics
+WHERE mod(hashtext(paper_id) & 2147483647, $1) = $2""",
     "cites": """-- zotero_struct:cites
-SELECT citing_paper_id, cited_paper_id FROM "{s}".cites""",
+SELECT citing_paper_id, cited_paper_id FROM "{s}".cites
+WHERE mod(hashtext(citing_paper_id) & 2147483647, $1) = $2""",
     "coupled": """-- zotero_struct:coupled
-SELECT paper_a, paper_b, shared_refs, score FROM "{s}".coupled""",
+SELECT paper_a, paper_b, shared_refs, score FROM "{s}".coupled
+WHERE mod(hashtext(paper_a) & 2147483647, $1) = $2""",
     # The server's own workspace and processed documents only.
     "documents": """-- zotero_struct:documents
 SELECT file_path FROM LIGHTRAG_DOC_STATUS WHERE workspace = $1 AND status = $2""",
@@ -259,6 +270,8 @@ _state: dict = {
     "struct": None,
     "owner": None,  # (id(db), schema) the struct was read from
     "checked": 0.0,
+    "failure": None,  # (reason, message) of a failed read, kept until the next check
+    "avail_checked": 0.0,  # when available() last asked the catalog
     "lock": None,
     "loop": None,
     "docs": None,  # (owner, workspace, read at, keys)
@@ -311,40 +324,85 @@ async def _fingerprint(db, schema: str) -> tuple:
     return tuple(sorted((t, found[t]) for t in _TABLES))
 
 
+_LOADED = (
+    "papers",
+    "attachments",
+    "authors",
+    "topics",
+    "paper_topics",
+    "cites",
+    "coupled",
+)
+# The big tables are read in _CHUNKS slices (rows of one paper stay together),
+# so no single fetch holds the event loop for long while its rows are decoded;
+# the loop runs between slices and the conversion into the structure happens in
+# a worker thread.
+_CHUNKED = ("authors", "paper_topics", "cites", "coupled")
+_CHUNKS = 8
+
+
+async def _read_tables(db, schema: str, fp: tuple) -> tuple[tuple, dict]:
+    """The tables' rows, and the fingerprint they were read under. A table that
+    is gone or unreadable (dropped between the fingerprint and the read) is
+    tried once more under a fresh fingerprint, then reported as unavailable."""
+    for attempt in (1, 2):
+        try:
+            rows = {}
+            for name in _LOADED:
+                sql = _SQL[name].format(s=schema)
+                if name not in _CHUNKED:
+                    rows[name] = await db.query(sql, multirows=True) or []
+                    continue
+                rows[name] = []
+                for k in range(_CHUNKS):
+                    rows[name] += (
+                        await db.query(sql, [_CHUNKS, k], multirows=True) or []
+                    )
+                    await asyncio.sleep(0)
+            return fp, rows
+        except Exception as e:
+            logger.warning(
+                f"zotero_struct: reading '{schema}' failed ({attempt}/2): {e}"
+            )
+            if attempt == 2:
+                raise Unavailable(
+                    "no_schema",
+                    f"schema '{schema}' could not be read (a table changed or went "
+                    "missing while it was being loaded)",
+                ) from e
+            fp = await _fingerprint(db, schema)
+    raise AssertionError("unreachable")
+
+
 async def _structure(rag) -> _Struct:
-    """The loaded structure, read again when its tables changed."""
+    """The loaded structure, read again when its tables changed. A structure is
+    kept only when every table was read: a failed read leaves none, and the
+    failure stands until the next check, one _CHECK_INTERVAL later."""
     db, schema, _ = _db(rag)
     owner = (id(db), schema)
     try:
         async with _lock():
             now = time.monotonic()
             st = _state["struct"]
-            if (
-                st is not None
-                and _state["owner"] == owner
-                and now - _state["checked"] < _CHECK_INTERVAL
-            ):
-                return st
+            if _state["owner"] == owner and now - _state["checked"] < _CHECK_INTERVAL:
+                if st is not None:
+                    return st
+                if _state["failure"] is not None:
+                    raise Unavailable(*_state["failure"])
             fp = await _fingerprint(db, schema)
-            _state["checked"] = now
             if st is not None and _state["owner"] == owner and st.fingerprint == fp:
+                _state.update(checked=now, failure=None)
                 return st
             started = time.monotonic()
-            rows = {}
-            for name in (
-                "papers",
-                "attachments",
-                "authors",
-                "topics",
-                "paper_topics",
-                "cites",
-                "coupled",
-            ):
-                rows[name] = (
-                    await db.query(_SQL[name].format(s=schema), multirows=True) or []
+            try:
+                fp, rows = await _read_tables(db, schema, fp)
+            except Unavailable as e:
+                _state.update(
+                    struct=None, owner=owner, checked=now, failure=(e.reason, str(e))
                 )
+                raise
             st = await asyncio.to_thread(_build, rows, fp)
-            _state.update(struct=st, owner=owner)
+            _state.update(struct=st, owner=owner, checked=now, failure=None)
             logger.info(
                 f"zotero_struct: read {len(st.ids)} papers, {len(rows['cites'])} "
                 f"citations and {len(rows['coupled'])} coupling pairs from "
@@ -378,26 +436,32 @@ async def _kb_keys(rag) -> set[str]:
 
 
 async def available(rag) -> bool:
-    """Whether the structure can be read (cheap: the table check alone, at
-    most every _CHECK_INTERVAL seconds). Never raises."""
+    """Whether the structure can be read (cheap: the table check alone, run at
+    most once per _CHECK_INTERVAL, and given up after _AVAILABLE_TIMEOUT so a
+    slow pool cannot hold /health). Never raises."""
     schema = schema_name()
     if not schema:
         return False
     known = _state["known"]
+    now = time.monotonic()
     if (
         known
         and known[0] == schema
-        and time.monotonic() - _state["checked"] < (_CHECK_INTERVAL)
+        and now - max(_state["checked"], _state["avail_checked"]) < _CHECK_INTERVAL
     ):
         return known[1]
+    _state["avail_checked"] = now
     try:
         db, schema, _ = _db(rag)
-        await _fingerprint(db, schema)
+        await asyncio.wait_for(_fingerprint(db, schema), _AVAILABLE_TIMEOUT)
     except Unavailable as e:
         _state["known"] = (schema, False, e.reason)
         return False
     except Exception as e:
-        logger.warning(f"zotero_struct: availability check failed: {e}")
+        logger.warning(
+            f"zotero_struct: availability check failed: {e or type(e).__name__}"
+        )
+        _state["known"] = (schema, False, "error")
         return False
     _state["known"] = (schema, True, None)
     return True
@@ -408,6 +472,8 @@ def _reset_for_tests() -> None:
         struct=None,
         owner=None,
         checked=0.0,
+        failure=None,
+        avail_checked=0.0,
         lock=None,
         loop=None,
         docs=None,
@@ -498,8 +564,9 @@ def _lite(st: _Struct, idx: int, kb: set[str]) -> dict:
 
 
 def _link_weight(st: _Struct, a: int, b: int) -> float:
-    """A link's strength for the map and its edge width: _W_CITE for a
-    citation either way, plus _W_COUPLED times the coupling score."""
+    """A link's strength for the map and its edge width: _W_CITE when either
+    paper cites the other (once, also when both do), plus _W_COUPLED times the
+    coupling score."""
     w = _W_CITE if (b in st.cites_out[a] or a in st.cites_out[b]) else 0.0
     if b in st.coupled[a]:
         w += _W_COUPLED * st.coupled[a][b][1]
@@ -742,37 +809,59 @@ async def papers_by_topic(
 def _cheapest_path(
     st: _Struct, a: int, b: int, banned: set[int], banned_pairs: set, max_hops: int
 ) -> list[int] | None:
-    """Cheapest path a -> b over citations (either way) and coupling, where
-    entering a paper other than b costs 1 + _HUB_PENALTY * log2(1 + its links);
-    papers in ``banned`` and the pairs in ``banned_pairs`` are not used.
-    Settles each paper once, so a path over ``max_hops`` is dropped rather than
-    replaced by a costlier shorter one."""
-    dist = {a: 0.0}
-    hops = {a: 0}
-    prev: dict[int, int] = {}
-    heap = [(0.0, a)]
-    done = set()
+    """Cheapest path a -> b of at most ``max_hops`` steps over citations (either
+    way) and coupling, where entering a paper other than b costs
+    1 + _HUB_PENALTY * log2(1 + its links); papers in ``banned`` and the pairs in
+    ``banned_pairs`` are not used.
+
+    The search runs over (paper, steps used) states, so a paper reached cheaply
+    by a long chain does not hide a costlier route that gets there in fewer
+    steps: whenever a path within the limit exists, the cheapest one is found.
+    A state is skipped when a settled one (cheaper or equal, since states leave
+    the heap in cost order) reached the same paper in no more steps."""
+    best = {(a, 0): 0.0}
+    prev: dict[tuple[int, int], tuple[int, int]] = {}
+    heap = [(0.0, 0, a)]
+    fewest: dict[int, int] = {}  # paper -> fewest steps among its settled states
     while heap:
-        d, u = heapq.heappop(heap)
-        if u in done:
+        d, h, u = heapq.heappop(heap)
+        if best[(u, h)] < d or fewest.get(u, max_hops + 1) <= h:
             continue
-        done.add(u)
+        fewest[u] = h
         if u == b:
-            path = [b]
-            while path[-1] != a:
-                path.append(prev[path[-1]])
+            state, path = (u, h), [u]
+            while state != (a, 0):
+                state = prev[state]
+                path.append(state[0])
             return path[::-1]
-        if hops[u] >= max_hops:
+        if h >= max_hops:
             continue
         for v in st.adj[u]:
-            if v in done or v in banned or (min(u, v), max(u, v)) in banned_pairs:
+            if v in banned or (min(u, v), max(u, v)) in banned_pairs:
+                continue
+            if fewest.get(v, max_hops + 1) <= h + 1:
                 continue
             cost = 1.0 if v == b else 1.0 + _HUB_PENALTY * math.log2(1 + len(st.adj[v]))
             nd = d + cost
-            if nd < dist.get(v, math.inf):
-                dist[v], hops[v], prev[v] = nd, hops[u] + 1, u
-                heapq.heappush(heap, (nd, v))
+            if nd < best.get((v, h + 1), math.inf):
+                best[(v, h + 1)] = nd
+                prev[(v, h + 1)] = (u, h)
+                heapq.heappush(heap, (nd, h + 1, v))
     return None
+
+
+def _unique_labels(st: _Struct, papers: list[int]) -> dict[int, str]:
+    """'Family Year' for each paper; papers with the same label get a, b, ...
+    after it (in id order), so no two papers of one answer read alike."""
+    labels = {v: _short(st, v) for v in papers}
+    same: dict[str, list[int]] = {}
+    for v in labels:
+        same.setdefault(labels[v], []).append(v)
+    for label, vs in same.items():
+        if len(vs) > 1:
+            for n, v in enumerate(sorted(vs, key=lambda i: st.ids[i])):
+                labels[v] = f"{label}{chr(ord('a') + n) if n < 26 else n}"
+    return labels
 
 
 def _connect(
@@ -802,7 +891,7 @@ def _connect(
             round(st.coupled[a][b][1], 4),
         )
     out["links"] = links
-    paths, banned, banned_pairs = [], set(), set()
+    found, banned, banned_pairs = [], set(), set()
     for _ in range(max_paths):
         path = _cheapest_path(st, a, b, banned, banned_pairs, max_hops)
         if path is None:
@@ -811,34 +900,49 @@ def _connect(
         if not inner:
             banned_pairs.add((min(a, b), max(a, b)))
         banned.update(inner)
+        found.append(path)
+    # one label per paper for the whole answer, so two papers never read alike
+    labels = _unique_labels(st, [a, b] + [i for path in found for i in path[1:-1]])
+    out["a"]["label"], out["b"]["label"] = labels[a], labels[b]
+    paths = []
+    for path in found:
+        inner = path[1:-1]
         cost = (
             sum(1.0 + _HUB_PENALTY * math.log2(1 + len(st.adj[v])) for v in inner) + 1.0
         )
         steps = []
         for u, v in zip(path, path[1:]):
             step = {
-                "from": _short(st, u),
+                "from": labels[u],
                 "relation": _relation(st, u, v),
-                "to": _short(st, v),
+                "to": labels[v],
             }
             if v in st.coupled[u]:
                 step["shared_refs"] = st.coupled[u][v][0]
             steps.append(step)
+        papers = []
+        for i in inner:
+            papers.append({**_lite(st, i, kb), "label": labels[i]})
         paths.append(
             {
                 "hops": len(path) - 1,
                 "cost": round(cost, 3),
-                "papers": [_lite(st, i, kb) for i in inner],
+                "papers": papers,
                 "steps": steps,
             }
         )
     out["paths"] = paths
+    out["max_hops"] = max_hops
     out["ranking"] = (
         f"cheapest first; each paper passed through costs 1 + {_HUB_PENALTY} x "
         "log2(1 + its links), and later paths avoid the papers of earlier ones"
     )
     if not paths:
         out["reason"] = "not_connected"
+        out["message"] = (
+            f"No route of at most {max_hops} steps over citations (either "
+            "direction) and bibliographic coupling links the two papers"
+        )
     return out
 
 
@@ -921,6 +1025,46 @@ def _seed_summary(st: _Struct, kb: set[str], idx: int) -> dict:
     }
 
 
+def _orient(st: _Struct, a: int, b: int) -> tuple[int, int]:
+    """A pair as an edge runs: from the citing paper, else from the first id."""
+    if b in st.cites_out[a] and a not in st.cites_out[b]:
+        return a, b
+    if a in st.cites_out[b] and b not in st.cites_out[a]:
+        return b, a
+    return (a, b) if st.ids[a] <= st.ids[b] else (b, a)
+
+
+def _thin_links(st: _Struct, shown: list[int], seeds: set[int], max_nodes: int) -> dict:
+    """The links among the shown papers (pairs of paper numbers) to draw:
+    every link of a chosen paper; of every other paper its _EDGES_PER_PAPER
+    strongest (a link kept for either end counts once); then at most
+    _EDGE_CAP_FACTOR x ``max_nodes`` in all, the weakest links of papers that
+    were not chosen going first. Strength is _link_weight, ties go to the
+    papers' ids. ``found`` counts all the links among the shown papers."""
+    inside = set(shown)
+    weight: dict[tuple[int, int], float] = {}
+    for u in shown:
+        for v in st.adj[u]:
+            if v in inside and u < v:
+                weight[(u, v)] = _link_weight(st, u, v)
+
+    def rank(pair):
+        return (-weight[pair], *sorted((st.ids[pair[0]], st.ids[pair[1]])))
+
+    chosen = {p for p in weight if p[0] in seeds or p[1] in seeds}
+    own: dict[int, list] = {}
+    for pair in weight:
+        for v in pair:
+            if v not in seeds:
+                own.setdefault(v, []).append(pair)
+    kept = set(chosen)
+    for pairs in own.values():
+        kept.update(sorted(pairs, key=rank)[:_EDGES_PER_PAPER])
+    ordered = sorted(kept, key=lambda p: (p not in chosen, *rank(p)))
+    kept = sorted(ordered[: _EDGE_CAP_FACTOR * max_nodes], key=rank)
+    return {"found": len(weight), "kept": kept}
+
+
 def _map_graph(
     st: _Struct, kb: set[str], asked: list[str], hops: int, max_nodes: int
 ) -> dict:
@@ -941,27 +1085,23 @@ def _map_graph(
         return {**empty, "paper": {**view, "reason": "not_in_structure"}}
     shown, hop, counts = _map(st, seeds, hops, max_nodes)
     view.update(counts)
-    inside = set(shown)
     view["shown_hop1"] = sum(1 for v in shown if hop[v] == 1)
     view["shown_hop2"] = sum(1 for v in shown if hop[v] == 2)
     view["ranking"] = (
         "the chosen papers, then one-hop papers by link strength to them "
-        f"({_W_CITE} per citation either way + {_W_COUPLED} x coupling score), "
+        f"({_W_CITE} when either cites the other + {_W_COUPLED} x coupling score), "
         "then two-hop papers by the strength of the one-hop papers they link "
-        "to, damped by log2(2 + links) of each"
+        "to, damped by log2(2 + links) of each; links: all of a chosen paper's, "
+        f"the {_EDGES_PER_PAPER} strongest of each other paper, at most "
+        f"{_EDGE_CAP_FACTOR} x the node limit"
     )
 
-    labels = {v: _short(st, v) for v in shown}
-    same: dict[str, list[int]] = {}
-    for v in shown:
-        same.setdefault(labels[v], []).append(v)
-    for label, vs in same.items():
-        if len(vs) > 1:
-            for n, v in enumerate(sorted(vs, key=lambda i: st.ids[i])):
-                labels[v] = f"{label}{chr(ord('a') + n) if n < 26 else n}"
-
+    labels = _unique_labels(st, shown)
+    links = _thin_links(st, shown, set(seeds), max_nodes)
+    view["n_links"], view["shown_links"] = links["found"], len(links["kept"])
     kg = KnowledgeGraph(
         is_truncated=len(shown) < len(seeds) + counts["n_hop1"] + counts["n_hop2"]
+        or len(links["kept"]) < links["found"]
     )
     node_ids = {v: _node_id(st, v, kb) for v in shown}
     for v in shown:
@@ -993,56 +1133,50 @@ def _map_graph(
                 properties={k: p for k, p in props.items() if p is not None},
             )
         )
-    for u in shown:
-        for v in st.adj[u]:
-            if v not in inside or v == u:
-                continue
-            cites_uv, cites_vu = v in st.cites_out[u], u in st.cites_out[v]
-            # one edge per pair: from the citing paper, else from the first id
-            if cites_vu and not cites_uv:
-                continue
-            if not cites_uv and not cites_vu and st.ids[u] > st.ids[v]:
-                continue
-            if cites_uv and cites_vu and st.ids[u] > st.ids[v]:
-                continue
-            words, props = [], {}
-            if cites_uv and cites_vu:
-                words.append("cite each other")
-            elif cites_uv:
-                words.append("cites")
-            if v in st.coupled[u]:
-                words.append("coupled")
-                props["shared_refs"] = st.coupled[u][v][0]
-                props["coupling_score"] = round(st.coupled[u][v][1], 4)
-            props.update(
-                keywords=", ".join(words),
-                weight=round(_link_weight(st, u, v), 4),
-                description=f"{labels[u]} {' and '.join(words)} {labels[v]}"
-                if cites_uv or cites_vu
-                else f"{labels[u]} and {labels[v]} share "
-                f"{props['shared_refs']} references",
+    for a, b in links["kept"]:
+        u, v = _orient(st, a, b)
+        cites_uv, cites_vu = v in st.cites_out[u], u in st.cites_out[v]
+        words, props = [], {}
+        if cites_uv and cites_vu:
+            words.append("cite each other")
+        elif cites_uv:
+            words.append("cites")
+        if v in st.coupled[u]:
+            words.append("coupled")
+            props["shared_refs"] = st.coupled[u][v][0]
+            props["coupling_score"] = round(st.coupled[u][v][1], 4)
+        props.update(
+            keywords=", ".join(words),
+            weight=round(_link_weight(st, u, v), 4),
+            description=f"{labels[u]} {' and '.join(words)} {labels[v]}"
+            if cites_uv or cites_vu
+            else f"{labels[u]} and {labels[v]} share {props['shared_refs']} references",
+        )
+        if cites_uv or cites_vu:
+            props["direction"] = (
+                "both" if cites_uv and cites_vu else "source cites target"
             )
-            if cites_uv or cites_vu:
-                props["direction"] = (
-                    "both" if cites_uv and cites_vu else "source cites target"
-                )
-            kg.edges.append(
-                KnowledgeGraphEdge(
-                    id=f"{node_ids[u]}-{node_ids[v]}",
-                    type="DIRECTED" if cites_uv or cites_vu else "UNDIRECTED",
-                    source=node_ids[u],
-                    target=node_ids[v],
-                    properties=props,
-                )
+        kg.edges.append(
+            KnowledgeGraphEdge(
+                id=f"{node_ids[u]}-{node_ids[v]}",
+                type="DIRECTED" if cites_uv or cites_vu else "UNDIRECTED",
+                source=node_ids[u],
+                target=node_ids[v],
+                properties=props,
             )
+        )
     if not kg.edges:
         view["reason"] = "no_links"
     return {**kg.model_dump(), "paper": view}
 
 
 async def paper_map(
-    rag, papers: str | list[str], hops: int = 1, max_nodes: int = 1000
-) -> dict:
+    rag,
+    papers: str | list[str],
+    hops: int = 1,
+    max_nodes: int = 1000,
+    encode: bool = False,
+) -> dict | bytes:
     """A graph of papers around one or more chosen papers, in the ``/graphs``
     shape, plus ``paper``: the chosen papers' summaries and the view's counts.
 
@@ -1051,20 +1185,39 @@ async def paper_map(
     neighbours; ``paper.ranking`` says how). A node's ``entity_type`` is the
     field of its primary topic, its label "Family Year". An edge runs from the
     citing paper to the cited one; a coupling-only edge is ``UNDIRECTED``.
+    Links are thinned (see :func:`_thin_links`): ``paper.n_links`` counts those
+    among the shown papers, ``paper.shown_links`` the ones drawn, and
+    ``is_truncated`` is true when papers or links were dropped.
     ``paper.reason``: ``too_many_papers`` (over MAX_PAPERS),
     ``not_in_structure`` (no chosen paper is in it), ``no_links``.
-    Raises :class:`Unavailable`."""
+    With ``encode`` the answer is JSON bytes made in the worker thread, so a
+    large graph is never serialised on the event loop. Raises
+    :class:`Unavailable`, also for more than MAX_PAPERS papers."""
+    _db(rag)  # off, bad name or no PostgreSQL: unavailable whatever the request
+    finish = (
+        (
+            lambda r: json.dumps(
+                r, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+            ).encode()
+        )
+        if encode
+        else (lambda r: r)
+    )
     asked = [papers] if isinstance(papers, str) else list(papers)
     if len(set(asked)) > MAX_PAPERS:
-        return {
-            **KnowledgeGraph().model_dump(),
-            "paper": {
-                "mode": "map",
-                "hops": hops,
-                "papers": [],
-                "reason": "too_many_papers",
-            },
-        }
+        return finish(
+            {
+                **KnowledgeGraph().model_dump(),
+                "paper": {
+                    "mode": "map",
+                    "hops": hops,
+                    "papers": [],
+                    "reason": "too_many_papers",
+                },
+            }
+        )
     st = await _structure(rag)
     kb = await _kb_keys(rag)
-    return await asyncio.to_thread(_map_graph, st, kb, asked, hops, max_nodes)
+    return await asyncio.to_thread(
+        lambda: finish(_map_graph(st, kb, asked, hops, max_nodes))
+    )
