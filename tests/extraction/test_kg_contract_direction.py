@@ -116,9 +116,16 @@ def test_a_record_carries_its_reverse_reading_and_is_oriented_by_it():
     """The extraction merge and the rebuild orient a relation record through
     ``oriented_record`` alone; the reverse reading is resolved before, with the
     table, by ``add_reverse_keywords``."""
-    record = {"src_id": "x", "tgt_id": "y", "keywords": "uses", "weight": 1.0}
-    edges = {("B", "A"): [record], ("A", "C"): [{"keywords": "part_of"}]}
+    shared = {"src_id": "x", "tgt_id": "y", "keywords": "uses", "weight": 1.0}
+    edges = {
+        ("B", "A"): [shared],
+        ("A", "C"): [{"keywords": "part_of"}],
+        ("D", "E"): [shared],  # one object under two pairs (a hook may do it)
+    }
     add_reverse_keywords(edges, TABLE)
+    assert shared["src_id"] == "x"  # copies, the input is left alone
+    assert edges[("D", "E")][0]["src_id"] == "D"
+    [record] = edges[("B", "A")]
     assert record == {
         "src_id": "B",
         "tgt_id": "A",

@@ -392,18 +392,24 @@ def stores_accepted_records(
 
 
 def add_reverse_keywords(maybe_edges: dict, table: Mapping[str, str] | None) -> None:
-    """Give every relation record of one chunk, in place, its pair as filed
-    (``src_id``, ``tgt_id``) and ``reverse_keywords``: its keywords read from
-    target to source, resolved now with the inverse table (``table``, the
-    two-way table of ``relationship_inverses``; the keywords unchanged without
-    one). ``oriented_record`` then needs nothing but the record."""
+    """Replace, in ``maybe_edges``, every relation record of one chunk by a
+    copy carrying its pair as filed (``src_id``, ``tgt_id``) and
+    ``reverse_keywords``: its keywords read from target to source, resolved now
+    with the inverse table (``table``, the two-way table of
+    ``relationship_inverses``; the keywords unchanged without one).
+    ``oriented_record`` then needs nothing but the record. Copies, because a
+    hook may file one record object under two pairs."""
     for (src, tgt), records in maybe_edges.items():
+        copies = []
         for record in records:
-            record["src_id"], record["tgt_id"] = src, tgt
             keywords = record.get("keywords")
+            reverse = keywords
             if table and isinstance(keywords, str) and keywords:
-                keywords = invert_keywords(keywords, table)
-            record[REVERSE_KEYWORDS] = keywords
+                reverse = invert_keywords(keywords, table)
+            copies.append(
+                {**record, "src_id": src, "tgt_id": tgt, REVERSE_KEYWORDS: reverse}
+            )
+        maybe_edges[(src, tgt)] = copies
 
 
 def oriented_record(record: dict) -> dict:
