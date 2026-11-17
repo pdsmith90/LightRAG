@@ -89,7 +89,10 @@ applied (after the ceiling above), the high- and low-level keywords retrieval se
 with, the answer exactly as the client received it (with its `### Sources` block),
 the sources, the response time, and whether the answer completed. Streamed lines are
 relayed unchanged and the entry is written when the stream ends, so an answer that
-failed or that the client abandoned is recorded too, as incomplete. A file that cannot
+failed or that the client abandoned is recorded too, as incomplete. A failure during a
+stream is recorded with the text the client received (upstream's `Internal server error
+(error_id: ...)`; the id is in the server log), a failure before the first line with the
+error's own text. A file that cannot
 be written logs a warning and never fails the query. Unset, the routes behave as
 upstream. The path is reported in the `/health` configuration.
 

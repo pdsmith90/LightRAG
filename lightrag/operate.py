@@ -6072,27 +6072,27 @@ async def _perform_kg_search(
             else:
                 logger.warning(f"Vector chunk missing chunk_id: {chunk}")
 
-        # Lexical leg for mix mode (opt-in, LEXICAL_CHUNK_TOP_K)
-        if query_param.mode == "mix":
-            lexical_chunks = await _get_lexical_context(query, text_chunks_db)
-            for i, chunk in enumerate(lexical_chunks):
-                if chunk["chunk_id"] not in chunk_tracking:
-                    chunk_tracking[chunk["chunk_id"]] = {
-                        "source": "L",
-                        "frequency": 1,
-                        "order": i + 1,
-                    }
-            # Author-year and citation legs (opt-in, METADATA_CHUNK_TOP_K / CITATION_HOP_TOP_K)
-            metadata_chunks = await _get_metadata_context(
-                query, text_chunks_db, hop_sources=vector_chunks + lexical_chunks
-            )
-            for i, chunk in enumerate(metadata_chunks):
-                if chunk["chunk_id"] not in chunk_tracking:
-                    chunk_tracking[chunk["chunk_id"]] = {
-                        "source": "M",
-                        "frequency": 1,
-                        "order": i + 1,
-                    }
+    # Lexical leg for mix mode (opt-in, LEXICAL_CHUNK_TOP_K)
+    if query_param.mode == "mix":
+        lexical_chunks = await _get_lexical_context(query, text_chunks_db)
+        for i, chunk in enumerate(lexical_chunks):
+            if chunk["chunk_id"] not in chunk_tracking:
+                chunk_tracking[chunk["chunk_id"]] = {
+                    "source": "L",
+                    "frequency": 1,
+                    "order": i + 1,
+                }
+        # Author-year and citation legs (opt-in, METADATA_CHUNK_TOP_K / CITATION_HOP_TOP_K)
+        metadata_chunks = await _get_metadata_context(
+            query, text_chunks_db, hop_sources=vector_chunks + lexical_chunks
+        )
+        for i, chunk in enumerate(metadata_chunks):
+            if chunk["chunk_id"] not in chunk_tracking:
+                chunk_tracking[chunk["chunk_id"]] = {
+                    "source": "M",
+                    "frequency": 1,
+                    "order": i + 1,
+                }
 
     # Round-robin merge entities
     final_entities = []

@@ -138,3 +138,34 @@ def test_family_only_and_given_only_creators_and_initial_ending(library):
 
 def test_entry_without_creators_keeps_comma_joined_authors(library):
     assert zc._authors(META["AAAA0001"]) == "Okafor Chidi, Lindqvist Maja"
+
+
+@pytest.mark.asyncio
+async def test_kg_context_reference_list_shows_the_short_citation(library):
+    """The reference list a graph-mode prompt carries names the work, not the file."""
+    from lightrag import operate
+    from lightrag.base import QueryParam
+    from lightrag.utils import Tokenizer
+
+    class _Chars:
+        def encode(self, content):
+            return [ord(ch) for ch in content]
+
+        def decode(self, tokens):
+            return "".join(chr(token) for token in tokens)
+
+    file_path = "AAAA0001__mascon_leakage_over_antarctica_okafor_2019.md"
+    context, raw = await operate._build_context_str(
+        [{"entity": "X", "type": "t", "description": "d"}],
+        [],
+        [{"chunk_id": "c1", "content": "evidence", "file_path": file_path}],
+        "q",
+        QueryParam(mode="mix", max_total_tokens=30000, enable_rerank=False),
+        {"tokenizer": Tokenizer("chars", _Chars())},
+    )
+    (line,) = [ln for ln in context.splitlines() if ln.startswith("[1]")]
+    assert "Okafor" in line and "2019" in line
+    assert file_path not in line
+    (reference,) = raw["data"]["references"]
+    assert reference["file_path"] == file_path
+    assert reference["citation"] and "Okafor" in reference["citation"]

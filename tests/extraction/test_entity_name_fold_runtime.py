@@ -705,3 +705,45 @@ async def test_no_build_task_means_no_wait(monkeypatch):
 
     monkeypatch.setattr("lightrag.lightrag.extract_entities", spy)
     assert await rag._process_extract_entities({}) == ["done"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fold_on", [True, False])
+async def test_initialize_storages_starts_the_map_build_only_when_the_fold_is_on(
+    tmp_path, fold_on
+):
+    import numpy as np
+
+    from lightrag import LightRAG
+    from lightrag.utils import EmbeddingFunc
+
+    class _Bytes:
+        def encode(self, content):
+            return list(content.encode())
+
+        def decode(self, tokens):
+            return bytes(tokens).decode(errors="ignore")
+
+    async def _llm(*_args, **_kwargs):
+        return ""
+
+    async def _embed(texts, **_kwargs):
+        return np.ones((len(texts), 8), dtype=float)
+
+    rag = LightRAG(
+        working_dir=str(tmp_path),
+        workspace="fold-start",
+        llm_model_func=_llm,
+        embedding_func=EmbeddingFunc(embedding_dim=8, max_token_size=512, func=_embed),
+        tokenizer=Tokenizer("bytes", _Bytes()),
+        entity_name_fold=fold_on,
+    )
+    await rag.initialize_storages()
+    try:
+        task = getattr(rag, "_fold_map_task", None)
+        assert (task is not None) is fold_on
+        if task is not None:
+            await asyncio.wait_for(task, 30)
+            await rag._await_fold_map()
+    finally:
+        await rag.finalize_storages()
