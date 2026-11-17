@@ -648,6 +648,13 @@ class PostgreSQLDB:
 
         self._transient_exceptions = TRANSIENT_DB_EXCEPTIONS
 
+        # Fork (extraction contract): whether LIGHTRAG_DOC_CHUNKS has the
+        # kg_records column (the chunk's accepted records). Set by the start-up
+        # column probe and by ensure_chunk_kg_records_column; while it is False
+        # no statement names the column.
+        self.chunk_kg_records_column = False
+        self._kg_records_column_lock = asyncio.Lock()
+
         # Connection retry configuration
         self.connection_retry_attempts = config["connection_retry_attempts"]
         self.connection_retry_backoff = config["connection_retry_backoff"]
@@ -2493,10 +2500,14 @@ class PostgreSQLDB:
                 WHERE table_name = 'lightrag_doc_chunks'
                   AND column_name = ANY($1)
                 """,
-                [[c for c, _ in columns_to_add]],
+                # Fork (extraction contract): the same lookup tells whether the
+                # kg_records column exists; it is added only when needed
+                # (ensure_chunk_kg_records_column).
+                [[c for c, _ in columns_to_add] + ["kg_records"]],
                 multirows=True,
             )
             existing_names = {row["column_name"] for row in (existing or [])}
+            self.chunk_kg_records_column = "kg_records" in existing_names
         except Exception as e:
             logger.warning(
                 f"Failed to inspect LIGHTRAG_DOC_CHUNKS columns for migration: {e}"
@@ -2520,6 +2531,64 @@ class PostgreSQLDB:
                 logger.error(
                     f"Failed to add column {col_name} to LIGHTRAG_DOC_CHUNKS: {e}"
                 )
+
+    # Fork (extraction contract): adding kg_records to an existing chunk table.
+    # ADD COLUMN of a nullable column without a default changes only the
+    # catalog, but it needs an ACCESS EXCLUSIVE lock, and while it waits for
+    # one every later statement on the table queues behind it. So each attempt
+    # gives up after the lock timeout, and the attempts are bounded.
+    KG_RECORDS_COLUMN_LOCK_TIMEOUT = "5s"
+    KG_RECORDS_COLUMN_ATTEMPTS = 3
+    KG_RECORDS_COLUMN_RETRY_DELAY_S = 2.0
+
+    async def ensure_chunk_kg_records_column(self) -> None:
+        """Add the kg_records column to LIGHTRAG_DOC_CHUNKS if it is missing.
+        Raises ``RuntimeError`` when it still cannot be added after
+        ``KG_RECORDS_COLUMN_ATTEMPTS`` attempts."""
+        if self.chunk_kg_records_column:
+            return
+        async with self._kg_records_column_lock:
+            if self.chunk_kg_records_column:
+                return
+
+            async def _add(connection: asyncpg.Connection) -> None:
+                async with connection.transaction():
+                    await connection.execute(
+                        "SET LOCAL lock_timeout = "
+                        f"'{self.KG_RECORDS_COLUMN_LOCK_TIMEOUT}'"
+                    )
+                    await connection.execute(
+                        "ALTER TABLE LIGHTRAG_DOC_CHUNKS "
+                        "ADD COLUMN IF NOT EXISTS kg_records JSONB NULL"
+                    )
+
+            last_error: Exception | None = None
+            for attempt in range(1, self.KG_RECORDS_COLUMN_ATTEMPTS + 1):
+                try:
+                    await self._run_with_retry(_add)
+                except Exception as e:
+                    last_error = e
+                    logger.warning(
+                        "PostgreSQL, adding column kg_records to LIGHTRAG_DOC_CHUNKS "
+                        f"failed (attempt {attempt} of "
+                        f"{self.KG_RECORDS_COLUMN_ATTEMPTS}): {e}"
+                    )
+                    if attempt < self.KG_RECORDS_COLUMN_ATTEMPTS:
+                        await asyncio.sleep(self.KG_RECORDS_COLUMN_RETRY_DELAY_S)
+                    continue
+                self.chunk_kg_records_column = True
+                logger.info("PostgreSQL, column kg_records is on LIGHTRAG_DOC_CHUNKS")
+                return
+            raise RuntimeError(
+                "Cannot add the column kg_records to LIGHTRAG_DOC_CHUNKS "
+                f"({self.KG_RECORDS_COLUMN_ATTEMPTS} attempts, lock timeout "
+                f"{self.KG_RECORDS_COLUMN_LOCK_TIMEOUT}; last error: {last_error}). "
+                "The extraction contract (relationship_types in the entity-type "
+                "profile) or an extraction hook (KG_CONTRACT_VALIDATOR) stores each "
+                "chunk's accepted records there. Start again when no other session "
+                "holds a lock on the table, or add the column first: ALTER TABLE "
+                "LIGHTRAG_DOC_CHUNKS ADD COLUMN IF NOT EXISTS kg_records JSONB NULL"
+            ) from last_error
 
     async def _migrate_field_lengths(self):
         """Migrate database field lengths: entity_name, source_id, target_id, and file_path"""
@@ -4045,6 +4114,50 @@ class PGKVStorage(BaseKVStorage):
                     key for key in listed if isinstance(key, str) and key in wanted
                 )
         return found
+
+    # ---- Fork (extraction contract): the chunk's accepted records ----------
+    # Text-chunk namespace only; see utils.write_chunk_kg_records and the
+    # helpers next to it.
+
+    async def ensure_kg_records_field(self) -> None:
+        if is_namespace(self.namespace, NameSpace.KV_STORE_TEXT_CHUNKS):
+            await self.db.ensure_chunk_kg_records_column()
+
+    async def write_kg_records(self, chunk_id: str, records: dict[str, Any]) -> None:
+        await self.ensure_kg_records_field()
+        rows = await self.db.query(
+            SQL_TEMPLATES["write_kg_records_text_chunks"],
+            [self.workspace, chunk_id, json.dumps(records)],
+            multirows=True,
+        )
+        if not rows:
+            raise RuntimeError(
+                f"chunk {chunk_id} not found: its accepted records cannot be stored"
+            )
+
+    async def read_kg_records(self, chunk_ids: list[str]) -> dict[str, Any]:
+        if not chunk_ids or not self.db.chunk_kg_records_column:
+            return {}
+        rows = await self.db.query(
+            SQL_TEMPLATES["read_kg_records_text_chunks"],
+            [self.workspace, list(chunk_ids)],
+            multirows=True,
+        )
+        found = {}
+        for row in rows or []:
+            records = row.get("kg_records")
+            if isinstance(records, str):
+                records = json.loads(records)
+            found[row["id"]] = records
+        return found
+
+    async def clear_kg_records(self, chunk_ids: list[str]) -> None:
+        if not chunk_ids or not self.db.chunk_kg_records_column:
+            return
+        await self.db.execute(
+            SQL_TEMPLATES["clear_kg_records_text_chunks"],
+            {"workspace": self.workspace, "ids": list(chunk_ids)},
+        )
 
     async def filter_keys(self, keys: set[str]) -> set[str]:
         """Filter out duplicated content"""
@@ -10646,6 +10759,7 @@ TABLES = {
                     create_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
                     update_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
                     llm_cache_contract JSONB NULL,
+                    kg_records JSONB NULL,
 	                CONSTRAINT LIGHTRAG_DOC_CHUNKS_PK PRIMARY KEY (workspace, id)
                     )"""
     },
@@ -11074,6 +11188,19 @@ SQL_TEMPLATES = {
                       ON CONFLICT (workspace,id) DO UPDATE
                       SET value=EXCLUDED.value,
                       update_time = CURRENT_TIMESTAMP
+                     """,
+    # Fork (extraction contract): the chunk's accepted records. Only these three
+    # statements name the column; the general chunk reads and the upsert leave
+    # it alone.
+    "write_kg_records_text_chunks": """UPDATE LIGHTRAG_DOC_CHUNKS SET kg_records = $3::jsonb
+                      WHERE workspace = $1 AND id = $2
+                      RETURNING id
+                     """,
+    "read_kg_records_text_chunks": """SELECT id, kg_records FROM LIGHTRAG_DOC_CHUNKS
+                      WHERE workspace = $1 AND id = ANY($2) AND kg_records IS NOT NULL
+                     """,
+    "clear_kg_records_text_chunks": """UPDATE LIGHTRAG_DOC_CHUNKS SET kg_records = NULL
+                      WHERE workspace = $1 AND id = ANY($2) AND kg_records IS NOT NULL
                      """,
     "upsert_full_entities": """INSERT INTO LIGHTRAG_FULL_ENTITIES (workspace, id, entity_names, count,
                       create_time, update_time)

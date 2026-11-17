@@ -34,6 +34,7 @@ from ..base import (
     SourceUnique,
 )
 from ..utils import (
+    CHUNK_KG_RECORDS_FIELD,
     logger,
     compute_mdhash_id,
     _cooperative_yield,
@@ -561,16 +562,28 @@ class MongoKVStorage(BaseKVStorage):
             # Remove create_time from $set to avoid conflict with $setOnInsert
             v_for_set.pop("create_time", None)
 
+            update = {
+                "$set": v_for_set,  # Update all fields except create_time
+                "$setOnInsert": {
+                    "create_time": current_time
+                },  # Set create_time only on insert
+            }
+            # Fork (extraction contract): a chunk row written without the
+            # accepted records (the pipeline re-creating it for a new
+            # extraction) must not keep an earlier run's, as on the storages
+            # whose upsert replaces the document. A row read and written back
+            # carries them in $set.
+            if (
+                self.namespace.endswith("text_chunks")
+                and CHUNK_KG_RECORDS_FIELD not in v_for_set
+            ):
+                update["$unset"] = {CHUNK_KG_RECORDS_FIELD: ""}
+
             operations.append(
                 (
                     UpdateOne(
                         {"_id": k},
-                        {
-                            "$set": v_for_set,  # Update all fields except create_time
-                            "$setOnInsert": {
-                                "create_time": current_time
-                            },  # Set create_time only on insert
-                        },
+                        update,
                         upsert=True,
                     ),
                     _estimate_doc_bytes(v_for_set),

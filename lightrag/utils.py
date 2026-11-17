@@ -39,6 +39,7 @@ from typing import (
     Iterator,
     Sequence,
     Collection,
+    Mapping,
 )
 import numpy as np
 from dotenv import load_dotenv
@@ -5437,6 +5438,76 @@ async def update_chunk_cache_list(
             f"Failed to update chunk {chunk_id} with cache references on {cache_scenario}: {e}"
         )
         return False
+
+
+# Fork (extraction contract): the text-chunk field holding the records the
+# chunk's extraction accepted (lightrag/kg_contract.py, ``accepted_records``).
+# Written only while the contract or an extraction hook is configured; a
+# knowledge rebuild reads it instead of re-parsing the chunk's cached output.
+CHUNK_KG_RECORDS_FIELD = "kg_records"
+
+
+async def write_chunk_kg_records(
+    text_chunks_storage: "BaseKVStorage", chunk_id: str, records: dict[str, Any]
+) -> None:
+    """Store one chunk's accepted records with its row. A storage that keeps
+    the field out of its general chunk reads and writes (PostgreSQL) has
+    ``write_kg_records``; on the others the field lives in the chunk document,
+    which is read and written back with it. Raises when the row is missing or
+    the write fails: the chunk's extraction must then fail."""
+    write = getattr(text_chunks_storage, "write_kg_records", None)
+    if write is not None:
+        await write(chunk_id, records)
+        return
+    chunk_data = await text_chunks_storage.get_by_id(chunk_id)
+    if not chunk_data:
+        raise RuntimeError(
+            f"chunk {chunk_id} not found: its accepted records cannot be stored"
+        )
+    chunk_data = dict(chunk_data)
+    chunk_data[CHUNK_KG_RECORDS_FIELD] = records
+    await text_chunks_storage.upsert({chunk_id: chunk_data})
+
+
+async def read_chunk_kg_records(
+    text_chunks_storage: "BaseKVStorage",
+    chunk_ids: Collection[str],
+    chunk_rows: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    """The stored accepted records of those of ``chunk_ids`` that have them,
+    by chunk id. ``chunk_rows`` are the chunks' rows as the general read
+    returned them; a storage with ``read_kg_records`` (PostgreSQL) reads the
+    field itself instead."""
+    read = getattr(text_chunks_storage, "read_kg_records", None)
+    if read is not None:
+        return await read(list(chunk_ids))
+    found = {}
+    for chunk_id in chunk_ids:
+        records = (chunk_rows.get(chunk_id) or {}).get(CHUNK_KG_RECORDS_FIELD)
+        if records is not None:
+            found[chunk_id] = records
+    return found
+
+
+async def clear_chunk_kg_records(
+    text_chunks_storage: "BaseKVStorage", chunk_ids: Collection[str]
+) -> None:
+    """Remove the stored accepted records of ``chunk_ids`` before they are
+    extracted again. Only a storage whose chunk upsert leaves the field alone
+    (PostgreSQL) has ``clear_kg_records``; on the others the pipeline's upsert
+    of the new chunk row already replaced the document without it."""
+    clear = getattr(text_chunks_storage, "clear_kg_records", None)
+    if clear is not None and chunk_ids:
+        await clear(list(chunk_ids))
+
+
+async def ensure_chunk_kg_records_field(text_chunks_storage: "BaseKVStorage") -> None:
+    """Make the storage able to hold accepted records before extraction needs
+    it: on PostgreSQL the column (``ensure_kg_records_field``); nothing to do
+    elsewhere. Raises when it cannot."""
+    ensure = getattr(text_chunks_storage, "ensure_kg_records_field", None)
+    if ensure is not None:
+        await ensure()
 
 
 class TruncatedResponse(str):
