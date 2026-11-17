@@ -6,7 +6,8 @@
 # is appended to the guidance below as `name = definition` lines with a read-it-back direction
 # check, and the JSON system prompt's naming, keyword and direction rules are replaced by the
 # contract's. Each definition says what SOURCE and TARGET must be; `related_to` is the answer
-# when no other type fits. Print the matching request schema with
+# when no other type fits. `relationship_inverses` keeps the direction in the graph (below).
+# Print the matching request schema with
 #   python -m lightrag.kg_contract --schema --profile <this file>
 entity_types_guidance: |
   Classify each entity using one of the following types. If no type fits, use `Other`.
@@ -50,6 +51,24 @@ relationship_types:
   depends_on: "SOURCE is a quantity, result or property whose value is determined by TARGET"
   has_property: "TARGET is a quantity, parameter or metric that describes or evaluates SOURCE"
   related_to: "the text links the two and no type above fits exactly"
+# The graph stores each pair once, in sorted order, so a relation the sort flips is stored
+# under the inverse name of its type ("GRACE part_of Constellation" becomes Constellation
+# has_part GRACE). The LLM never sees these names. A type not listed here is symmetric.
+relationship_inverses:
+  is_a: has_kind
+  part_of: has_part
+  measures: measured_by
+  estimates: estimated_by
+  uses: used_by
+  applied_to: target_of
+  produces: produced_by
+  derived_from: source_of
+  operates: operated_by
+  located_in: location_of
+  affects: affected_by
+  corrects: corrected_by
+  depends_on: determines
+  has_property: property_of
 entity_extraction_json_examples:
   - |
     Worked example 1 (an illustration of the format and of what to leave out: the citation, the label and the symbols in it produce no entity). Passage:

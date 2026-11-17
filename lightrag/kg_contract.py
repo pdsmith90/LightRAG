@@ -16,7 +16,23 @@ to its definition, in prompt order -- gets
 
 A profile without the key leaves every prompt exactly as it was. The contract
 needs JSON extraction (``ENTITY_EXTRACTION_USE_JSON=true``); the text-mode
-prompts are not edited.
+prompts are not edited. The gleaning turn is sent with the contract system
+prompt and the unchanged gleaning template.
+
+Direction in the graph. The graph stores each pair of entities once, in sorted
+order (``src < tgt`` by code point, Python's ``sorted``): the extraction merge
+and the rebuild after a deletion write each pair that way, and the plain-table
+PostgreSQL storage enforces it, so "GRACE part_of Constellation" is stored as
+(Constellation, GRACE) with keywords ``part_of``. Without more,
+the stored ``keywords`` no longer say which node is the part; the direction
+survives only in the description text. A profile that also declares
+``relationship_inverses`` -- a mapping of a directed type name to its inverse
+name; a type the mapping does not name is symmetric -- keeps it: every write
+path puts the pair into sorted order and, when that flips an extracted
+relation "A t B", stores the inverse name of ``t`` instead (``orient_relation``),
+so a stored edge (src, tgt) with keyword k always reads "src k tgt". The LLM
+never sees the inverse names: the prompt, the guidance and the schema keep the
+forward list. See ``ZLIGHTRAG.md`` for the write paths and their limits.
 
 The schema the extraction requests are constrained by is built by a front
 process, not by this code, so ``python -m lightrag.kg_contract --schema --profile
@@ -94,6 +110,148 @@ def normalize_relationship_types(value: Any, source: str) -> dict[str, str]:
             )
         types[name] = " ".join(definition.split())
     return types
+
+
+# The inverse names of the v3.1 list; the sample profile declares exactly this.
+# same_as, compared_with and related_to are symmetric and have none.
+RELATIONSHIP_INVERSES_V31: dict[str, str] = {
+    "is_a": "has_kind",
+    "part_of": "has_part",
+    "measures": "measured_by",
+    "estimates": "estimated_by",
+    "uses": "used_by",
+    "applied_to": "target_of",
+    "produces": "produced_by",
+    "derived_from": "source_of",
+    "operates": "operated_by",
+    "located_in": "location_of",
+    "affects": "affected_by",
+    "corrects": "corrected_by",
+    "depends_on": "determines",
+    "has_property": "property_of",
+}
+
+
+def normalize_relationship_inverses(
+    value: Any, types: Mapping[str, str] | None, source: str
+) -> dict[str, str]:
+    """Validate a profile's ``relationship_inverses`` against its
+    ``relationship_types`` and return it as a plain dict.
+
+    Each key is a declared type, each value its inverse name: lower-case snake
+    case, not a declared type, and used once. ``source`` names the profile in
+    the error message."""
+    field = f"{source} field 'relationship_inverses'"
+    if not types:
+        raise ValueError(f"{field} needs 'relationship_types' in the same profile.")
+    if not isinstance(value, Mapping) or not value:
+        raise ValueError(
+            f"{field} must be a non-empty mapping of relation type name to its "
+            "inverse name."
+        )
+    inverses: dict[str, str] = {}
+    for name, inverse in value.items():
+        if name not in types:
+            raise ValueError(
+                f"{field}: {name!r} is not a type in 'relationship_types'."
+            )
+        if not isinstance(inverse, str) or not RELATIONSHIP_TYPE_NAME_RE.match(inverse):
+            raise ValueError(
+                f"{field}: the inverse of {name!r}, {inverse!r}, must be lower-case "
+                "snake case (letters, digits and underscores, starting with a letter)."
+            )
+        if inverse in types:
+            raise ValueError(
+                f"{field}: the inverse of {name!r}, {inverse!r}, is also a type in "
+                "'relationship_types'."
+            )
+        if inverse in inverses.values():
+            raise ValueError(
+                f"{field}: {inverse!r} is the inverse of more than one type."
+            )
+        inverses[name] = inverse
+    return inverses
+
+
+def inverse_table(inverses: Mapping[str, str] | None) -> dict[str, str] | None:
+    """Both directions of a ``relationship_inverses`` mapping (``part_of`` <->
+    ``has_part``), or None when there is none: a stored keyword may already be
+    an inverse name that a later re-keying flips back."""
+    if not inverses:
+        return None
+    table = dict(inverses)
+    table.update((inverse, name) for name, inverse in inverses.items())
+    return table
+
+
+_KEYWORD_TOKEN = re.compile(r"[^,]+")
+
+
+def invert_keywords(keywords: str, table: Mapping[str, str]) -> str:
+    """``keywords`` read the other way round: each comma-separated keyword that
+    is a directed type or an inverse name in ``table`` becomes its counterpart;
+    symmetric types, unknown keywords, separators and spacing stay as they are."""
+
+    def swap(match: re.Match) -> str:
+        token = match.group(0)
+        name = token.strip()
+        if name not in table:
+            return token
+        start = token.index(name)
+        return token[:start] + table[name] + token[start + len(name) :]
+
+    return _KEYWORD_TOKEN.sub(swap, keywords)
+
+
+def orient_relation(
+    src: str, tgt: str, keywords: str, table: Mapping[str, str] | None
+) -> tuple[str, str, str]:
+    """A relation whose ``keywords`` read "src keywords tgt", in the graph's
+    storage order: ``(min, max, keywords)``, the keywords inverted when the pair
+    was flipped. Without a table the pair is sorted and the keywords are
+    returned unchanged (the behaviour without ``relationship_inverses``)."""
+    if src <= tgt:
+        return src, tgt, keywords
+    if table and keywords:
+        keywords = invert_keywords(keywords, table)
+    return tgt, src, keywords
+
+
+def orient_edge_records(
+    edge_key: tuple[str, str], records: list[dict], table: Mapping[str, str] | None
+) -> list[dict]:
+    """The parsed relation records of ``edge_key`` (as extracted: source,
+    target) for the sorted key: when sorting flips the pair, copies with
+    ``src_id``/``tgt_id`` swapped and ``keywords`` inverted. The records are
+    returned as they are when there is no table or no flip."""
+    src, tgt = edge_key
+    if not table or src <= tgt:
+        return records
+    flipped = []
+    for record in records:
+        record = {**record, "src_id": tgt, "tgt_id": src}
+        if record.get("keywords"):
+            record["keywords"] = invert_keywords(str(record["keywords"]), table)
+        flipped.append(record)
+    return flipped
+
+
+def relation_inverse_table(global_config: Mapping[str, Any]) -> dict[str, str] | None:
+    """The inverse table of the profile ``global_config`` carries (the one
+    ``LightRAG`` caches as ``_entity_extraction_prompt_profile``), or None when
+    it declares no ``relationship_inverses``. A config without a cached profile
+    (tests, custom wiring) resolves it the way ``extract_entities`` does."""
+    profile = global_config.get("_entity_extraction_prompt_profile")
+    if profile is None:
+        addon_params = global_config.get("addon_params") or {}
+        if not addon_params.get("entity_type_prompt_file"):
+            return None
+        from lightrag.prompt import resolve_entity_extraction_prompt_profile
+
+        profile = resolve_entity_extraction_prompt_profile(
+            addon_params, global_config.get("entity_extraction_use_json", False)
+        )
+    return inverse_table(profile.get("relationship_inverses"))
 
 
 def profile_status(profile: Mapping[str, Any] | None) -> dict[str, int]:

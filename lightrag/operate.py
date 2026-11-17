@@ -87,7 +87,11 @@ from lightrag.chunk_schema import (
     format_parent_headings,
     strip_internal_multimodal_markup_for_extraction,
 )
-from lightrag.kg_contract import contract_system_prompt
+from lightrag.kg_contract import (
+    contract_system_prompt,
+    orient_edge_records,
+    relation_inverse_table,
+)
 from lightrag.prompt import PROMPTS, resolve_entity_extraction_prompt_profile
 from lightrag.constants import (
     GRAPH_FIELD_SEP,
@@ -2286,6 +2290,16 @@ async def _rebuild_single_relationship(
     keyed lock for the relationship pair to ensure thread safety.
     """
 
+    # Fork (extraction contract): with relationship_inverses in the profile the
+    # cached records are read in the graph's storage order, so a record cached
+    # as (larger, smaller) contributes the inverse names of its types, and the
+    # edge is written back in that order. The in-tree callers already pass the
+    # sorted pair; sorting here keeps a reversed caller from writing an AGE edge
+    # against its keywords.
+    inverse_table = relation_inverse_table(global_config)
+    if inverse_table and src > tgt:
+        src, tgt = tgt, src
+
     # Get current relationship data
     current_relationship = await knowledge_graph_inst.get_edge(src, tgt)
     if not current_relationship:
@@ -2339,7 +2353,11 @@ async def _rebuild_single_relationship(
             for edge_key in [(src, tgt), (tgt, src)]:
                 if edge_key in chunk_relationships[chunk_id]:
                     all_relationship_data.extend(
-                        chunk_relationships[chunk_id][edge_key]
+                        orient_edge_records(
+                            edge_key,
+                            chunk_relationships[chunk_id][edge_key],
+                            inverse_table,
+                        )
                     )
 
     degraded = not all_relationship_data
@@ -3890,6 +3908,10 @@ async def merge_nodes_and_edges(
     # Collect all nodes and edges from all chunks
     all_nodes = defaultdict(list)
     all_edges = defaultdict(list)
+    # Fork (extraction contract): with relationship_inverses in the profile, a
+    # relation the sort below flips keeps its direction under the inverse name
+    # of its type (lightrag/kg_contract.py). None leaves the records as they are.
+    inverse_table = relation_inverse_table(global_config)
 
     for i, (maybe_nodes, maybe_edges) in enumerate(chunk_results, start=1):
         # Collect nodes
@@ -3899,7 +3921,9 @@ async def merge_nodes_and_edges(
         # Collect edges with sorted keys for undirected graph
         for edge_key, edges in maybe_edges.items():
             sorted_edge_key = tuple(sorted(edge_key))
-            all_edges[sorted_edge_key].extend(edges)
+            all_edges[sorted_edge_key].extend(
+                orient_edge_records(edge_key, edges, inverse_table)
+            )
         await _cooperative_yield(i, every=32)
 
     total_entities_count = len(all_nodes)

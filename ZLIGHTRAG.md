@@ -29,7 +29,7 @@ starting with [README.md](./README.md), applies as written.
 | [Strict entity types](#strict-entity-types) | `ENTITY_TYPE_STRICT` | `false` |
 | [Symbol entity names](#symbol-entity-names) | `DROP_SYMBOL_ENTITIES` | `false` |
 | [Apparatus entity names](#apparatus-entity-names) | `DROP_JUNK_ENTITIES` | `false` |
-| [Extraction contract: closed relation types](#extraction-contract-closed-relation-types) | `relationship_types` in the `ENTITY_TYPE_PROMPT_FILE` profile; schema via `python -m lightrag.kg_contract --schema` | absent (off) |
+| [Extraction contract: closed relation types](#extraction-contract-closed-relation-types) | `relationship_types` (and `relationship_inverses`) in the `ENTITY_TYPE_PROMPT_FILE` profile; schema via `python -m lightrag.kg_contract --schema` | absent (off) |
 | [Extraction contract validator](#extraction-contract-validator) | `KG_CONTRACT_VALIDATOR` | `false` |
 | [Entity name fold](#entity-name-fold) | `ENTITY_NAME_FOLD`; lists and aliases via `ENTITY_NAME_FOLD_LISTS`, `ENTITY_NAME_ALIASES` | `false` |
 | [Sidecar relations](#sidecar-relations) | `SIDECAR_RELATIONS` | `all` (upstream behaviour) |
@@ -265,9 +265,10 @@ collapsed. A profile that declares it switches the contract on:
   rule and the text's spelling instead of title case, says never to glue words into one
   identifier, takes exactly one listed type in `keywords` instead of free keywords, makes
   relations directed, and lists an entity only when the text states a relation for it.
-  The gleaning prompt carries none of these rules and is unchanged; it is sent with the
-  same system prompt. A base template that no longer holds a replaced passage the
-  expected number of times fails startup rather than sending a half-edited prompt.
+  The gleaning turn is sent with this contract system prompt and the unchanged gleaning
+  template, which carries none of these rules. A base template that no longer holds a
+  replaced passage the expected number of times fails startup rather than sending a
+  half-edited prompt.
 
 The contract needs `ENTITY_EXTRACTION_USE_JSON=true`; in text mode a profile with
 `relationship_types` is refused at startup. A profile without the key sends exactly the
@@ -279,8 +280,82 @@ of the LLM server, not here. `python -m lightrag.kg_contract --schema --profile 
 prints it for a profile: the entity types its guidance lists, read as `ENTITY_TYPE_STRICT`
 reads them and in order, plus `Other`, and the profile's relation types, both as enums.
 A sample profile for a geoscience paper corpus, with relation list v3.1 (17 types, each
-defined by what its source and target must be), is
-`prompts/samples/entity_type_prompt.kg_contract.sample.yml`.
+defined by what its source and target must be, and their inverse names), is
+`prompts/samples/entity_type_prompt.kg_contract.sample.yml`. `/health` reports the
+active profile's counts as `kg_contract_profile` (`relationship_types`,
+`relationship_inverses`; 0 and 0 when the contract is off).
+
+#### Direction in the graph: inverse names
+
+The graph stores each pair of entities once, in sorted order (Python string order, by
+code point): the extraction merge sorts every extracted pair before merging,
+`PGTableGraphStorage` keeps `src_id < tgt_id` by the same order, and the Apache AGE
+storage keeps the direction the merge writes, which is that order. So "GRACE part_of
+Constellation" is stored as (Constellation, GRACE) with keywords `part_of`, and two chunks
+that give A `part_of` B and B `has_property` A merge into one edge with keywords
+`has_property,part_of`. Without more, the stored keywords do not say which node is the
+part: the direction survives only in the relation's description text.
+
+A profile may also declare `relationship_inverses`, a mapping of a directed type name to
+its inverse name; a type the mapping does not name is symmetric. It needs
+`relationship_types` in the same profile; each key must be a declared type, each inverse
+lower-case snake case, not a declared type and the inverse of one type only, or the
+profile is refused at load. With it, every write path below puts a relation into sorted
+order and, when that flips an extracted or given relation "A t B", stores the inverse name
+of `t`, so **a stored edge (src, tgt) with keyword k always reads "src k tgt"**:
+Constellation `has_part` GRACE, and the two chunks above give `has_part,has_property`.
+In a keyword field that holds several comma-separated types after merges, each declared
+type or inverse name is rewritten on its own (exact match); symmetric types and any other
+keyword stay as they are. The LLM never sees an inverse name: the prompt, the guidance and
+the schema keep the forward list, and the rewrite is a deterministic storage-side step
+(`orient_relation` in `lightrag/kg_contract.py`). Without the key every write is what it
+was (`tests/extraction/test_kg_contract_direction.py`). The sample profile's inverses:
+
+| type | inverse | | type | inverse |
+|---|---|---|---|---|
+| `is_a` | `has_kind` | | `derived_from` | `source_of` |
+| `part_of` | `has_part` | | `operates` | `operated_by` |
+| `measures` | `measured_by` | | `located_in` | `location_of` |
+| `estimates` | `estimated_by` | | `affects` | `affected_by` |
+| `uses` | `used_by` | | `corrects` | `corrected_by` |
+| `applied_to` | `target_of` | | `depends_on` | `determines` |
+| `produces` | `produced_by` | | `has_property` | `property_of` |
+
+`same_as`, `compared_with` and `related_to` are symmetric.
+
+The write paths and what each does with the key:
+
+| path | with `relationship_inverses` |
+|---|---|
+| extraction merge (`merge_nodes_and_edges`) | the records of a pair the sort flips get the inverse names before the merge; the stored edge's keywords already read in stored order |
+| rebuild after a deletion, and the kept-summary rebuild (`_rebuild_single_relationship`) | cached extraction records filed under the reversed pair are inverted; the edge is written back in sorted order |
+| `ENTITY_NAME_FOLD` and `KG_CONTRACT_VALIDATOR` renames | no change needed: both rename endpoints before the merge and keep the extracted direction, so the merge orients the renamed pair |
+| entity rename (`edit_entity`), entity merge (`merge_entities`, and `edit_entity` with `allow_merge`) | the stored keywords read in the old sorted pair; the renamed or redirected pair is re-sorted, inverted when it flips, and written in sorted order before duplicates are joined |
+| `create_relation`, `edit_relation`, `insert_custom_kg` | keywords given with (source, target) read "source keywords target"; they are inverted when the stored order is the other way, and the edge is written in sorted order |
+
+Limits:
+
+- Turning the key on does not rewrite edges already in the graph: they keep their forward
+  names in whichever order the merge sorted them, and later merges add inverse names next
+  to them. Re-extract the documents (delete and insert) for a graph that holds the
+  invariant throughout. Turning it off later leaves the inverse names in place.
+- `edit_relation` reads the keywords in its request in the caller's order, while
+  `get_relation_info` and the graph view return the stored keywords with the pair as
+  asked or as stored; a caller that reads in the reversed order and writes the same
+  keywords back inverts them. Edit in the stored order (smaller name first), as the
+  graph view does.
+- Tools that copy or re-key edges outside these paths do not know the profile:
+  the graph migration tool (`lightrag/tools/migrate_graph_storage.py`) copies each
+  pair in the order the source lists it, so an AGE target can draw the arrow of a pair a
+  NetworkX source lists unsorted the other way round (the keywords still read in sorted
+  order); `PGTableGraphStorage`'s start-up normalization of reversed legacy rows swaps the
+  endpoints without touching keywords (only rows written before the storage kept sorted
+  order); and a bulk tool that renames entities directly in the database must apply
+  `kg_contract.orient_relation` to each edge it re-keys.
+- Readers take the keywords as text: the relation vector content (the keywords, the
+  sorted pair and the description), the web UI edge label and `get_relation_info` show
+  the stored keywords; the query context does not include keywords. None of them assumes
+  the forward list.
 
 ### Extraction contract validator
 
@@ -632,10 +707,12 @@ also triggers on pushes and pull requests to `zlightrag`, as does upstream's
 [.github/workflows/linting.yaml](./.github/workflows/linting.yaml). The exceptions are the Apache
 AGE integration test for the edge removal,
 `tests/kg/postgres_impl/test_postgres_remove_edges_age.py`, which needs
-`--run-integration` and a live AGE server, and the fold map build on the table graph
-storage, `tests/kg/pgtable_impl/test_pgtable_fold_map_smoke.py`, marked `pg_smoke` like
-the storage's other live-PostgreSQL tests, which needs `--run-integration` and
-`POSTGRES_PASSWORD`. No workflow on this branch runs either.
+`--run-integration` and a live AGE server, and the fold map build and the extraction
+contract's inverse names on the table graph storage,
+`tests/kg/pgtable_impl/test_pgtable_fold_map_smoke.py` and
+`tests/kg/pgtable_impl/test_pgtable_relation_direction_smoke.py`, marked `pg_smoke` like
+the storage's other live-PostgreSQL tests, which need `--run-integration` and
+`POSTGRES_PASSWORD`. No workflow on this branch runs them.
 
 ## `zotero-toolkit/`
 

@@ -8,6 +8,7 @@ import yaml
 from lightrag.kg_contract import (
     contract_system_prompt,
     guidance_with_relationship_types,
+    normalize_relationship_inverses,
     normalize_relationship_types,
 )
 from lightrag.utils import logger
@@ -532,6 +533,7 @@ class _EntityExtractionPromptProfileOptional(TypedDict, total=False):
     # Fork (extraction contract): present only when the profile file declares
     # it; see lightrag/kg_contract.py.
     relationship_types: dict[str, str]
+    relationship_inverses: dict[str, str]
 
 
 class EntityExtractionPromptProfile(_EntityExtractionPromptProfileOptional):
@@ -821,6 +823,12 @@ def load_entity_extraction_prompt_profile(
             raw_profile["relationship_types"],
             f"ENTITY_TYPE_PROMPT_FILE '{profile_path}'",
         )
+    if "relationship_inverses" in raw_profile:
+        profile["relationship_inverses"] = normalize_relationship_inverses(
+            raw_profile["relationship_inverses"],
+            profile.get("relationship_types"),
+            f"ENTITY_TYPE_PROMPT_FILE '{profile_path}'",
+        )
 
     return profile
 
@@ -896,6 +904,11 @@ def resolve_entity_extraction_prompt_profile(
             guidance, relationship_types
         )
         resolved["relationship_types"] = dict(relationship_types)
+        # Storage side only: the prompt and the schema keep the forward list.
+        if file_profile.get("relationship_inverses"):
+            resolved["relationship_inverses"] = dict(
+                file_profile["relationship_inverses"]
+            )
 
     return resolved
 
@@ -938,4 +951,8 @@ def validate_entity_extraction_prompt_profile_for_mode(
     }
     if prompt_profile.get("relationship_types"):
         validated["relationship_types"] = dict(prompt_profile["relationship_types"])
+    if prompt_profile.get("relationship_inverses"):
+        validated["relationship_inverses"] = dict(
+            prompt_profile["relationship_inverses"]
+        )
     return validated
