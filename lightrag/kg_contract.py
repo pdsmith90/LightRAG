@@ -96,6 +96,16 @@ def normalize_relationship_types(value: Any, source: str) -> dict[str, str]:
     return types
 
 
+def profile_status(profile: Mapping[str, Any] | None) -> dict[str, int]:
+    """For ``/health``: how many relation types and inverse names the active
+    entity-type profile declares (0 and 0: the contract is off)."""
+    profile = profile or {}
+    return {
+        "relationship_types": len(profile.get("relationship_types") or ()),
+        "relationship_inverses": len(profile.get("relationship_inverses") or ()),
+    }
+
+
 def relationship_guidance(types: Mapping[str, str]) -> str:
     """The relation list for the entity-type guidance. Lines are ``name =
     definition``, never ``- name: ...``: ENTITY_TYPE_STRICT reads ``- Name:``

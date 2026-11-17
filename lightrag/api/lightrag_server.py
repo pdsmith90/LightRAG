@@ -3077,6 +3077,9 @@ def create_app(args):
                         "drop_symbol_entities": args.drop_symbol_entities,
                         "drop_junk_entities": args.drop_junk_entities,
                         "kg_contract_validator": args.kg_contract_validator,
+                        "kg_contract_profile": kg_contract.profile_status(
+                            getattr(rag, "_entity_extraction_prompt_profile", None)
+                        ),
                         "entity_name_fold": args.entity_name_fold,
                         "entity_name_fold_lists": args.entity_name_fold_lists,
                         "entity_name_aliases": args.entity_name_aliases,
