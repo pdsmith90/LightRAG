@@ -132,6 +132,31 @@ class _ChunksVDB:
         return [{"id": "v1", "content": "vector prose", "file_path": "v.md"}]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_chunk_vectors", [True, False])
+async def test_mix_search_runs_the_lexical_leg_with_or_without_chunk_vectors(
+    with_chunk_vectors,
+):
+    """The lexical leg of a mix query does not depend on the chunk vector store."""
+    text_chunks = _TextChunks(
+        {"lexical_chunk_top_k": 2, "kg_chunk_pick_method": "WEIGHT"}, [_row("l1")]
+    )
+    text_chunks.embedding_func = None
+    result = await operate._perform_kg_search(
+        "probabilistic indexing",
+        "",
+        "",
+        None,
+        None,
+        None,
+        text_chunks,
+        QueryParam(mode="mix"),
+        _ChunksVDB() if with_chunk_vectors else None,
+    )
+    assert [query for query, _ in text_chunks.requests] == ["probabilistic indexing"]
+    assert [c["chunk_id"] for c in result["lexical_chunks"]] == ["l1"]
+
+
 def _config(model, **extra) -> dict:
     return {
         "tokenizer": Tokenizer("fake", _FakeTokenizerImpl()),
