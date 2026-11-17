@@ -67,6 +67,9 @@ def test_stdio_lists_tools_and_compiles_citations(
         "find_paper",
         "paper_equation",
         "paper_table",
+        "related_papers",
+        "papers_by_topic",
+        "connect_papers",
         "add_note",
         "health",
     }

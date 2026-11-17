@@ -16,6 +16,9 @@ into real bibliographic citations using Zotero metadata. The LLM never writes th
 | `paper_equation(paper, number, page=0)` | One numbered display equation of **one** paper as `$…$` LaTeX with its printed number as `\tag{N}`, read from the paper's own PDF (see [Equations and tables from the PDF](#equations-and-tables-from-the-pdf)), with the PDF's text layer for the same box, the page and the sentence that cites it. Without an OCR model the answer is the text layer, labelled as such. |
 | `paper_table(paper, number)` | One numbered table of **one** paper as a Markdown table with its caption and page, read from the PDF's text layer by the layout converter. No OCR model. |
 | `find_paper(paper)` | A lookup with the same `paper` forms: the matching papers that are indexed, then the Zotero items that match but are not, then near matches when nothing has every word. A lookup that finds nothing also says how old the Zotero item list is. With one lookup per line (up to 40) it answers one line per lookup instead: its first match and the counts (see [One paper's passages and the paper lookup](#one-papers-passages-and-the-paper-lookup)). No retrieval and no LLM. |
+| `related_papers(paper, relations="all", limit=15)` | The library papers linked to **one** paper by its citation structure: those it cites, those citing it, its bibliographic-coupling partners (shared references and a score) and papers sharing an author, ranked, each with why and whether it is indexed (`indexed as KEY`, for `paper_passages`). Needs the server's paper structure (see [Paper structure](#paper-structure)). |
+| `papers_by_topic(topic, limit=15, primary_only=False, topics_only=False)` | The library papers under an OpenAlex topic at any level (domain, field, subfield, topic), named by words or id, ranked; `topics_only=True` lists the matching topics with paper counts instead. |
+| `connect_papers(a, b, paths=3)` | What connects two papers: the direct links (citation, coupling, shared authors, same topic, papers citing both), then up to `paths` routes over citations and coupling, cheapest first, hub papers costing more, each step labelled. |
 | `add_note(text, description="")` | Inserts a text note into the knowledge base (`POST /documents/text`) under a unique document name (see below). |
 | `health(verbose=False)` | A few lines from the server's `/health` report: status, versions, pipeline state, the queues (queued/running) and the models, or `unreachable at <url>: <error>`. A status other than 200, or a body that is not a JSON object, is shown as it came (the first 300 characters). `verbose=True` returns the whole report as `<status code>: <body>`. |
 
@@ -239,6 +242,18 @@ here; it is sent as the `X-API-Key` header, never in a URL. A server protected o
 account login (`AUTH_ACCOUNTS` without `LIGHTRAG_API_KEY`) needs a session token, which
 this proxy does not obtain.
 
+### Paper structure
+
+`related_papers`, `papers_by_topic` and `connect_papers` call the zlightrag fork's
+`GET /graph/papers/related`, `/graph/papers/topics`, `/graph/papers/by_topic` and
+`/graph/papers/connect`. The server answers them only with `ZOTERO_STRUCT_SCHEMA` set
+to a loaded structure schema (see the fork's `ZLIGHTRAG.md`); otherwise it answers 501,
+and a stock or older server 404, and the tools say so in a sentence instead of failing.
+The proxy never reads the structure itself. `paper` takes a Zotero key, a DOI, a
+structure id (`doi:…`, `zot:…`) as they are; words are looked up as for
+`paper_passages`, and exactly one paper must fit. `limit` is clamped to 1..50 and
+`paths` to 1..5.
+
 ## Install
 
 Python 3.10 or newer. From the `zotero-toolkit/` directory:
@@ -357,7 +372,7 @@ matches), the batch lookup (statuses, order, the 40-line limit, a failing or sta
 the age note, the locks around the shared metadata), the short `health` answer, both
 `paper_passages` paths and their local file line, the header strip
 (checked against `corpus/build_corpus.py` when it imports), the section-heading cleanup,
-duplicate passages, and the stdio tool listing
+duplicate passages, the paper-structure tools (requests, wording, 501 and 404), and the stdio tool listing
 with text-only results. `test_mcp_paper_tools.py` covers `paper_equation` and `paper_table`
 (which paper and file, the helper's failures, the wording of every answer, stdio) against a
 stand-in helper; `test_mcp_pdf_tools.py` covers the helper (numbers, LaTeX pairing, citing

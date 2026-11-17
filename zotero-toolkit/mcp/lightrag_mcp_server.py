@@ -3,7 +3,7 @@
 lightrag_mcp_server.py — expose a Zotero-backed LightRAG knowledge base to any
 MCP client (Claude Code, Claude Desktop, other agents) over stdio.
 
-It's a thin, self-contained proxy over the LightRAG Server REST API. Seven tools:
+It's a thin, self-contained proxy over the LightRAG Server REST API. Ten tools:
 
     search_library(query, mode="naive", top_k, answer=False, include_graph=False,
                    passages=10)        -> compiled citations, then the retrieved
@@ -17,6 +17,12 @@ It's a thin, self-contained proxy over the LightRAG Server REST API. Seven tools
     paper_equation(paper, number)      -> one numbered display equation of ONE paper,
                                           as LaTeX read from the paper's PDF
     paper_table(paper, number)         -> one table of ONE paper, as rows, from the PDF
+    related_papers(paper)              -> library papers it cites, citing it, coupled
+                                          with it or sharing an author, ranked
+    papers_by_topic(topic)             -> library papers under an OpenAlex topic at any
+                                          level (topics_only=True: the topics)
+    connect_papers(a, b)               -> direct links and citation/coupling routes
+                                          between two papers
     add_note(text, description)        -> insert a note/snippet into the KB under
                                           a unique document name
     health(verbose=False)              -> is the LightRAG server up? (a few lines;
@@ -57,6 +63,12 @@ zlightrag fork's paper lookup) which papers are indexed, and paper_passages asks
 POST /graph/papers/passages for one paper's passages. A stock LightRAG Server has
 neither route: the lookup then falls back to zotero_metadata.json alone, and
 paper_passages to a /query that names the paper.
+
+related_papers, papers_by_topic and connect_papers ask the fork's paper-structure
+routes (GET /graph/papers/related, /graph/papers/topics, /graph/papers/by_topic,
+/graph/papers/connect), which answer only when the server has ZOTERO_STRUCT_SCHEMA set;
+otherwise (501, or 404 on an older server) the tools say so in a sentence. The proxy
+itself never reads the structure.
 
 paper_equation and paper_table read what the index lacks (display equations, tables the
 converter scrambled) from the paper's own PDF in the Zotero storage folder. The PDF work
@@ -1982,6 +1994,342 @@ def find_paper(paper: str) -> str:
     if len(lines) > 1:
         return _batch_text(lines)
     return _lookup_text(paper, *_lookup(paper), age_note=_meta_age_note())
+
+
+# --- the library's citation structure (server routes /graph/papers/related, /topics,
+# /by_topic and /connect; zlightrag fork with ZOTERO_STRUCT_SCHEMA set) ---------------
+
+STRUCT_DEFAULT = 15
+STRUCT_MAX = 50
+STRUCT_PATHS_MAX = 5
+_STRUCT_KEY = re.compile(r"^[A-Z0-9]{8}$")
+_RELATION_WORDS = {
+    "cites": "cites",
+    "cited_by": "cited by",
+    "coupled": "coupled",
+    "coauthor": "co-author",
+}
+
+
+def _struct_get(path: str, params: dict) -> dict | str:
+    """A structure route's JSON answer, or a sentence saying why there is none: the
+    server has no such route (an older server or a stock one: 404) or its paper
+    structure is switched off or not loaded (501)."""
+    try:
+        r = httpx.get(
+            f"{BASE}{path}", params=params, headers=HEADERS, timeout=QUERY_TIMEOUT
+        )
+        if r.status_code == 404 and _error_detail(r) == "Not Found":
+            return (
+                "This LightRAG server has no paper-structure routes (it predates them, "
+                "or is not the zlightrag fork). find_paper, paper_passages and "
+                "search_library still work."
+            )
+        if r.status_code == 501:
+            return (
+                f"{_error_detail(r) or 'The paper structure is not available.'} "
+                "The server needs ZOTERO_STRUCT_SCHEMA set to the loaded schema. "
+                "find_paper, paper_passages and search_library still work."
+            )
+        r.raise_for_status()
+        data = r.json()
+    except httpx.HTTPError as e:
+        raise _tool_error(path, e) from e
+    except ValueError as e:
+        raise ToolError(f"LightRAG {path} returned no JSON: {e}") from e
+    return data if isinstance(data, dict) else {}
+
+
+def _struct_paper(paper: str, tool: str) -> tuple[str | None, str | None]:
+    """(the id the structure routes take, None), or (None, the text to answer with)
+    when `paper` names no single paper. A Zotero key, a DOI or a structure id
+    (doi:..., zot:...) is passed as it is; words are looked up as find_paper does,
+    and one indexed paper or one Zotero item must fit."""
+    text = (paper or "").strip()
+    if _STRUCT_KEY.match(text) or _norm_doi(text) or re.match(r"^(doi|zot):", text):
+        return text, None
+    indexed, rest, truncated, near, unchecked = _lookup(text)
+    if indexed and len(indexed) == 1:
+        p = indexed[0]
+        return (_norm_doi(p.get("doi") or "") or _lead_key(p.get("keys") or [])), None
+    if not indexed and len(rest) == 1 and not unchecked:
+        return rest[0][0], None
+    shown = (
+        _lookup_text(text, None, rest, False, near)
+        if indexed is None
+        else _lookup_text(text, indexed, rest, truncated, near, unchecked)
+    )
+    return None, shown + (
+        f"\n\n{tool} needs exactly one paper: call it again with one Zotero key or "
+        "DOI from the list."
+        if indexed or rest or near or unchecked
+        else ""
+    )
+
+
+def _struct_limit(limit: int) -> int:
+    return max(1, min(int(limit), STRUCT_MAX))
+
+
+def _struct_row(p: dict) -> str:
+    """'Family Year · Title · field · key K (indexed)' for one paper of an answer."""
+    title = str(p.get("title") or "")
+    if len(title) > 90:
+        title = title[:90] + "…"
+    parts = [str(p.get("label") or p.get("paper_id") or ""), title]
+    if p.get("venue"):
+        parts.append(str(p["venue"])[:50])
+    if p.get("in_kb"):
+        parts.append(f"indexed as {p.get('key')}")
+    else:
+        parts.append(
+            "not indexed"
+            + (f" (Zotero {', '.join(p['keys'][:2])})" if p.get("keys") else "")
+        )
+    if p.get("doi"):
+        parts.append(f"doi:{p['doi']}")
+    return " · ".join(x for x in parts if x)
+
+
+def _relation_text(relation: list) -> str:
+    return " and ".join(_RELATION_WORDS.get(r, str(r)) for r in relation or [])
+
+
+@mcp.tool(structured_output=False)
+def related_papers(
+    paper: str, relations: str = "all", limit: int = STRUCT_DEFAULT
+) -> str:
+    """Papers of the library linked to ONE paper by its structure, not by its text: the
+    library papers it cites, those citing it, its bibliographic-coupling partners (papers
+    sharing many references, with the count and a score) and papers sharing an author.
+
+    paper: a Zotero key, a DOI, or words that all occur in its title, authors or year (as
+    for paper_passages). relations: "all" or a comma-separated subset of cites, cited_by,
+    coupled, coauthor. limit: rows shown, default 15, at most 50.
+
+    Each row says why it is related and whether its text is indexed ("indexed as KEY":
+    call paper_passages(KEY, question) to read what it says). Ranked: a citation either
+    way 1.0 (+0.25 both ways), plus 2 x the coupling score, plus 0.25 per shared author
+    (at most 4). Only papers in the library appear, and citations come from OpenAlex
+    reference lists, so a paper without one has no "cites" rows. No retrieval, no LLM;
+    under a second."""
+    pid, message = _struct_paper(paper, "related_papers")
+    if message:
+        return message
+    params = {"paper": pid, "limit": _struct_limit(limit)}
+    wanted = [r.strip() for r in (relations or "").split(",") if r.strip()]
+    if wanted and wanted != ["all"]:
+        unknown = [r for r in wanted if r not in _RELATION_WORDS]
+        if unknown:
+            return (
+                f"Unknown relation(s): {', '.join(unknown)}. Use all, or a "
+                "comma-separated subset of cites, cited_by, coupled, coauthor."
+            )
+        params["relations"] = ",".join(wanted)
+    data = _struct_get("/graph/papers/related", params)
+    if isinstance(data, str):
+        return data
+    if data.get("reason") == "not_in_structure":
+        return (
+            f'"{paper}" is not in the library\'s citation structure (it holds the '
+            "papers of the Zotero library as of its last build). Check it with "
+            "find_paper."
+        )
+    me = data.get("paper") or {}
+    totals = data.get("totals") or {}
+    counts = " · ".join(
+        f"{_RELATION_WORDS[r]} {totals[r]}" for r in _RELATION_WORDS if r in totals
+    )
+    out = [
+        f"### Related to {_struct_row(me)}",
+        f"{counts} → {totals.get('papers', 0)} papers, {totals.get('in_kb', 0)} indexed.",
+    ]
+    for i, p in enumerate(data.get("related") or [], start=1):
+        why = []
+        for r in p.get("reasons") or []:
+            if r == "coupled" and p.get("shared_refs") is not None:
+                why.append(
+                    f"coupled: {p['shared_refs']} shared refs, score {p.get('coupling_score')}"
+                )
+            elif r == "coauthor" and p.get("shared_authors"):
+                why.append("co-author: " + ", ".join(p["shared_authors"][:3]))
+            else:
+                why.append(_RELATION_WORDS.get(r, r))
+        out.append(f"{i}. [{'; '.join(why)}] {_struct_row(p)}")
+    shown = len(data.get("related") or [])
+    if data.get("truncated"):
+        out.append(
+            f"Showing {shown} of {totals.get('papers')}: raise limit (at most "
+            f"{STRUCT_MAX}) or keep to some relations for more."
+        )
+    elif not shown:
+        out.append("No library paper is linked to this one.")
+    return "\n".join(out)
+
+
+@mcp.tool(structured_output=False)
+def papers_by_topic(
+    topic: str,
+    limit: int = STRUCT_DEFAULT,
+    primary_only: bool = False,
+    topics_only: bool = False,
+) -> str:
+    """Papers of the library under one OpenAlex topic, at any level: domain, field,
+    subfield or topic (e.g. "Geophysics", "Earth and Planetary Sciences", "GNSS").
+
+    topic: words of the topic's name, or a topic id from a listing (topic:T…,
+    subfield:…, field:…, domain:…). The best name match is used and the next ones are
+    listed. primary_only: only papers whose primary topic is under it (OpenAlex gives
+    a paper up to three topics). topics_only=True lists the topics whose names match,
+    with their paper counts, instead of papers (topic="" lists the largest).
+    limit: rows shown, default 15, at most 50.
+
+    Ranked: papers whose primary topic is under it first, then most cited by library
+    papers, then most cited overall. Topics are coarse labels: use them to survey or
+    filter, not as evidence about a paper's content. Each row says whether the paper is
+    indexed (then paper_passages can read it)."""
+    limit = _struct_limit(limit)
+    if topics_only:
+        data = _struct_get("/graph/papers/topics", {"q": topic or "", "limit": limit})
+        if isinstance(data, str):
+            return data
+        rows = data.get("topics") or []
+        out = [f'Topics matching "{topic}" ({data.get("total", len(rows))}):']
+        for t in rows:
+            out.append(
+                f"- {t.get('topic_id')} · {t.get('level')} · {t.get('path')} · "
+                f"{t.get('n_primary')} papers with it as primary topic, "
+                f"{t.get('n_papers')} with it at all"
+            )
+        if not rows:
+            out.append("No topic name holds every word.")
+        return "\n".join(out)
+    if not (topic or "").strip():
+        return "Name a topic, or call papers_by_topic(topic, topics_only=True) to list them."
+    data = _struct_get(
+        "/graph/papers/by_topic",
+        {
+            "topic": topic,
+            "limit": limit,
+            "primary_only": str(bool(primary_only)).lower(),
+        },
+    )
+    if isinstance(data, str):
+        return data
+    if data.get("reason") == "no_topic":
+        return (
+            f'No topic name holds every word of "{topic}". List topics with '
+            "papers_by_topic(words, topics_only=True)."
+        )
+    t = data.get("topic") or {}
+    out = [
+        f"### {t.get('name')} ({t.get('level')}; {t.get('path')}; {t.get('topic_id')})",
+        f"{data.get('total')} papers"
+        + (" with it as primary topic" if data.get("primary_only") else "")
+        + f", {data.get('in_kb')} indexed.",
+    ]
+    for i, p in enumerate(data.get("papers") or [], start=1):
+        mark = "" if p.get("primary") else "[secondary topic] "
+        out.append(f"{i}. {mark}{_struct_row(p)}")
+    if data.get("truncated"):
+        out.append(
+            f"Showing {len(data.get('papers') or [])}: raise limit (at most {STRUCT_MAX})."
+        )
+    alternatives = data.get("alternatives") or []
+    if alternatives:
+        out.append(
+            "Other topics matching the words: "
+            + "; ".join(
+                f"{a.get('name')} ({a.get('level')}, {a.get('topic_id')})"
+                for a in alternatives
+            )
+        )
+    return "\n".join(out)
+
+
+@mcp.tool(structured_output=False)
+def connect_papers(a: str, b: str, paths: int = 3) -> str:
+    """What connects two papers of the library through its citation structure.
+
+    a, b: each a Zotero key, a DOI, or words that all occur in the paper's title,
+    authors or year. paths: how many alternative routes to show, default 3, at most 5.
+
+    Returns the direct links first (one cites the other, coupling with its shared
+    references, shared authors, same OpenAlex topic / subfield / field, how many
+    library papers cite both and how many library papers both cite), then up to
+    `paths` routes over citations (either direction) and coupling, cheapest first, each
+    step labelled. A paper passed through costs more the more links it has, so routes
+    through heavily cited hub papers come later; each later route avoids the papers of
+    earlier ones. Up to 6 steps are searched.
+
+    Concepts both papers' TEXT names (shared knowledge-graph entities) are not part of
+    this: the web UI's paper filter shows them (pick both papers, "common" mode), as
+    does GET /graphs/paper?paper=A&paper=B&mode=common on the server."""
+    ids = []
+    for which, text in (("a", a), ("b", b)):
+        pid, message = _struct_paper(text, f"connect_papers ({which})")
+        if message:
+            return message
+        ids.append(pid)
+    data = _struct_get(
+        "/graph/papers/connect",
+        {"a": ids[0], "b": ids[1], "paths": max(1, min(int(paths), STRUCT_PATHS_MAX))},
+    )
+    if isinstance(data, str):
+        return data
+    if data.get("reason") == "not_in_structure":
+        return (
+            "Not in the library's citation structure: "
+            + ", ".join(f'"{m}"' for m in data.get("missing") or [])
+            + ". Check with find_paper."
+        )
+    pa, pb = data.get("a") or {}, data.get("b") or {}
+    out = [f"### A: {_struct_row(pa)}", f"### B: {_struct_row(pb)}"]
+    if data.get("reason") == "same_paper":
+        out.append("A and B are the same paper.")
+        return "\n".join(out)
+    links = data.get("links") or {}
+    direct = []
+    relation = links.get("relation") or []
+    if "cites" in relation:
+        direct.append("A cites B")
+    if "cited_by" in relation:
+        direct.append("B cites A")
+    if links.get("shared_refs") is not None:
+        direct.append(
+            f"{links['shared_refs']} shared references (coupling score {links.get('coupling_score')})"
+        )
+    if links.get("shared_authors"):
+        direct.append("shared authors: " + ", ".join(links["shared_authors"][:5]))
+    for level in ("topic", "subfield", "field"):
+        if links.get(f"same_{level}"):
+            direct.append(f"same {level}: {links[f'same_{level}']}")
+            break
+    direct.append(
+        f"{links.get('cited_by_both', 0)} library papers cite both; both cite "
+        f"{links.get('cite_both', 0)} of the same library papers"
+    )
+    out.append("Direct: " + " · ".join(direct))
+    routes = data.get("paths") or []
+    if routes:
+        out.append("Routes (cheapest first; hub papers cost more):")
+    for i, path in enumerate(routes, start=1):
+        steps = path.get("steps") or []
+        chain = steps[0]["from"] if steps else ""
+        for s in steps:
+            chain += f" —{_relation_text(s.get('relation'))}→ {s.get('to')}"
+        out.append(
+            f"{i}. ({path.get('hops')} step{'s' if path.get('hops') != 1 else ''}) {chain}"
+        )
+        for p in path.get("papers") or []:
+            out.append(f"   via {_struct_row(p)}")
+    if not routes:
+        out.append(
+            "No route over citations and coupling within 6 steps"
+            if data.get("reason") == "not_connected"
+            else "No route."
+        )
+    return "\n".join(out)
 
 
 @mcp.tool(structured_output=False)

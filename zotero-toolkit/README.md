@@ -126,6 +126,9 @@ cd zotero-toolkit
    `/graph/papers/passages` routes; against a stock LightRAG Server they fall back to
    `zotero_metadata.json` and a plain query (see
    [mcp/README.md](mcp/README.md#one-papers-passages-and-the-paper-lookup)).
+   `related_papers`, `papers_by_topic` and `connect_papers` answer only from a fork server
+   with its paper structure loaded (`ZOTERO_STRUCT_SCHEMA`; see
+   [mcp/README.md](mcp/README.md#paper-structure)).
 
 4. **Optional.** Put [`fronts/`](fronts/README.md) between LightRAG and its model servers
    if you have a second place to run a model. Run
