@@ -30,15 +30,21 @@ survives only in the description text. A profile that also declares
 name; a type the mapping does not name is symmetric -- keeps it: every write
 path puts the pair into sorted order and, when that flips an extracted
 relation "A t B", stores the inverse name of ``t`` instead (``orient_relation``),
-so a stored edge (src, tgt) with keyword k always reads "src k tgt". The LLM
-never sees the inverse names: the prompt, the guidance and the schema keep the
-forward list. See ``ZLIGHTRAG.md`` for the write paths and their limits.
+so a stored edge (src, tgt) with a declared type or inverse name k reads
+"src k tgt". That holds for every keyword of an LLM-extracted relation, which
+the parser checks against the list; keywords given by a caller or made by the
+code (sidecar links) that are not on it are stored as given. The LLM never sees
+the inverse names: the prompt, the guidance and the schema keep the forward
+list. See ``ZLIGHTRAG.md`` for the write paths and their limits.
 
 The schema the extraction requests are constrained by is built by a front
 process, not by this code, so ``python -m lightrag.kg_contract --schema --profile
-PATH`` prints it for a profile: the entity types its guidance lists (read the way
-ENTITY_TYPE_STRICT reads them) plus ``Other``, and the profile's relation types,
-both as enums.
+PATH`` prints it for a profile: the entity types its guidance lists (read the
+way ENTITY_TYPE_STRICT reads them) plus ``Other``, and the profile's relation
+types, both as enums. Nothing on
+this side can make the front apply it, so the parser checks every extracted
+relation's keywords against the list (``check_relation_keywords``) and counts
+what it had to change.
 
 ``kg_extraction_validator`` (wired by ``KG_CONTRACT_VALIDATOR`` in the API
 server) applies the checks the parser does not make: it drops entity names that
@@ -54,6 +60,7 @@ import argparse
 import json
 import re
 import sys
+from collections import Counter
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -236,22 +243,147 @@ def orient_edge_records(
     return flipped
 
 
-def relation_inverse_table(global_config: Mapping[str, Any]) -> dict[str, str] | None:
-    """The inverse table of the profile ``global_config`` carries (the one
-    ``LightRAG`` caches as ``_entity_extraction_prompt_profile``), or None when
-    it declares no ``relationship_inverses``. A config without a cached profile
-    (tests, custom wiring) resolves it the way ``extract_entities`` does."""
+def _active_profile(global_config: Mapping[str, Any]) -> Mapping[str, Any]:
+    """The profile ``global_config`` carries (the one ``LightRAG`` caches as
+    ``_entity_extraction_prompt_profile``). A config without a cached profile
+    (tests, custom wiring) resolves it the way ``extract_entities`` does; one
+    without a profile file has no contract keys."""
     profile = global_config.get("_entity_extraction_prompt_profile")
     if profile is None:
         addon_params = global_config.get("addon_params") or {}
         if not addon_params.get("entity_type_prompt_file"):
-            return None
+            return {}
         from lightrag.prompt import resolve_entity_extraction_prompt_profile
 
         profile = resolve_entity_extraction_prompt_profile(
             addon_params, global_config.get("entity_extraction_use_json", False)
         )
-    return inverse_table(profile.get("relationship_inverses"))
+    return profile
+
+
+def relation_inverse_table(global_config: Mapping[str, Any]) -> dict[str, str] | None:
+    """The inverse table of the profile ``global_config`` carries, or None when
+    it declares no ``relationship_inverses``."""
+    return inverse_table(_active_profile(global_config).get("relationship_inverses"))
+
+
+def relation_types(global_config: Mapping[str, Any]) -> dict[str, str] | None:
+    """The ``relationship_types`` of the profile ``global_config`` carries, or
+    None when it declares none (the contract is off)."""
+    return _active_profile(global_config).get("relationship_types") or None
+
+
+# ---- the relation list at parse time ----------------------------------------------
+
+# What the keyword check counts: every relation it checks, and each change it
+# makes. A keyword that is exactly one declared type is not counted as a change.
+RELATION_KEYWORD_COUNTS = (
+    "checked",
+    "normalized",
+    "multi_type",
+    "related_to",
+    "dropped",
+)
+
+
+def check_relation_keywords(
+    keywords: str, types: Mapping[str, str]
+) -> tuple[str | None, str | None]:
+    """One LLM-extracted relation's ``keywords`` checked against the declared
+    relation list: ``(keywords to store, or None to drop the relation; the
+    change made, or None when the field is exactly one declared type)``.
+
+    A comma-separated keyword matches a declared type when it equals the type
+    after trimming and case-folding (``Part_Of`` is ``part_of``; ``part of`` and
+    ``member of`` match nothing). A field of one keyword that matches is
+    rewritten to the declared spelling (``normalized``). A field of several
+    keywords keeps the declared types among them, in their order, and loses the
+    rest (``multi_type``); several spellings of one type are ``normalized``. A
+    field with no declared type becomes ``related_to`` when the list declares
+    it, and is otherwise dropped with its relation (``dropped``)."""
+    tokens = [token.strip() for token in keywords.split(",") if token.strip()]
+    declared_by_fold = {name.casefold(): name for name in types}
+    declared = list(
+        dict.fromkeys(
+            declared_by_fold[token.casefold()]
+            for token in tokens
+            if token.casefold() in declared_by_fold
+        )
+    )
+    if not declared:
+        if "related_to" in types:
+            return "related_to", "related_to"
+        return None, "dropped"
+    if len(declared) > 1 or any(t.casefold() not in declared_by_fold for t in tokens):
+        return ",".join(declared), "multi_type"
+    if keywords == declared[0]:
+        return keywords, None
+    return declared[0], "normalized"
+
+
+def check_chunk_relation_keywords(
+    maybe_edges: dict, types: Mapping[str, str], counts: Counter | None = None
+) -> dict:
+    """``check_relation_keywords`` applied to every record of one parsed
+    extraction result (``(source, target) -> [edge records]``). Returns a new
+    dict without the dropped records (and without a pair left with none); the
+    records are copied when their keywords change. ``counts`` gains one
+    ``checked`` per record and one per change (``RELATION_KEYWORD_COUNTS``)."""
+    checked: dict = {}
+    for edge_key, records in maybe_edges.items():
+        kept = []
+        for record in records:
+            keywords, change = check_relation_keywords(
+                str(record.get("keywords") or ""), types
+            )
+            if counts is not None:
+                counts["checked"] += 1
+                if change:
+                    counts[change] += 1
+            if keywords is None:
+                continue
+            if keywords != record.get("keywords"):
+                record = {**record, "keywords": keywords}
+            kept.append(record)
+        if kept:
+            checked[edge_key] = kept
+    return checked
+
+
+# Running totals of this process for /health, by where the check ran: new LLM
+# output ("extraction") or cached LLM output re-parsed by a knowledge rebuild
+# ("rebuild"), which re-counts records an extraction already counted.
+_RELATION_KEYWORD_TOTALS: dict[str, Counter] = {
+    "extraction": Counter(),
+    "rebuild": Counter(),
+}
+
+
+def record_relation_keyword_counts(stage: str, counts: Mapping[str, int]) -> None:
+    """Add one document's (or one rebuild's) keyword-check counts to the
+    running totals of ``stage`` (``extraction`` or ``rebuild``)."""
+    _RELATION_KEYWORD_TOTALS[stage].update(counts)
+
+
+def relation_keyword_totals() -> dict[str, dict[str, int]]:
+    """For ``/health``: the keyword-check counts of this process so far."""
+    return {
+        stage: {name: totals.get(name, 0) for name in RELATION_KEYWORD_COUNTS}
+        for stage, totals in _RELATION_KEYWORD_TOTALS.items()
+    }
+
+
+def relation_keyword_changes(counts: Mapping[str, int]) -> str | None:
+    """A log line's worth of the changes in ``counts``, or None when the check
+    changed nothing."""
+    changes = {name: counts.get(name, 0) for name in RELATION_KEYWORD_COUNTS[1:]}
+    if not any(changes.values()):
+        return None
+    detail = ", ".join(f"{name}={n}" for name, n in changes.items())
+    return (
+        f"{sum(changes.values())} of {counts.get('checked', 0)} relation keywords "
+        f"were not exactly one declared relationship type ({detail})"
+    )
 
 
 def profile_status(profile: Mapping[str, Any] | None) -> dict[str, int]:

@@ -221,6 +221,10 @@ class _Repairer:
         self.initialized = False
         self.finalized = False
 
+    def _build_global_config(self):
+        # No extraction hook and no entity-type profile.
+        return {}
+
     async def initialize_storages(self):
         self.initialized = True
 
@@ -1282,3 +1286,44 @@ async def test_namespace_scope_does_not_let_relation_block_entity_repair():
 
     assert repairer.entity_chunks.drops == 1
     assert repairer.relation_chunks.drops == 0
+
+
+async def test_attribution_re_applies_the_extraction_hook():
+    """Fork (extraction contract): a chunk is attributed to the names its
+    extraction stored. The extraction hook renamed the LLM's ``ScaleHeight`` to
+    the text's ``scale height``, the name the graph holds, so the repair runs
+    the hook on the chunk's re-parsed records with the chunk's text."""
+    from lightrag.kg_contract import kg_extraction_validator
+
+    class _HookedRepairer(_Repairer):
+        def _build_global_config(self):
+            return {"kg_extraction_validator": kg_extraction_validator}
+
+    chunks = {
+        "c1": {
+            "content": "The scale height of the thermosphere.",
+            "llm_cache_list": ["cache-1"],
+        }
+    }
+    cache = {
+        "cache-1": {
+            "cache_type": "extract",
+            "chunk_id": "c1",
+            "return": _extraction_payload(
+                entities=["ScaleHeight", "thermosphere"],
+                relationships=[("ScaleHeight", "thermosphere")],
+            ),
+            "create_time": 1,
+        }
+    }
+    graph = _Graph(["scale height", "thermosphere"], [("scale height", "thermosphere")])
+    repairer = _HookedRepairer(
+        docs={"doc-1": _Doc(["c1"])}, chunks=chunks, cache=cache, graph=graph
+    )
+
+    await _repair(repairer)
+
+    assert repairer.entity_chunks.data["scale height"]["chunk_ids"] == ["c1"]
+    assert repairer.relation_chunks.data[
+        make_relation_chunk_key("scale height", "thermosphere")
+    ]["chunk_ids"] == ["c1"]

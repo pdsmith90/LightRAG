@@ -1,6 +1,7 @@
 """/health shows, next to ``kg_contract_validator``, how many relation types and
 inverse names the active entity-type profile declares: 0 and 0 when the
-extraction contract is off."""
+extraction contract is off; and the running totals of the parse-time check of
+relation keywords against the declared list."""
 
 import pytest
 
@@ -54,4 +55,37 @@ def test_health_shows_the_contract_off_without_the_keys(monkeypatch):
     assert config["kg_contract_profile"] == {
         "relationship_types": 0,
         "relationship_inverses": 0,
+    }
+
+
+def test_health_shows_the_relation_keyword_totals(monkeypatch):
+    """The running totals of the parse-time keyword check, by stage."""
+    from collections import Counter
+
+    from lightrag import kg_contract
+
+    monkeypatch.setattr(
+        kg_contract,
+        "_RELATION_KEYWORD_TOTALS",
+        {
+            "extraction": Counter(checked=10, normalized=2, related_to=1),
+            "rebuild": Counter(checked=3, dropped=1),
+        },
+    )
+    config = _health_config(monkeypatch)
+    assert config["kg_contract_relation_keywords"] == {
+        "extraction": {
+            "checked": 10,
+            "normalized": 2,
+            "multi_type": 0,
+            "related_to": 1,
+            "dropped": 0,
+        },
+        "rebuild": {
+            "checked": 3,
+            "normalized": 0,
+            "multi_type": 0,
+            "related_to": 0,
+            "dropped": 1,
+        },
     }

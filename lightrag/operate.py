@@ -88,9 +88,14 @@ from lightrag.chunk_schema import (
     strip_internal_multimodal_markup_for_extraction,
 )
 from lightrag.kg_contract import (
+    check_chunk_relation_keywords,
     contract_system_prompt,
+    inverse_table,
     orient_edge_records,
+    record_relation_keyword_counts,
     relation_inverse_table,
+    relation_keyword_changes,
+    relation_types,
 )
 from lightrag.prompt import PROMPTS, resolve_entity_extraction_prompt_profile
 from lightrag.constants import (
@@ -1299,6 +1304,131 @@ async def _process_json_extraction_result(
     return dict(maybe_nodes), dict(maybe_edges)
 
 
+def _keyword_types(record: dict) -> frozenset[str]:
+    """The comma-separated keywords of one relation record, trimmed."""
+    return frozenset(
+        token.strip()
+        for token in str(record.get("keywords") or "").split(",")
+        if token.strip()
+    )
+
+
+async def _merge_extraction_pass(
+    maybe_nodes: dict,
+    maybe_edges: dict,
+    pass_nodes: dict,
+    pass_edges: dict,
+    relation_inverses: dict[str, str] | None = None,
+) -> None:
+    """Merge a later extraction pass of one chunk into the records gathered so
+    far, in place: the gleaning turn in ``extract_entities``, and each further
+    cached result of the chunk in the knowledge rebuild, which must store what
+    extraction stored. A name or pair the pass shares with the records so far
+    keeps whichever record list has the longer first description; a new one is
+    added.
+
+    Fork (extraction contract): with ``relationship_inverses`` in the profile
+    (``relation_inverses`` is its two-way table) direction is the payload, so a
+    pass that states a pair the other way round with the same type is a
+    correction: each earlier record of the reversed pair whose types the pass
+    restates is removed (the pair with it, when none is left). A reversed pair
+    of another type is a second relation and stays beside the first. A pass
+    that itself states both orders of a pair corrects neither. Without the table
+    the merge is the one extraction always made."""
+    if relation_inverses:
+        for (src, tgt), records in pass_edges.items():
+            reverse = (tgt, src)
+            if reverse in pass_edges or not maybe_edges.get(reverse):
+                continue
+            restated = frozenset().union(*(_keyword_types(r) for r in records))
+            kept = [
+                record
+                for record in maybe_edges[reverse]
+                if not (_keyword_types(record) and _keyword_types(record) <= restated)
+            ]
+            if len(kept) == len(maybe_edges[reverse]):
+                continue
+            if kept:
+                maybe_edges[reverse] = kept
+            else:
+                del maybe_edges[reverse]
+
+    for i, (entity_name, pass_entities) in enumerate(pass_nodes.items(), start=1):
+        if maybe_nodes.get(entity_name):
+            # Compare description lengths and keep the better one
+            original_desc_len = len(
+                maybe_nodes[entity_name][0].get("description", "") or ""
+            )
+            pass_desc_len = len(pass_entities[0].get("description", "") or "")
+            if pass_desc_len > original_desc_len:
+                maybe_nodes[entity_name] = list(pass_entities)
+            # Otherwise keep original version
+        else:
+            # New entity from this pass
+            maybe_nodes[entity_name] = list(pass_entities)
+        await _cooperative_yield(i, every=8)
+
+    for i, (edge_key, pass_edge_list) in enumerate(pass_edges.items(), start=1):
+        if maybe_edges.get(edge_key):
+            # Compare description lengths and keep the better one
+            original_desc_len = len(
+                maybe_edges[edge_key][0].get("description", "") or ""
+            )
+            pass_desc_len = len(pass_edge_list[0].get("description", "") or "")
+            if pass_desc_len > original_desc_len:
+                maybe_edges[edge_key] = list(pass_edge_list)
+            # Otherwise keep original version
+        else:
+            # New edge from this pass
+            maybe_edges[edge_key] = list(pass_edge_list)
+        await _cooperative_yield(i, every=8)
+
+
+def _validator_chunk_text(content: str) -> str:
+    """The text ``kg_extraction_validator`` receives for a chunk whose stored
+    content is ``content``: the EXTRACTION-VISIBLE text. The parser-internal
+    markup is stripped as for the extraction prompt, and this reproduces the
+    sanitize_text_for_encoding that use_llm_func_with_cache applies to the whole
+    prompt. The invariant is that the hook sees byte-for-byte what sat between
+    the ---Input Text--- fences of the prompt the provider received.
+    strip=False follows from it: the chunk is a FRAGMENT sitting inside those
+    fences, so its own boundary whitespace is interior to the prompt and stays
+    model-visible, while the wrapper's strip only trims the template's ends.
+    The knowledge rebuild rebuilds the same text from the stored chunk."""
+    return sanitize_text_for_encoding(
+        strip_internal_multimodal_markup_for_extraction(content), strip=False
+    )
+
+
+async def _run_kg_extraction_validator(
+    kg_extraction_validator: Callable,
+    chunk_key: str,
+    chunk_text: str,
+    maybe_nodes: dict,
+    maybe_edges: dict,
+) -> tuple[dict, dict]:
+    """Call the extraction-quality hook on one chunk's records and check what
+    it returns."""
+    validated = kg_extraction_validator(chunk_key, chunk_text, maybe_nodes, maybe_edges)
+    if inspect.isawaitable(validated):
+        validated = await validated
+    # Validate the shape before unpacking: a bare unpack accepts a
+    # two-key dict and silently binds its KEYS as maybe_nodes /
+    # maybe_edges, surfacing much later inside the merge as an
+    # unrelated-looking failure.
+    if (
+        not isinstance(validated, (tuple, list))
+        or len(validated) != 2
+        or not all(isinstance(part, dict) for part in validated)
+    ):
+        raise TypeError(
+            "kg_extraction_validator must return a (maybe_nodes, "
+            "maybe_edges) pair of dicts; got "
+            f"{type(validated).__name__} for chunk {chunk_key}"
+        )
+    return validated[0], validated[1]
+
+
 async def rebuild_knowledge_from_chunks(
     entities_to_rebuild: dict[str, list[str]],
     relationships_to_rebuild: dict[tuple[str, str], list[str]],
@@ -1410,6 +1540,19 @@ async def rebuild_knowledge_from_chunks(
     chunk_entities = {}  # chunk_id -> {entity_name: [entity_data]}
     chunk_relationships = {}  # chunk_id -> {(src, tgt): [relationship_data]}
 
+    # Each chunk's records must be the ones its extraction stored, so the
+    # re-parse repeats what extract_entities did after its parser: the
+    # extraction contract's keyword check (relationship_types), the merge of the
+    # gleaning pass into the first (_merge_extraction_pass, which knows the
+    # contract's direction corrections), then the extraction-quality hook on the
+    # merged records with the text the hook saw. A name the hook renamed is then
+    # filed under the name the graph holds; without the hook it would stay under
+    # the LLM's spelling and the rebuild would miss it.
+    kg_extraction_validator = global_config.get("kg_extraction_validator")
+    relationship_types = relation_types(global_config)
+    relation_inverses = relation_inverse_table(global_config)
+    relation_keyword_counts: Counter = Counter()
+
     for chunk_id, results in cached_results.items():
         try:
             # Handle multiple extraction results per chunk
@@ -1424,59 +1567,52 @@ async def rebuild_knowledge_from_chunks(
                     extraction_result=result[0],
                     timestamp=result[1],
                     chunk_data=chunk_data_by_id.get(chunk_id),
+                    relationship_types=relationship_types,
+                    relation_keyword_counts=relation_keyword_counts,
                 )
-                # Fork (ENTITY_NAME_FOLD): cached results carry the spelling the
-                # LLM wrote; file them under the canonical name as well.
+                if kg_extraction_validator is None:
+                    # Fork (ENTITY_NAME_FOLD): cached results carry the spelling
+                    # the LLM wrote; file them under the canonical name as well.
+                    entities, relationships = alias_chunk_result(
+                        entities, relationships
+                    )
+
+                # Merge entities and relationships from this extraction result:
+                # keep the record with the longer description for a name or
+                # pair, as extraction merges its gleaning pass.
+                await _merge_extraction_pass(
+                    chunk_entities[chunk_id],
+                    chunk_relationships[chunk_id],
+                    entities,
+                    relationships,
+                    relation_inverses,
+                )
+
+            if kg_extraction_validator is not None:
+                # The hook judged the merged records of the chunk, before the
+                # fold; so does the rebuild. Without the chunk's text the hook
+                # cannot run, and its records are not used.
+                chunk_data = chunk_data_by_id.get(chunk_id) or {}
+                if not isinstance(chunk_data.get("content"), str):
+                    raise ValueError(
+                        "chunk text not available for kg_extraction_validator"
+                    )
+                entities, relationships = await _run_kg_extraction_validator(
+                    kg_extraction_validator,
+                    chunk_id,
+                    _validator_chunk_text(chunk_data["content"]),
+                    dict(chunk_entities.pop(chunk_id)),
+                    dict(chunk_relationships.pop(chunk_id)),
+                )
                 entities, relationships = alias_chunk_result(entities, relationships)
-
-                # Merge entities and relationships from this extraction result
-                # Compare description lengths and keep the better version for the same chunk_id
-                for entity_name, entity_list in entities.items():
-                    if entity_name not in chunk_entities[chunk_id]:
-                        # New entity for this chunk_id
-                        chunk_entities[chunk_id][entity_name].extend(entity_list)
-                    elif len(chunk_entities[chunk_id][entity_name]) == 0:
-                        # Empty list, add the new entities
-                        chunk_entities[chunk_id][entity_name].extend(entity_list)
-                    else:
-                        # Compare description lengths and keep the better one
-                        existing_desc_len = len(
-                            chunk_entities[chunk_id][entity_name][0].get(
-                                "description", ""
-                            )
-                            or ""
-                        )
-                        new_desc_len = len(entity_list[0].get("description", "") or "")
-
-                        if new_desc_len > existing_desc_len:
-                            # Replace with the new entity that has longer description
-                            chunk_entities[chunk_id][entity_name] = list(entity_list)
-                        # Otherwise keep existing version
-
-                # Compare description lengths and keep the better version for the same chunk_id
-                for rel_key, rel_list in relationships.items():
-                    if rel_key not in chunk_relationships[chunk_id]:
-                        # New relationship for this chunk_id
-                        chunk_relationships[chunk_id][rel_key].extend(rel_list)
-                    elif len(chunk_relationships[chunk_id][rel_key]) == 0:
-                        # Empty list, add the new relationships
-                        chunk_relationships[chunk_id][rel_key].extend(rel_list)
-                    else:
-                        # Compare description lengths and keep the better one
-                        existing_desc_len = len(
-                            chunk_relationships[chunk_id][rel_key][0].get(
-                                "description", ""
-                            )
-                            or ""
-                        )
-                        new_desc_len = len(rel_list[0].get("description", "") or "")
-
-                        if new_desc_len > existing_desc_len:
-                            # Replace with the new relationship that has longer description
-                            chunk_relationships[chunk_id][rel_key] = list(rel_list)
-                        # Otherwise keep existing version
+                chunk_entities[chunk_id] = entities
+                chunk_relationships[chunk_id] = relationships
 
         except Exception as e:
+            if kg_extraction_validator is not None:
+                # Records the hook has not seen must not reach the graph.
+                chunk_entities.pop(chunk_id, None)
+                chunk_relationships.pop(chunk_id, None)
             report.unusable_cache_chunk_ids.add(chunk_id)
             status_message = (
                 f"Failed to parse cached extraction result for chunk {chunk_id}: {e}"
@@ -1484,6 +1620,16 @@ async def rebuild_knowledge_from_chunks(
             logger.warning(status_message)
             status_logger.log(status_message)
             continue
+
+    if relation_keyword_counts:
+        record_relation_keyword_counts("rebuild", relation_keyword_counts)
+        changes = relation_keyword_changes(relation_keyword_counts)
+        if changes is not None:
+            status_message = (
+                f"KG rebuild: {changes} in the cached extractions it re-parsed"
+            )
+            logger.warning(status_message)
+            status_logger.log(status_message)
 
     # Get max async tasks limit from global_config for semaphore control
     graph_max_async = global_config.get("llm_model_max_async", 4) * 2
@@ -1879,6 +2025,8 @@ async def _rebuild_from_extraction_result(
     chunk_id: str,
     timestamp: int,
     chunk_data: dict[str, Any] | None = None,
+    relationship_types: dict[str, str] | None = None,
+    relation_keyword_counts: Counter | None = None,
 ) -> tuple[dict, dict]:
     """Parse cached extraction result using the same logic as extract_entities.
 
@@ -1890,10 +2038,32 @@ async def _rebuild_from_extraction_result(
         text_chunks_storage: Text chunks storage to get chunk data
         extraction_result: The cached LLM extraction result
         chunk_id: The chunk ID for source tracking
+        relationship_types: Fork (extraction contract): the active profile's
+            relation list; the relations' keywords are checked against it as
+            extraction checks them (``check_chunk_relation_keywords``), and the
+            changes counted in ``relation_keyword_counts``. None: no check.
 
     Returns:
         Tuple of (entities_dict, relationships_dict)
     """
+    nodes, edges = await _parse_cached_extraction_result(
+        text_chunks_storage, extraction_result, chunk_id, timestamp, chunk_data
+    )
+    if relationship_types:
+        edges = check_chunk_relation_keywords(
+            edges, relationship_types, relation_keyword_counts
+        )
+    return nodes, edges
+
+
+async def _parse_cached_extraction_result(
+    text_chunks_storage: BaseKVStorage,
+    extraction_result: str,
+    chunk_id: str,
+    timestamp: int,
+    chunk_data: dict[str, Any] | None,
+) -> tuple[dict, dict]:
+    """The parser half of ``_rebuild_from_extraction_result``."""
 
     # Get chunk data for file_path from storage
     if chunk_data is None:
@@ -4292,6 +4462,14 @@ async def extract_entities(
     _configure_entity_type_allowlist(global_config, entity_types_guidance)
     _configure_symbol_entity_filter(global_config)
     _configure_junk_entity_filter(global_config)
+    # Fork (extraction contract): with relationship_types in the profile every
+    # parsed relation's keywords are checked against the list (first pass and
+    # gleaning, before they merge), and the changes are counted for the document;
+    # with relationship_inverses a gleaning turn can correct a direction
+    # (_merge_extraction_pass). Both None leave extraction as it was.
+    relationship_types = prompt_profile.get("relationship_types") or None
+    relation_inverses = inverse_table(prompt_profile.get("relationship_inverses"))
+    relation_keyword_counts: Counter = Counter()
 
     max_total_records = global_config["entity_extract_max_records"]
     max_entity_records = global_config["entity_extract_max_entities"]
@@ -4527,6 +4705,10 @@ async def extract_entities(
                 tuple_delimiter=context_base["tuple_delimiter"],
                 completion_delimiter=context_base["completion_delimiter"],
             )
+        if relationship_types:
+            maybe_edges = check_chunk_relation_keywords(
+                maybe_edges, relationship_types, relation_keyword_counts
+            )
 
         # Process additional gleaning results only 1 time when entity_extract_max_gleaning is greater than zero.
         run_gleaning = entity_extract_max_gleaning > 0
@@ -4603,44 +4785,15 @@ async def extract_entities(
                     completion_delimiter=context_base["completion_delimiter"],
                 )
 
+            if relationship_types:
+                glean_edges = check_chunk_relation_keywords(
+                    glean_edges, relationship_types, relation_keyword_counts
+                )
+
             # Merge results - compare description lengths to choose better version
-            for i, (entity_name, glean_entities) in enumerate(
-                glean_nodes.items(), start=1
-            ):
-                if entity_name in maybe_nodes:
-                    # Compare description lengths and keep the better one
-                    original_desc_len = len(
-                        maybe_nodes[entity_name][0].get("description", "") or ""
-                    )
-                    glean_desc_len = len(glean_entities[0].get("description", "") or "")
-
-                    if glean_desc_len > original_desc_len:
-                        maybe_nodes[entity_name] = list(glean_entities)
-                    # Otherwise keep original version
-                else:
-                    # New entity from gleaning stage
-                    maybe_nodes[entity_name] = list(glean_entities)
-                await _cooperative_yield(i, every=8)
-
-            for i, (edge_key, glean_edge_list) in enumerate(
-                glean_edges.items(), start=1
-            ):
-                if edge_key in maybe_edges:
-                    # Compare description lengths and keep the better one
-                    original_desc_len = len(
-                        maybe_edges[edge_key][0].get("description", "") or ""
-                    )
-                    glean_desc_len = len(
-                        glean_edge_list[0].get("description", "") or ""
-                    )
-
-                    if glean_desc_len > original_desc_len:
-                        maybe_edges[edge_key] = list(glean_edge_list)
-                    # Otherwise keep original version
-                else:
-                    # New edge from gleaning stage
-                    maybe_edges[edge_key] = list(glean_edge_list)
-                await _cooperative_yield(i, every=8)
+            await _merge_extraction_pass(
+                maybe_nodes, maybe_edges, glean_nodes, glean_edges, relation_inverses
+            )
 
         # No end-of-chunk cache-key attach here, by design. Each extract cache
         # row is attached to this chunk BEFORE it is written, inside
@@ -4665,39 +4818,15 @@ async def extract_entities(
         # (multimodal_entity, rejected_entity) edges dangling, so the merge's
         # endpoint upsert would re-create the very entities the hook rejected.
         if kg_extraction_validator is not None:
-            validated = kg_extraction_validator(
+            maybe_nodes, maybe_edges = await _run_kg_extraction_validator(
+                kg_extraction_validator,
                 chunk_key,
-                # The EXTRACTION-VISIBLE text: `content` already has the
-                # parser-internal markup stripped, and this reproduces the
-                # sanitize_text_for_encoding that use_llm_func_with_cache
-                # applies to the whole prompt. The invariant is that the hook
-                # sees byte-for-byte what sat between the ---Input Text---
-                # fences of the prompt the provider received. strip=False
-                # follows from it: the chunk is a FRAGMENT sitting inside those
-                # fences, so its own boundary whitespace is interior to the
-                # prompt and stays model-visible, while the wrapper's strip only
-                # trims the template's ends.
-                sanitize_text_for_encoding(content, strip=False),
+                # The EXTRACTION-VISIBLE text (see _validator_chunk_text); the
+                # knowledge rebuild hands the hook the same text.
+                _validator_chunk_text(chunk_dp["content"]),
                 maybe_nodes,
                 maybe_edges,
             )
-            if inspect.isawaitable(validated):
-                validated = await validated
-            # Validate the shape before unpacking: a bare unpack accepts a
-            # two-key dict and silently binds its KEYS as maybe_nodes /
-            # maybe_edges, surfacing much later inside the merge as an
-            # unrelated-looking failure.
-            if (
-                not isinstance(validated, (tuple, list))
-                or len(validated) != 2
-                or not all(isinstance(part, dict) for part in validated)
-            ):
-                raise TypeError(
-                    "kg_extraction_validator must return a (maybe_nodes, "
-                    "maybe_edges) pair of dicts; got "
-                    f"{type(validated).__name__} for chunk {chunk_key}"
-                )
-            maybe_nodes, maybe_edges = validated
 
         # Inject multimodal entity + associations for drawing/table/equation
         # chunks. Placed inside the chunk's
@@ -4826,6 +4955,27 @@ async def extract_entities(
         logger.warning(cache_skip_message)
         status_logger.log(cache_skip_message)
 
+    def _publish_relation_keyword_summary() -> None:
+        """Fork (extraction contract): one warning per document when the
+        keyword check changed anything, and the counts into the running totals
+        /health shows. Called from the same ``finally`` as the summaries above,
+        under the same rules. A no-op without ``relationship_types``."""
+        if not relation_keyword_counts:
+            return
+        record_relation_keyword_counts("extraction", relation_keyword_counts)
+        changes = relation_keyword_changes(relation_keyword_counts)
+        if changes is None:
+            return
+        first_chunk = ordered_chunks[0][1]
+        message = (
+            f"Warning: {changes} in "
+            f"{first_chunk.get('file_path', 'unknown_source')} "
+            f"({first_chunk.get('full_doc_id', ordered_chunks[0][0])}); the "
+            "extraction request schema is not keeping keywords on the list"
+        )
+        logger.warning(message)
+        status_logger.log(message)
+
     # Get max async tasks limit from global_config
     chunk_max_async = global_config.get("llm_model_max_async", 4)
     semaphore = asyncio.Semaphore(chunk_max_async)
@@ -4925,6 +5075,7 @@ async def extract_entities(
         # already been recorded. Await-free, called exactly once.
         _publish_truncation_summary()
         _publish_cache_skip_summary()
+        _publish_relation_keyword_summary()
 
     # Fork (ENTITY_NAME_FOLD): canonical spellings before the results reach the
     # write-ahead anchors and the merge, which must name the same nodes.

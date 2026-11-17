@@ -34,9 +34,13 @@ from typing import Any
 from dotenv import load_dotenv
 
 from lightrag.base import CURSOR_END, CURSOR_START, DocStatus
-from lightrag.constants import RELATION_NO_EVIDENCE_SOURCE_IDS
+from lightrag.constants import (
+    DEFAULT_KG_CONTRACT_VALIDATOR,
+    RELATION_NO_EVIDENCE_SOURCE_IDS,
+)
 from lightrag.utils import (
     EmbeddingFunc,
+    get_env_value,
     has_chunk_tracking_row,
     logger,
     make_relation_chunk_key,
@@ -842,10 +846,22 @@ async def _accumulate_cached_attribution(
     rag,
     disk: _DiskPlan,
 ) -> tuple[int, int, int]:
+    from lightrag.kg_contract import relation_inverse_table, relation_types
     from lightrag.operate import (
         _get_cached_extraction_results,
+        _merge_extraction_pass,
         _rebuild_from_extraction_result,
+        _run_kg_extraction_validator,
+        _validator_chunk_text,
     )
+
+    # A chunk's records are the ones its extraction stored: the extraction
+    # contract's keyword check, the merge of its passes and the extraction-
+    # quality hook are applied as the knowledge rebuild applies them.
+    global_config = rag._build_global_config()
+    kg_extraction_validator = global_config.get("kg_extraction_validator")
+    relationship_types = relation_types(global_config)
+    relation_inverses = relation_inverse_table(global_config)
 
     with_cache = 0
     with_attribution = 0
@@ -861,15 +877,20 @@ async def _accumulate_cached_attribution(
         )
         for chunk_id, results in cached_results.items():
             parsed_any = False
-            attributed_any = False
+            entities: dict = {}
+            relationships: dict = {}
             for extraction_result, timestamp in results:
                 try:
-                    entities, relationships = await _rebuild_from_extraction_result(
+                    (
+                        result_entities,
+                        result_relationships,
+                    ) = await _rebuild_from_extraction_result(
                         text_chunks_storage=rag.text_chunks,
                         chunk_id=chunk_id,
                         extraction_result=extraction_result,
                         timestamp=timestamp,
                         chunk_data=chunk_data_by_id.get(chunk_id),
+                        relationship_types=relationship_types,
                     )
                 except Exception as exc:
                     logger.warning(
@@ -878,19 +899,44 @@ async def _accumulate_cached_attribution(
                     )
                     continue
                 parsed_any = True
-                if entities or relationships:
-                    attributed_any = True
-                for entity_name in entities:
-                    if disk.object_exists("entity_chunks", entity_name):
-                        disk.add_row("entity_chunks", entity_name, [chunk_id])
-                for src, tgt in relationships:
-                    storage_key = make_relation_chunk_key(src, tgt)
-                    if disk.object_exists("relation_chunks", storage_key):
-                        disk.add_row("relation_chunks", storage_key, [chunk_id])
+                await _merge_extraction_pass(
+                    entities,
+                    relationships,
+                    result_entities,
+                    result_relationships,
+                    relation_inverses,
+                )
+            if parsed_any and kg_extraction_validator is not None:
+                try:
+                    content = (chunk_data_by_id.get(chunk_id) or {}).get("content")
+                    if not isinstance(content, str):
+                        raise ValueError(
+                            "chunk text not available for kg_extraction_validator"
+                        )
+                    entities, relationships = await _run_kg_extraction_validator(
+                        kg_extraction_validator,
+                        chunk_id,
+                        _validator_chunk_text(content),
+                        entities,
+                        relationships,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Chunk tracking repair: kg_extraction_validator failed "
+                        f"on chunk {chunk_id}; no attribution from it: {exc}"
+                    )
+                    entities, relationships = {}, {}
             if parsed_any:
                 with_cache += 1
-            if attributed_any:
+            if entities or relationships:
                 with_attribution += 1
+            for entity_name in entities:
+                if disk.object_exists("entity_chunks", entity_name):
+                    disk.add_row("entity_chunks", entity_name, [chunk_id])
+            for src, tgt in relationships:
+                storage_key = make_relation_chunk_key(src, tgt)
+                if disk.object_exists("relation_chunks", storage_key):
+                    disk.add_row("relation_chunks", storage_key, [chunk_id])
     return with_cache, with_attribution, disk.count("chunks") - with_cache
 
 
@@ -1044,6 +1090,7 @@ def _print_run_status(message: str) -> None:
 
 async def _build_rag():
     from lightrag import LightRAG
+    from lightrag.kg_contract import kg_extraction_validator
 
     async def _noop_llm(*_args, **_kwargs) -> str:
         raise RuntimeError("chunk_tracking_repair never calls the LLM")
@@ -1052,6 +1099,15 @@ async def _build_rag():
         raise RuntimeError("chunk_tracking_repair never embeds")
 
     return LightRAG(
+        # The server's extraction hook (KG_CONTRACT_VALIDATOR) decided which
+        # records each chunk stored; attribution re-applies it.
+        **(
+            {"kg_extraction_validator": kg_extraction_validator}
+            if get_env_value(
+                "KG_CONTRACT_VALIDATOR", DEFAULT_KG_CONTRACT_VALIDATOR, bool
+            )
+            else {}
+        ),
         working_dir=os.getenv("WORKING_DIR", "./rag_storage"),
         workspace=os.getenv("WORKSPACE", ""),
         kv_storage=os.getenv("LIGHTRAG_KV_STORAGE", "JsonKVStorage"),
