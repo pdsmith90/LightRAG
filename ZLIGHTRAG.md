@@ -29,6 +29,8 @@ starting with [README.md](./README.md), applies as written.
 | [Strict entity types](#strict-entity-types) | `ENTITY_TYPE_STRICT` | `false` |
 | [Symbol entity names](#symbol-entity-names) | `DROP_SYMBOL_ENTITIES` | `false` |
 | [Apparatus entity names](#apparatus-entity-names) | `DROP_JUNK_ENTITIES` | `false` |
+| [Extraction contract: closed relation types](#extraction-contract-closed-relation-types) | `relationship_types` in the `ENTITY_TYPE_PROMPT_FILE` profile; schema via `python -m lightrag.kg_contract --schema` | absent (off) |
+| [Extraction contract validator](#extraction-contract-validator) | `KG_CONTRACT_VALIDATOR` | `false` |
 | [Entity name fold](#entity-name-fold) | `ENTITY_NAME_FOLD`; lists and aliases via `ENTITY_NAME_FOLD_LISTS`, `ENTITY_NAME_ALIASES` | `false` |
 | [Sidecar relations](#sidecar-relations) | `SIDECAR_RELATIONS` | `all` (upstream behaviour) |
 | [Paper filter in the graph view](#paper-filter-in-the-graph-view) | none; reference lists via `ZOTERO_REFERENCES` | always active |
@@ -247,14 +249,77 @@ characters are left to `DROP_SYMBOL_ENTITIES`. Applied as each chunk's extractio
 is parsed, so existing apparatus entities stay until deleted. Reported in the `/health`
 configuration. Off by default.
 
+### Extraction contract: closed relation types
+
+An entity-type profile (`ENTITY_TYPE_PROMPT_FILE`) may declare `relationship_types`, a
+mapping of relation type name to definition in prompt order (`lightrag/kg_contract.py`).
+The names are lower-case snake case; each definition is one line, its whitespace
+collapsed. A profile that declares it switches the contract on:
+
+- the list is appended to the profile's entity-type guidance, one `name = definition`
+  line per type (never `- name:`, which `ENTITY_TYPE_STRICT` would read as an entity
+  type), followed by a read-it-back check of each relation's direction, and a sentence
+  that prefers `related_to` to a forced type when the list has `related_to`. The guidance
+  goes into both the system and the user prompt, as before;
+- the JSON extraction system prompt (`SYSTEM_PROMPT_EDITS`) follows the profile's naming
+  rule and the text's spelling instead of title case, says never to glue words into one
+  identifier, takes exactly one listed type in `keywords` instead of free keywords, makes
+  relations directed, and lists an entity only when the text states a relation for it.
+  The gleaning prompt carries none of these rules and is unchanged; it is sent with the
+  same system prompt. A base template that no longer holds a replaced passage the
+  expected number of times fails startup rather than sending a half-edited prompt.
+
+The contract needs `ENTITY_EXTRACTION_USE_JSON=true`; in text mode a profile with
+`relationship_types` is refused at startup. A profile without the key sends exactly the
+prompts it sent before (`tests/extraction/test_kg_contract.py`). The extraction cache keys
+on the prompt, so switching the contract on re-extracts instead of reusing cached results.
+
+The JSON schema that constrains the extraction requests is set by the process in front
+of the LLM server, not here. `python -m lightrag.kg_contract --schema --profile PATH`
+prints it for a profile: the entity types its guidance lists, read as `ENTITY_TYPE_STRICT`
+reads them and in order, plus `Other`, and the profile's relation types, both as enums.
+A sample profile for a geoscience paper corpus, with relation list v3.1 (17 types, each
+defined by what its source and target must be), is
+`prompts/samples/entity_type_prompt.kg_contract.sample.yml`.
+
+### Extraction contract validator
+
+With `KG_CONTRACT_VALIDATOR=true` the API server passes
+`lightrag.kg_contract.kg_extraction_validator` as `kg_extraction_validator`, the hook that
+sees each chunk's parsed records before the merge (see *Extraction Quality Hook* in
+`docs/ProgramingWithCore.md`). It runs after `DROP_SYMBOL_ENTITIES` and
+`DROP_JUNK_ENTITIES` and does not need the relation list. Per chunk it
+
+- drops a name that is mathematical notation of three or more characters (`x_k`, `q_n(x)`,
+  `f(x)`, `x1*`, TeX characters) and every relation that names it; `L1`, `J2`, `C20`,
+  `F10.7` and `P(Y)` stay;
+- keeps a name glued from several words (`MetOp`) when the chunk text contains it, renames
+  it to the text's spelling of its words when the text has them (`ScaleHeight` to
+  `scale height`), drops it when a part is one or two characters, a Greek-letter or
+  accent word, carries a digit or is an `et al.` (`PhiTau`, `p_y_2`), and otherwise splits
+  it into lower-case words; relations follow the rename;
+- drops a relation whose endpoint is not an extracted entity of the chunk and is not in
+  the chunk text either, or is notation; a grounded undeclared endpoint is kept, and the
+  merge creates its node as before;
+- drops a relation whose two endpoints a rename joined.
+
+Names are looked up in the chunk text after the same normalization extraction applies to
+names, case-folded. The rename and the grounding depend on the chunk's text, so one name
+can be kept in one chunk and renamed in another. The knowledge rebuild after a deletion
+re-parses cached extractions without the hook (true of any validator), so there a renamed
+name's records stay under the spelling the LLM wrote and do not reach the renamed node.
+Reported in the `/health` configuration.
+Off by default.
+
 ### Entity name fold
 
 With `ENTITY_NAME_FOLD=true`, every entity name an extraction produces is mapped to the
 spelling the graph already uses for the same fold key, or becomes that spelling when
 the key is new (`lightrag/entity_name_fold.py`). The extraction LLM spells one entity
 several ways across papers, and the merge keys on the exact string, so without it a
-concept's relations scatter over several nodes. The map is read from the Postgres/AGE
-graph in the background after the storages initialise (computed in a worker thread, so
+concept's relations scatter over several nodes. The map is read from the PostgreSQL
+graph (`PGGraphStorage`, Apache AGE, or `PGTableGraphStorage`, plain tables, for its own
+workspace and namespace) in the background after the storages initialise (computed in a worker thread, so
 the server keeps answering) until `ENTITY_NAME_FOLD armed: N name keys, A aliases, lists
 <source>, from M nodes in Xs` is logged. Extraction and the deletion and kept-summary
 rebuilds wait for it, for at most 300 s after startup; past that an error is logged and
@@ -564,10 +629,13 @@ The unit tests for these changes, including the upstream tests the branch modifi
 are marked `offline`, so upstream's
 [.github/workflows/tests.yml](./.github/workflows/tests.yml) runs them; on this branch it
 also triggers on pushes and pull requests to `zlightrag`, as does upstream's
-[.github/workflows/linting.yaml](./.github/workflows/linting.yaml). The exception is the Apache
+[.github/workflows/linting.yaml](./.github/workflows/linting.yaml). The exceptions are the Apache
 AGE integration test for the edge removal,
 `tests/kg/postgres_impl/test_postgres_remove_edges_age.py`, which needs
-`--run-integration` and a live AGE server; no workflow runs it.
+`--run-integration` and a live AGE server, and the fold map build on the table graph
+storage, `tests/kg/pgtable_impl/test_pgtable_fold_map_smoke.py`, marked `pg_smoke` like
+the storage's other live-PostgreSQL tests, which needs `--run-integration` and
+`POSTGRES_PASSWORD`. No workflow on this branch runs either.
 
 ## `zotero-toolkit/`
 
