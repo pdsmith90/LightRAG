@@ -103,6 +103,9 @@ DEFAULT_DROP_SYMBOL_ENTITIES = False
 # Fork: drop extracted bibliography/document apparatus entities (cited authors,
 # citations, journal names, numbered labels, placeholder words), and their relations.
 DEFAULT_DROP_JUNK_ENTITIES = False
+# Fork: the API server passes the extraction contract's validator
+# (lightrag/kg_contract.py) as kg_extraction_validator.
+DEFAULT_KG_CONTRACT_VALIDATOR = False
 # Fork: fold extracted entity names that differ only in case/spacing/punctuation
 # onto the spelling the graph already uses.
 DEFAULT_ENTITY_NAME_FOLD = False

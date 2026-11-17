@@ -43,6 +43,7 @@ from lightrag.constants import (
     DEFAULT_ENTITY_TYPE_STRICT,
     DEFAULT_DROP_SYMBOL_ENTITIES,
     DEFAULT_DROP_JUNK_ENTITIES,
+    DEFAULT_KG_CONTRACT_VALIDATOR,
     DEFAULT_ENTITY_NAME_FOLD,
     DEFAULT_ENTITY_NAME_FOLD_LISTS,
     DEFAULT_ENTITY_NAME_ALIASES,
@@ -997,6 +998,9 @@ def parse_args() -> argparse.Namespace:
     )
     args.drop_junk_entities = get_env_value(
         "DROP_JUNK_ENTITIES", DEFAULT_DROP_JUNK_ENTITIES, bool
+    )
+    args.kg_contract_validator = get_env_value(
+        "KG_CONTRACT_VALIDATOR", DEFAULT_KG_CONTRACT_VALIDATOR, bool
     )
     args.entity_name_fold = get_env_value(
         "ENTITY_NAME_FOLD", DEFAULT_ENTITY_NAME_FOLD, bool
