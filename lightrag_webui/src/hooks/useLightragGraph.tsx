@@ -530,7 +530,8 @@ const useLightrangeGraph = () => {
             return
           }
 
-          if (result?.is_truncated) {
+          // A paper map has its own wording for the papers it left out (the summary below).
+          if (result?.is_truncated && result.paper?.mode !== 'map') {
             toast.info(t('graphPanel.dataIsTruncated', 'Graph data is truncated to Max Nodes'))
           }
           if (result?.paper) {

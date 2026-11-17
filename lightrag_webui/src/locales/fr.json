@@ -427,6 +427,7 @@
       "mapSummary": "Carte des articles : {{nodes}} articles trouvés et affichés ({{hop1}} à un pas, {{hop2}} à deux pas)",
       "mapSummaryLimited": "Carte des articles : {{found}} articles trouvés, {{nodes}} affichés (limite {{limit}} ; {{hop1}} à un pas, {{hop2}} à deux pas)",
       "mapShowMore": "Afficher plus d'articles ({{shown}} sur {{found}}, prochaine limite {{limit}})",
+      "mapMoreSuffix": ". « Afficher plus d'articles » relève la limite.",
       "someNotInStructure": "{{count}} des articles choisis ne sont pas dans la structure des citations",
       "mapLinksThinned": "{{shown}} liens sur {{found}} affichés : les plus forts de chaque article",
       "mapUnavailable": "Ce serveur n'a pas de carte des articles (sa structure de citations est désactivée ou absente). Affichage du graphe des articles à la place",

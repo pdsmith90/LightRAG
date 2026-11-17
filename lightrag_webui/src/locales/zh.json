@@ -427,6 +427,7 @@
       "mapSummary": "论文地图：找到并显示 {{nodes}} 篇论文（一步 {{hop1}} 篇，两步 {{hop2}} 篇）",
       "mapSummaryLimited": "论文地图：找到 {{found}} 篇论文，显示 {{nodes}} 篇（上限 {{limit}}；一步 {{hop1}} 篇，两步 {{hop2}} 篇）",
       "mapShowMore": "显示更多论文（共 {{found}} 篇，已显示 {{shown}} 篇，下一上限 {{limit}}）",
+      "mapMoreSuffix": "。点击“显示更多论文”可提高上限。",
       "someNotInStructure": "所选论文中有 {{count}} 篇不在引用结构中",
       "mapLinksThinned": "显示 {{found}} 条链接中的 {{shown}} 条：每篇论文最强的链接",
       "mapUnavailable": "此服务器没有论文地图（论文结构未启用或缺失），改为显示论文自身的图谱",

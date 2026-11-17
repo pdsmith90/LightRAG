@@ -427,6 +427,7 @@
       "mapSummary": "論文地圖：找到並顯示 {{nodes}} 篇論文（一步 {{hop1}} 篇，兩步 {{hop2}} 篇）",
       "mapSummaryLimited": "論文地圖：找到 {{found}} 篇論文，顯示 {{nodes}} 篇（上限 {{limit}}；一步 {{hop1}} 篇，兩步 {{hop2}} 篇）",
       "mapShowMore": "顯示更多論文（共 {{found}} 篇，已顯示 {{shown}} 篇，下一上限 {{limit}}）",
+      "mapMoreSuffix": "。點選「顯示更多論文」可提高上限。",
       "someNotInStructure": "所選論文中有 {{count}} 篇不在引用結構中",
       "mapLinksThinned": "顯示 {{found}} 條連結中的 {{shown}} 條：每篇論文最強的連結",
       "mapUnavailable": "此伺服器沒有論文地圖（論文結構未啟用或缺失），改為顯示論文本身的圖譜",

@@ -427,6 +427,7 @@
       "mapSummary": "Peta makalah: {{nodes}} makalah ditemukan dan ditampilkan ({{hop1}} satu langkah, {{hop2}} dua langkah)",
       "mapSummaryLimited": "Peta makalah: {{found}} makalah ditemukan, {{nodes}} ditampilkan (batas {{limit}}; {{hop1}} satu langkah, {{hop2}} dua langkah)",
       "mapShowMore": "Tampilkan lebih banyak makalah ({{shown}} dari {{found}}, batas berikutnya {{limit}})",
+      "mapMoreSuffix": ". “Tampilkan lebih banyak makalah” menaikkan batas.",
       "someNotInStructure": "{{count}} makalah terpilih tidak ada dalam struktur sitasi",
       "mapLinksThinned": "menampilkan {{shown}} dari {{found}} tautan: yang terkuat untuk setiap makalah",
       "mapUnavailable": "Server ini tidak memiliki peta makalah (struktur makalahnya mati atau tidak ada). Menampilkan graf makalah itu sendiri",

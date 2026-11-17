@@ -8,6 +8,7 @@ import { EdgeType, NodeType } from '@/hooks/useLightragGraph'
 import useIsDarkMode from '@/hooks/useIsDarkMode'
 import * as Constants from '@/lib/constants'
 import { edgeEventsActive } from '@/lib/paperFilter'
+import { mapLinkEvents } from '@/lib/mapLinkPick'
 
 import { useSettingsStore } from '@/stores/settings'
 import { useGraphStore } from '@/stores/graph'
@@ -308,20 +309,27 @@ const GraphControl = ({ disableHoverEffect }: { disableHoverEffect?: boolean }) 
         setSelectedEdge(event.edge)
         setSelectedNode(null)
       }
-      events.enterEdge = (event: EdgeEvent) => {
-        if (!isButtonPressed(event.event.original)) {
-          setFocusedEdge(event.edge)
+      if (paperMap) {
+        // A map's links are one or two pixels wide: sigma's own picking would need a click
+        // exactly on the line, so the map picks the link nearest to the pointer instead
+        // (hover highlights it, a click on the stage selects it).
+        Object.assign(events, mapLinkEvents(sigma, () => useGraphStore.getState()))
+      } else {
+        events.enterEdge = (event: EdgeEvent) => {
+          if (!isButtonPressed(event.event.original)) {
+            setFocusedEdge(event.edge)
+          }
         }
-      }
-      events.leaveEdge = (event: EdgeEvent) => {
-        if (!isButtonPressed(event.event.original)) {
-          setFocusedEdge(null)
+        events.leaveEdge = (event: EdgeEvent) => {
+          if (!isButtonPressed(event.event.original)) {
+            setFocusedEdge(null)
+          }
         }
       }
     }
 
     registerEvents(events)
-  }, [registerEvents, effectiveEdgeEvents, sigma])
+  }, [registerEvents, effectiveEdgeEvents, paperMap, sigma])
 
   /**
    * When edge size settings change, recalculate edge sizes.

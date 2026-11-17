@@ -453,6 +453,7 @@
       "mapSummary": "Paper map: {{nodes}} papers found and shown ({{hop1}} one step away, {{hop2}} two steps away)",
       "mapSummaryLimited": "Paper map: {{found}} papers found, {{nodes}} shown (limit {{limit}}; {{hop1}} one step away, {{hop2}} two steps away)",
       "mapShowMore": "Show more papers ({{shown}} of {{found}} shown, next limit {{limit}})",
+      "mapMoreSuffix": ". \"Show more papers\" raises the limit.",
       "someNotInStructure": "{{count}} of the selected papers are not in the paper structure",
       "mapLinksThinned": "{{shown}} of the {{found}} links between them shown, the strongest for each paper",
       "mapUnavailable": "This server has no paper map (its paper structure is off or missing). Showing the papers' own graph instead",

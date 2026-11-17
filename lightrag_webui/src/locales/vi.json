@@ -427,6 +427,7 @@
       "mapSummary": "Bản đồ bài báo: tìm thấy và hiển thị {{nodes}} bài ({{hop1}} cách một bước, {{hop2}} cách hai bước)",
       "mapSummaryLimited": "Bản đồ bài báo: tìm thấy {{found}} bài, hiển thị {{nodes}} (giới hạn {{limit}}; {{hop1}} cách một bước, {{hop2}} cách hai bước)",
       "mapShowMore": "Hiển thị thêm bài ({{shown}} trên {{found}}, giới hạn tiếp theo {{limit}})",
+      "mapMoreSuffix": ". “Hiển thị thêm bài” nâng giới hạn.",
       "someNotInStructure": "{{count}} bài đã chọn không có trong cấu trúc trích dẫn",
       "mapLinksThinned": "hiển thị {{shown}} trong {{found}} liên kết: những liên kết mạnh nhất của mỗi bài",
       "mapUnavailable": "Máy chủ này không có bản đồ bài báo (cấu trúc bài báo bị tắt hoặc thiếu). Đang hiển thị đồ thị của chính các bài thay thế",

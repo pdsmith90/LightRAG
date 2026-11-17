@@ -459,7 +459,12 @@ describe('paper map size', () => {
 
   test('the summary line says how many papers were found and how many are shown', () => {
     expect(paperSummaryMessage(t, map, 150)).toBe(
-      'Paper map: 612 papers found, 150 shown (limit 150; 40 one step away, 109 two steps away)'
+      'Paper map: 612 papers found, 150 shown (limit 150; 40 one step away, 109 two steps away). ' +
+        '"Show more papers" raises the limit.'
+    )
+    // at the server's ceiling there is no more to show, and the line does not say there is
+    expect(paperSummaryMessage(t, { ...map, max_nodes: 1000 }, 150)).toBe(
+      'Paper map: 612 papers found, 150 shown (limit 1000; 40 one step away, 109 two steps away)'
     )
     // nothing left out: said once
     const all = { ...map, n_papers: 150 }
@@ -475,7 +480,8 @@ describe('paper map size', () => {
     const thinned = { ...map, n_links: 900, shown_links: 800, links_thinned: true }
     expect(paperSummaryMessage(t, thinned, 150)).toBe(
       'Paper map: 612 papers found, 150 shown (limit 150; 40 one step away, 109 two steps away); ' +
-        '800 of the 900 links between them shown, the strongest for each paper'
+        '800 of the 900 links between them shown, the strongest for each paper. ' +
+        '"Show more papers" raises the limit.'
     )
     const whole = { ...map, n_links: 900, shown_links: 900, links_thinned: false }
     expect(paperSummaryMessage(t, whole, 150)).not.toContain('links between them')
@@ -511,7 +517,7 @@ describe('paper map size', () => {
     expect(en.graphPanel.paperFilter.mapOneHopTooltip).toContain('{{limit}}')
     expect(en.graphPanel.paperFilter.mapTwoHopsTooltip).toContain('{{limit}}')
     const locales = { ar, de, fr, id, ja, ko, ru, uk, vi, zh, zhTW }
-    for (const key of ['mapSummaryLimited', 'mapShowMore', 'legendCitation', 'legendCoupling', 'linkKind', 'linkDirectionNone']) {
+    for (const key of ['mapSummaryLimited', 'mapShowMore', 'mapMoreSuffix', 'legendCitation', 'legendCoupling', 'linkKind', 'linkDirectionNone']) {
       expect(key in de.graphPanel.paperFilter, key).toBe(true)
     }
     const keys = (o: Record<string, any>): string[] => Object.keys(o).sort()

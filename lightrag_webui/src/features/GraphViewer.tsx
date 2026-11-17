@@ -4,14 +4,14 @@ import { SigmaContainer, useRegisterEvents, useSigma } from '@react-sigma/core'
 import { Settings as SigmaSettings } from 'sigma/settings'
 import { GraphSearchOption, OptionItem } from '@react-sigma/graph-search'
 import {
-  EdgeArrowProgram,
   EdgeLineProgram,
   EdgeRectangleProgram,
   NodePointProgram,
   NodeCircleProgram
 } from 'sigma/rendering'
 import { NodeBorderProgram } from '@sigma/node-border'
-import { EdgeCurvedArrowProgram, createEdgeCurveProgram } from '@sigma/edge-curve'
+import { createEdgeCurveProgram } from '@sigma/edge-curve'
+import { MapArrowProgram, MapCurvedArrowProgram } from '@/lib/mapArrowPrograms'
 
 import FocusOnNode from '@/components/graph/FocusOnNode'
 import LayoutsControl from '@/components/graph/LayoutsControl'
@@ -65,8 +65,9 @@ const createSigmaSettings = (
   edgeProgramClasses: {
     rect: EdgeRectangleProgram,
     line: EdgeLineProgram,
-    arrow: EdgeArrowProgram,
-    curvedArrow: EdgeCurvedArrowProgram,
+    // the arrowheads of a map's citation links (larger than sigma's own, see mapArrowPrograms)
+    arrow: MapArrowProgram,
+    curvedArrow: MapCurvedArrowProgram,
     // kept registered for backward compatibility with edges that still
     // carry type: 'curvedNoArrow'
     curvedNoArrow: createEdgeCurveProgram()

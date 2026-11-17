@@ -427,6 +427,7 @@
       "mapSummary": "논문 지도: 논문 {{nodes}}편을 찾아 모두 표시 (한 단계 {{hop1}}편, 두 단계 {{hop2}}편)",
       "mapSummaryLimited": "논문 지도: 논문 {{found}}편을 찾음, {{nodes}}편 표시 (한도 {{limit}}편, 한 단계 {{hop1}}편, 두 단계 {{hop2}}편)",
       "mapShowMore": "논문 더 보기 ({{found}}편 중 {{shown}}편 표시, 다음 한도 {{limit}}편)",
+      "mapMoreSuffix": ". '논문 더 보기'를 누르면 한도가 올라갑니다.",
       "someNotInStructure": "선택한 논문 중 {{count}}편은 인용 구조에 없습니다",
       "mapLinksThinned": "링크 {{found}}개 중 {{shown}}개 표시: 논문별로 가장 강한 링크",
       "mapUnavailable": "이 서버에는 논문 지도가 없습니다(논문 구조가 꺼져 있거나 없습니다). 대신 논문 자체의 그래프를 표시합니다",

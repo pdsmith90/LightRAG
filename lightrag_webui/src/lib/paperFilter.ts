@@ -324,6 +324,8 @@ export const paperSummaryMessage = (
     }
     const unknown = papers.filter((p) => p.reason === 'not_in_structure').length
     if (unknown) map += `; ${t(k('someNotInStructure'), { count: unknown })}`
+    // Papers were left out: say how to see more, when the "Show more papers" button is there.
+    if (foundPapers > nodes && mapHasMorePapers(summary)) map += t(k('mapMoreSuffix'))
     return map
   }
 

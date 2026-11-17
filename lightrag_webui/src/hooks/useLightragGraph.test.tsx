@@ -279,8 +279,23 @@ describe('paper map in the graph hook', () => {
     useGraphStore.getState().setGraphDataFetchAttempted(false)
     useSettingsStore.getState().setQueryLabel('paper+map:10.1/b')
     renderWithProviders(<Harness />)
-    expect(await screen.findByText('Graph data is truncated to Max Nodes')).toBeTruthy()
+    // a map says what it left out in its own words: how many papers, and how to see more
     expect(await screen.findByText(/612 papers found, 2 shown/)).toBeTruthy()
+    expect(await screen.findByText(/"Show more papers" raises the limit/)).toBeTruthy()
+    expect(screen.queryByText('Graph data is truncated to Max Nodes')).toBeNull()
+  })
+
+  test('an entity graph that was cut short keeps the generic truncation toast', async () => {
+    __setAxiosAdapterForTests(async (config: any) =>
+      respond(config, {
+        nodes: [{ id: 'A', labels: ['A'], properties: { entity_type: 'x' } }],
+        edges: [],
+        is_truncated: true
+      })
+    )
+    useSettingsStore.getState().setQueryLabel('GRACE')
+    renderWithProviders(<Harness />)
+    expect(await screen.findByText('Graph data is truncated to Max Nodes')).toBeTruthy()
   })
 
   test('another failure of a map fetch is still retried', async () => {

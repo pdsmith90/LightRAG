@@ -427,6 +427,7 @@
       "mapSummary": "論文マップ：{{nodes}} 本を検出し全て表示（1ステップ {{hop1}} 本、2ステップ {{hop2}} 本）",
       "mapSummaryLimited": "論文マップ：{{found}} 本を検出、{{nodes}} 本を表示（上限 {{limit}}、1ステップ {{hop1}} 本、2ステップ {{hop2}} 本）",
       "mapShowMore": "論文をさらに表示（{{found}} 本中 {{shown}} 本、次の上限 {{limit}}）",
+      "mapMoreSuffix": "。「論文をさらに表示」で上限を引き上げられます。",
       "someNotInStructure": "選択した論文のうち {{count}} 本は引用構造にありません",
       "mapLinksThinned": "{{found}} 本のリンクのうち {{shown}} 本を表示：各論文の強いリンク",
       "mapUnavailable": "このサーバーには論文マップがありません（論文構造がオフか未設定です）。代わりに論文自体のグラフを表示します",

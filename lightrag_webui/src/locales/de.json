@@ -427,6 +427,7 @@
       "mapSummary": "Literaturkarte: {{nodes}} Arbeiten gefunden und gezeigt ({{hop1}} einen Schritt entfernt, {{hop2}} zwei Schritte)",
       "mapSummaryLimited": "Literaturkarte: {{found}} Arbeiten gefunden, {{nodes}} gezeigt (Grenze {{limit}}; {{hop1}} einen Schritt entfernt, {{hop2}} zwei Schritte)",
       "mapShowMore": "Mehr Arbeiten zeigen ({{shown}} von {{found}}, nächste Grenze {{limit}})",
+      "mapMoreSuffix": ". „Mehr Arbeiten zeigen“ erhöht die Grenze.",
       "someNotInStructure": "{{count}} der gewählten Arbeiten sind nicht in der Zitationsstruktur",
       "mapLinksThinned": "{{shown}} von {{found}} Verbindungen gezeigt, die stärksten jeder Arbeit",
       "mapUnavailable": "Dieser Server hat keine Literaturkarte (seine Literaturstruktur ist aus oder fehlt). Stattdessen wird der Graph der Arbeiten gezeigt",

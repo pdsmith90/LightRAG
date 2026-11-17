@@ -10,7 +10,7 @@ into real bibliographic citations using Zotero metadata. The LLM never writes th
 
 | Tool | What it returns |
 |---|---|
-| `search_library(query, mode="mix", top_k=10, answer=False, include_graph=False, passages=8)` | Compiled citations **first**, then the retrieved passages as plain text, each headed `[n] Family Year · section` (see [Retrieved passages](#retrieved-passages)). No answer is generated, so it is faster. `passages` sets how many are retrieved. `include_graph=True` appends the knowledge-graph entities and relations. |
+| `search_library(query, mode="naive", top_k=10, answer=False, include_graph=False, passages=10)` | Compiled citations **first**, then the retrieved passages as plain text, each headed `[n] Family Year · section` (see [Retrieved passages](#retrieved-passages)). No answer is generated, so it is faster. `passages` sets how many are retrieved. `include_graph=True` appends the knowledge-graph entities and relations. |
 | `search_library(..., answer=True)` | The server's synthesized answer. Any reference section the model wrote is stripped, and a `### Sources (compiled from retrieval)` list is appended. |
 | `paper_passages(paper, question)` | Up to 3 passages of **one** paper ranked against `question`, under that paper's citation and, when this host has it, the path of the paper's file in Zotero's storage folder. `paper` is a Zotero key, a DOI, or words that must all occur in the title, authors or year. If no indexed paper, several, or only near matches fit, it lists them instead of querying. |
 | `paper_equation(paper, number, page=0)` | One numbered display equation of **one** paper as `$…$` LaTeX with its printed number as `\tag{N}`, read from the paper's own PDF (see [Equations and tables from the PDF](#equations-and-tables-from-the-pdf)), with the PDF's text layer for the same box, the page and the sentence that cites it. Without an OCR model the answer is the text layer, labelled as such. |
@@ -22,14 +22,16 @@ into real bibliographic citations using Zotero metadata. The LLM never writes th
 | `add_note(text, description="")` | Inserts a text note into the knowledge base (`POST /documents/text`) under a unique document name (see below). |
 | `health(verbose=False)` | A few lines from the server's `/health` report: status, an `API key:` line (whether the key is accepted), versions, pipeline state, the queues (queued/running) and the models, or `unreachable at <url>: <error>`. A status other than 200, or a body that is not a JSON object, is shown as it came (the first 300 characters). `verbose=True` returns the whole report as `<status code>: <body>`. |
 
-`mode` is one of `mix` (default: knowledge graph + vectors), `hybrid`, `local`, `global` or
-`naive`. Any other value, including LightRAG's `bypass`, falls back to `mix`. In every mode
+`mode` is one of `naive` (default: vector search only, the fastest; best for checking a claim
+against the papers), `mix` (knowledge graph + vectors; about twice as slow, and finds a few
+more), `hybrid`, `local` or `global`. Any other value, including LightRAG's `bypass`, falls
+back to `naive`. In every mode
 but `naive` the request carries no entity or relation token budget, so the server uses its own
 (`MAX_ENTITY_TOKENS`, `MAX_RELATION_TOKENS`) and retrieves the passages that come through the
 graph; the result still holds the passages only unless `include_graph=True`. A `naive`
 search sends 1-token budgets (1000 with `include_graph`), since it takes no graph passages. `top_k` is
 clamped to `1..LIGHTRAG_MCP_MAX_TOP_K` (see below). It sizes the knowledge-graph legs of
-retrieval, not the result: `passages` (default 8, clamped to `1..12`) is sent as the
+retrieval, not the result: `passages` (default 10, clamped to `1..14`) is sent as the
 request's `chunk_top_k` and decides how many passages come back, at about 4 KB each.
 `answer=True` does not send it.
 
@@ -250,7 +252,9 @@ this proxy does not obtain.
 
 The key is read once, when the client launches the proxy, so after the server's key is
 rotated a running proxy keeps sending the old one and every keyed call gets 403 while the
-client still shows the server as connected. With `LIGHTRAG_MCP_ENV_FILE` set, a 401 or 403
+client still shows the server as connected. The reload is off unless `LIGHTRAG_MCP_ENV_FILE`
+is set: without it the proxy never reads the key again, and the client has to relaunch it
+after a rotation. With `LIGHTRAG_MCP_ENV_FILE` set, a 401 or 403
 makes the proxy read the file's last `LIGHTRAG_API_KEY=` line again (quotes stripped) and,
 when that key differs from the one this request used, send the request once more; every
 request the tools send, the three paper-structure tools included, goes through it. The
