@@ -55,6 +55,8 @@ class FakeLightRAG:
 
     def __init__(self):
         self.requests: list[dict] = []
+        # the request the calling handler thread is answering (routes may read its headers)
+        self.current = threading.local()
         self.routes = {
             ("GET", "/health"): lambda body: (200, {"status": "healthy"}),
             ("POST", "/query"): lambda body: (
@@ -78,16 +80,16 @@ class FakeLightRAG:
                 raw = self.rfile.read(n) if n else b""
                 body = json.loads(raw) if raw else None
                 url = urlsplit(self.path)
-                fake.requests.append(
-                    {
-                        "method": method,
-                        "path": url.path,
-                        "url": self.path,
-                        "params": dict(parse_qsl(url.query)),
-                        "headers": {k.lower(): v for k, v in self.headers.items()},
-                        "json": body,
-                    }
-                )
+                record = {
+                    "method": method,
+                    "path": url.path,
+                    "url": self.path,
+                    "params": dict(parse_qsl(url.query)),
+                    "headers": {k.lower(): v for k, v in self.headers.items()},
+                    "json": body,
+                }
+                fake.current.request = record
+                fake.requests.append(record)
                 route = fake.routes.get((method, url.path))
                 # GET routes answer from the query string, POST routes from the body.
                 if method == "GET" and route:
@@ -179,6 +181,7 @@ def load_server(monkeypatch, fake_lightrag, metadata_file):
         for name in (
             "LIGHTRAG_BASE_URL",
             "LIGHTRAG_API_KEY",
+            "LIGHTRAG_MCP_ENV_FILE",
             "ZOTERO_METADATA",
             "ZOTERO_STORAGE",
             "LIGHTRAG_MCP_TIMEOUT",

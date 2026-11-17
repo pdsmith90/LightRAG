@@ -25,8 +25,9 @@ It's a thin, self-contained proxy over the LightRAG Server REST API. Ten tools:
                                           between two papers
     add_note(text, description)        -> insert a note/snippet into the KB under
                                           a unique document name
-    health(verbose=False)              -> is the LightRAG server up? (a few lines;
-                                          verbose: the server's whole report)
+    health(verbose=False)              -> is the LightRAG server up, and is the API key
+                                          accepted? (a few lines; verbose: the server's
+                                          whole report)
 
 Citations are compiled from the `references` array that stock LightRAG returns
 (one {reference_id, file_path} per retrieved document): corpus files named
@@ -38,6 +39,10 @@ Config (environment variables):
     LIGHTRAG_BASE_URL                  default http://localhost:9621
     LIGHTRAG_API_KEY                   sent as the X-API-Key header; must match
                                        LIGHTRAG_API_KEY in the server's .env
+    LIGHTRAG_MCP_ENV_FILE              optional: an env file with a LIGHTRAG_API_KEY=
+                                       line; after a 401/403 the proxy reads the key
+                                       from it again and retries once, so a key
+                                       rotated while the proxy runs needs no restart
     ZOTERO_METADATA                    default ~/Zotero/zotero_metadata.json, the
                                        corpus builder's default output (~ is expanded)
     ZOTERO_STORAGE                     default ~/Zotero/storage, Zotero's attachment
@@ -345,6 +350,87 @@ def _top_k(top_k: int) -> int:
 _REF_MEMO: dict = {}
 
 
+# Key rotation without a restart. KEY and HEADERS are read once, at launch, so after a
+# rotation a running proxy would keep sending the old key and every keyed call would get
+# 403. With LIGHTRAG_MCP_ENV_FILE set, a 401/403 makes the proxy read that file's
+# LIGHTRAG_API_KEY= line again and, when the key changed, send the request once more. The
+# retry is safe: the server refuses a bad key before it does any work. Comparing with the
+# key THIS request sent keeps parallel tool calls right: a thread that fails after another
+# already reloaded still retries.
+ENV_FILE = os.path.expanduser(os.environ.get("LIGHTRAG_MCP_ENV_FILE") or "")
+_KEY_LOCK = threading.Lock()
+
+
+def _env_file_key() -> str:
+    """LIGHTRAG_API_KEY from ENV_FILE, quotes stripped, '' when there is no file or no line."""
+    key = ""
+    if not ENV_FILE:
+        return key
+    try:
+        with open(ENV_FILE, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line.startswith("LIGHTRAG_API_KEY="):
+                    key = (
+                        line.split("=", 1)[1].strip().strip('"').strip("'")
+                    )  # last wins
+    except OSError:
+        pass
+    return key
+
+
+def _reload_key() -> None:
+    """Take the key from ENV_FILE when it differs from the one in use. Never logs the value."""
+    global KEY
+    with _KEY_LOCK:
+        new = _env_file_key()
+        if new and new != KEY:
+            KEY = new
+            HEADERS["X-API-Key"] = new
+            print(
+                "lightrag-mcp: LIGHTRAG_API_KEY reloaded from LIGHTRAG_MCP_ENV_FILE "
+                "after a 401/403 (the key changed after this proxy started)",
+                file=sys.stderr,
+                flush=True,
+            )
+
+
+def _send(method: str, path: str, **kw) -> httpx.Response:
+    """One request to LightRAG with the current key; on 401/403 reload the key and, if it
+    changed since this request was sent, send it once more."""
+    used = HEADERS.get("X-API-Key", "")
+    r = httpx.request(method, f"{BASE}{path}", headers=dict(HEADERS), **kw)
+    if r.status_code in (401, 403):
+        _reload_key()
+        if HEADERS.get("X-API-Key", "") != used:
+            r = httpx.request(method, f"{BASE}{path}", headers=dict(HEADERS), **kw)
+    return r
+
+
+def _key_check() -> str:
+    """One keyed call, because /health is usually left open and answers 200 with any key or
+    none: whether the key is accepted, reloaded, or rejected even after a reload."""
+    before = HEADERS.get("X-API-Key", "")
+    try:
+        r = _send("GET", "/documents/pipeline_status", timeout=HEALTH_TIMEOUT)
+    except Exception as e:
+        return f"API key: not checked ({type(e).__name__})"
+    reloaded = HEADERS.get("X-API-Key", "") != before
+    if r.status_code == 200:
+        return "API key: accepted" + (
+            " (reloaded from LIGHTRAG_MCP_ENV_FILE: it changed after this proxy started)"
+            if reloaded
+            else ""
+        )
+    if r.status_code in (401, 403):
+        return (
+            f"API key: REJECTED (HTTP {r.status_code}: {_error_detail(r)[:80]}). The key "
+            "this proxy sends does not match the server's; reconnecting will not help "
+            "unless LIGHTRAG_API_KEY (or LIGHTRAG_MCP_ENV_FILE) holds the current one"
+        )
+    return f"API key: not checked (HTTP {r.status_code})"
+
+
 def _error_detail(r: httpx.Response) -> str:
     """The server's explanation of a refusal: FastAPI's {"detail": "..."} when it
     is a string, otherwise the raw body, truncated."""
@@ -368,10 +454,10 @@ def _tool_error(path: str, e: httpx.HTTPError) -> ToolError:
 
 def _post(path: str, payload: dict, timeout: float | None = None) -> dict:
     try:
-        r = httpx.post(
-            f"{BASE}{path}",
+        r = _send(
+            "POST",
+            path,
             json=payload,
-            headers=HEADERS,
             timeout=QUERY_TIMEOUT if timeout is None else timeout,
         )
         r.raise_for_status()
@@ -667,6 +753,17 @@ def _render_context(data: dict, include_graph: bool) -> str:
     return f"{out}\n\n{graph}" if graph else out
 
 
+def _graph_budgets(mode: str, include_graph: bool) -> dict:
+    """The token budgets for the graph's entities and relations. Naive search takes no
+    graph passages, so its budgets stay at 1 token unless the graph is asked for. Every
+    other mode gets the server's own budgets (none sent): its entities and relations
+    lead to graph-derived passages, and a 1-token budget would leave none."""
+    if mode != "naive":
+        return {}
+    size = 1000 if include_graph else 1
+    return {"max_entity_tokens": size, "max_relation_tokens": size}
+
+
 def _context(
     query: str, mode: str, top_k: int, passages: int, include_graph: bool = False
 ) -> str:
@@ -677,8 +774,7 @@ def _context(
         "top_k": top_k,
         "chunk_top_k": passages,
         "only_need_context": True,
-        "max_entity_tokens": 1000 if include_graph else 1,
-        "max_relation_tokens": 1000 if include_graph else 1,
+        **_graph_budgets(mode, include_graph),
     }
     data = _post("/query", payload)
     return _render_context(data, include_graph)
@@ -977,9 +1073,7 @@ def _paper_search(**params) -> tuple[list[dict] | None, bool]:
     if hit and time.monotonic() - hit[0] < PAPER_CACHE_TTL:
         return (None if hit[1] is None else list(hit[1])), hit[2]
     try:
-        r = httpx.get(
-            f"{BASE}{path}", params=params, headers=HEADERS, timeout=QUERY_TIMEOUT
-        )
+        r = _send("GET", path, params=params, timeout=QUERY_TIMEOUT)
         if r.status_code == 404:
             papers = None
         else:
@@ -1399,9 +1493,7 @@ def _other_line(ref: dict) -> str:
 def _post_or_absent(path: str, payload: dict) -> dict | None:
     """_post, but None when the server has no such route (it answers 404)."""
     try:
-        r = httpx.post(
-            f"{BASE}{path}", json=payload, headers=HEADERS, timeout=QUERY_TIMEOUT
-        )
+        r = _send("POST", path, json=payload, timeout=QUERY_TIMEOUT)
         if r.status_code == 404:
             return None
         r.raise_for_status()
@@ -1524,8 +1616,7 @@ def search_library(
             "mode": mode,
             "top_k": top_k,
             "chunk_top_k": passages,
-            "max_entity_tokens": 1000 if include_graph else 1,
-            "max_relation_tokens": 1000 if include_graph else 1,
+            **_graph_budgets(mode, include_graph),
             "user_prompt": "Do not generate a References section; "
             "references are appended programmatically.",
         },
@@ -2016,9 +2107,7 @@ def _struct_get(path: str, params: dict) -> dict | str:
     server has no such route (an older server or a stock one: 404) or its paper
     structure is switched off or not loaded (501)."""
     try:
-        r = httpx.get(
-            f"{BASE}{path}", params=params, headers=HEADERS, timeout=QUERY_TIMEOUT
-        )
+        r = _send("GET", path, params=params, timeout=QUERY_TIMEOUT)
         if r.status_code == 404 and _error_detail(r) == "Not Found":
             return (
                 "This LightRAG server has no paper-structure routes (it predates them, "
@@ -2177,7 +2266,8 @@ def papers_by_topic(
     """Papers of the library under one OpenAlex topic, at any level: domain, field,
     subfield or topic (e.g. "Geophysics", "Earth and Planetary Sciences", "GNSS").
 
-    topic: words of the topic's name, or a topic id from a listing (topic:T…,
+    topic: words of the topic's name (each a whole word of it; a word of four letters
+    or more may be the start of one), or a topic id from a listing (topic:T…,
     subfield:…, field:…, domain:…). The best name match is used and the next ones are
     listed. primary_only: only papers whose primary topic is under it (OpenAlex gives
     a paper up to three topics). topics_only=True lists the topics whose names match,
@@ -2434,16 +2524,16 @@ def _health_summary(code: int, text: str) -> str:
 @mcp.tool(structured_output=False)
 def health(verbose: bool = False) -> str:
     """Check that the LightRAG server is reachable and report its status: a few lines
-    (version, pipeline, queues, models); verbose=True returns the server's whole report."""
+    (version, pipeline, queues, models, whether the API key is accepted); verbose=True
+    returns the server's whole report."""
     try:
         r = httpx.get(f"{BASE}/health", headers=HEADERS, timeout=HEALTH_TIMEOUT)
     except Exception as e:
         return f"unreachable at {BASE}: {e}"
-    return (
-        f"{r.status_code}: {r.text}"
-        if verbose
-        else _health_summary(r.status_code, r.text)
-    )
+    if verbose:
+        return f"{r.status_code}: {r.text}\n{_key_check()}"
+    lines = _health_summary(r.status_code, r.text).split("\n")
+    return "\n".join(lines[:1] + [_key_check()] + lines[1:])
 
 
 if __name__ == "__main__":
