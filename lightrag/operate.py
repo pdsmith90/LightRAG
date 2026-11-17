@@ -87,6 +87,7 @@ from lightrag.chunk_schema import (
     format_parent_headings,
     strip_internal_multimodal_markup_for_extraction,
 )
+from lightrag.kg_contract import contract_system_prompt
 from lightrag.prompt import PROMPTS, resolve_entity_extraction_prompt_profile
 from lightrag.constants import (
     GRAPH_FIELD_SEP,
@@ -713,6 +714,15 @@ def entity_types_in_guidance(guidance: str) -> frozenset[str]:
         m.group(1).replace(" ", "").lower()
         for m in _TYPE_LINE_RE.finditer(guidance or "")
     )
+
+
+def entity_type_names_in_guidance(guidance: str) -> list[str]:
+    """The type names a guidance text lists as ``- Name: ...`` lines, as written
+    and in order, one per normalised name (see ``entity_types_in_guidance``)."""
+    names: dict[str, str] = {}
+    for m in _TYPE_LINE_RE.finditer(guidance or ""):
+        names.setdefault(m.group(1).replace(" ", "").lower(), m.group(1))
+    return list(names.values())
 
 
 def _configure_entity_type_allowlist(
@@ -4307,9 +4317,13 @@ async def extract_entities(
         and max_extract_input_tokens > 0
     )
     if use_json_extraction:
-        entity_extraction_system_prompt = PROMPTS[
-            "entity_extraction_json_system_prompt"
-        ].format(**context_base)
+        system_template = PROMPTS["entity_extraction_json_system_prompt"]
+        if prompt_profile.get("relationship_types"):
+            # Fork (extraction contract): the profile declares a closed relation
+            # list, so the template's naming, keyword and direction rules are
+            # replaced by the contract's (lightrag/kg_contract.py).
+            system_template = contract_system_prompt(system_template)
+        entity_extraction_system_prompt = system_template.format(**context_base)
         json_continue_extraction_user_prompt = PROMPTS[
             "entity_continue_extraction_json_user_prompt"
         ].format(**context_base)
