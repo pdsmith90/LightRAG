@@ -2309,10 +2309,13 @@ class PostgreSQLDB:
         return bool(rows)
 
     async def _migrate_text_chunks_add_heading_sidecar(self):
-        """Add heading and sidecar JSONB columns to LIGHTRAG_DOC_CHUNKS if missing."""
+        """Add heading and sidecar JSONB columns to LIGHTRAG_DOC_CHUNKS if missing,
+        and the fork's llm_cache_contract (extraction contract fingerprints per
+        cache key; NULL on every row extracted without the contract)."""
         columns_to_add = [
             ("heading", "JSONB NULL DEFAULT '{}'::jsonb"),
             ("sidecar", "JSONB NULL DEFAULT '{}'::jsonb"),
+            ("llm_cache_contract", "JSONB NULL"),
         ]
         try:
             existing = await self.query(
@@ -3305,6 +3308,28 @@ class ClientManager:
                         await db.pool.close()
 
 
+def _parse_cache_contract(row: dict[str, Any]) -> None:
+    """Fork (extraction contract): a text-chunk row's ``llm_cache_contract``
+    column as the dict the other KV backends store, or no key at all when the
+    column is NULL (every row extracted without the contract), so such a row
+    reads exactly as before the column existed."""
+    contracts = row.pop("llm_cache_contract", None)
+    if isinstance(contracts, str):
+        try:
+            contracts = json.loads(contracts)
+        except json.JSONDecodeError:
+            contracts = None
+    if isinstance(contracts, dict):
+        row["llm_cache_contract"] = contracts
+
+
+def _dump_cache_contract(row: dict[str, Any]) -> str | None:
+    """The ``llm_cache_contract`` column value of a text-chunk row: NULL when
+    the row has no mapping."""
+    contracts = row.get("llm_cache_contract")
+    return json.dumps(contracts) if isinstance(contracts, dict) else None
+
+
 @final
 @dataclass
 class PGKVStorage(BaseKVStorage):
@@ -3385,6 +3410,8 @@ class PGKVStorage(BaseKVStorage):
             if not isinstance(sidecar, dict):
                 sidecar = {}
             response["sidecar"] = sidecar
+
+            _parse_cache_contract(response)
 
             create_time = response.get("create_time", 0)
             update_time = response.get("update_time", 0)
@@ -3562,6 +3589,8 @@ class PGKVStorage(BaseKVStorage):
                 if not isinstance(sidecar, dict):
                     sidecar = {}
                 result["sidecar"] = sidecar
+
+                _parse_cache_contract(result)
 
                 create_time = result.get("create_time", 0)
                 update_time = result.get("update_time", 0)
@@ -3839,7 +3868,7 @@ class PGKVStorage(BaseKVStorage):
             for i, (k, v) in enumerate(data.items(), start=1):
                 # Tuple order must match SQL: (workspace, id, tokens, chunk_order_index,
                 #   full_doc_id, content, file_path, llm_cache_list, heading, sidecar,
-                #   create_time, update_time)
+                #   create_time, update_time, llm_cache_contract)
                 batch_values.append(
                     (
                         self.workspace,
@@ -3854,6 +3883,7 @@ class PGKVStorage(BaseKVStorage):
                         json.dumps(v.get("sidecar") or {}),
                         current_time,
                         current_time,
+                        _dump_cache_contract(v),
                     )
                 )
                 await _cooperative_yield(i)
@@ -10113,6 +10143,7 @@ TABLES = {
                     sidecar JSONB NULL DEFAULT '{}'::jsonb,
                     create_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
                     update_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
+                    llm_cache_contract JSONB NULL,
 	                CONSTRAINT LIGHTRAG_DOC_CHUNKS_PK PRIMARY KEY (workspace, id)
                     )"""
     },
@@ -10261,6 +10292,7 @@ SQL_TEMPLATES = {
                                 COALESCE(llm_cache_list, '[]'::jsonb) as llm_cache_list,
                                 COALESCE(heading, '{}'::jsonb) as heading,
                                 COALESCE(sidecar, '{}'::jsonb) as sidecar,
+                                llm_cache_contract,
                                 EXTRACT(EPOCH FROM create_time)::BIGINT as create_time,
                                 EXTRACT(EPOCH FROM update_time)::BIGINT as update_time
                                 FROM LIGHTRAG_DOC_CHUNKS WHERE workspace=$1 AND id=$2
@@ -10387,6 +10419,7 @@ SQL_TEMPLATES = {
                                   COALESCE(llm_cache_list, '[]'::jsonb) as llm_cache_list,
                                   COALESCE(heading, '{}'::jsonb) as heading,
                                   COALESCE(sidecar, '{}'::jsonb) as sidecar,
+                                  llm_cache_contract,
                                   EXTRACT(EPOCH FROM create_time)::BIGINT as create_time,
                                   EXTRACT(EPOCH FROM update_time)::BIGINT as update_time
                                    FROM LIGHTRAG_DOC_CHUNKS WHERE workspace=$1 AND id = ANY($2)
@@ -10494,8 +10527,8 @@ SQL_TEMPLATES = {
                                      """,
     "upsert_text_chunk": """INSERT INTO LIGHTRAG_DOC_CHUNKS (workspace, id, tokens,
                       chunk_order_index, full_doc_id, content, file_path, llm_cache_list,
-                      heading, sidecar, create_time, update_time)
-                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                      heading, sidecar, create_time, update_time, llm_cache_contract)
+                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                       ON CONFLICT (workspace,id) DO UPDATE
                       SET tokens=EXCLUDED.tokens,
                       chunk_order_index=EXCLUDED.chunk_order_index,
@@ -10505,7 +10538,8 @@ SQL_TEMPLATES = {
                       llm_cache_list=EXCLUDED.llm_cache_list,
                       heading=EXCLUDED.heading,
                       sidecar=EXCLUDED.sidecar,
-                      update_time = EXCLUDED.update_time
+                      update_time = EXCLUDED.update_time,
+                      llm_cache_contract=EXCLUDED.llm_cache_contract
                      """,
     "upsert_full_entities": """INSERT INTO LIGHTRAG_FULL_ENTITIES (workspace, id, entity_names, count,
                       create_time, update_time)

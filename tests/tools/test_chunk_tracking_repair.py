@@ -1293,7 +1293,7 @@ async def test_attribution_re_applies_the_extraction_hook():
     extraction stored. The extraction hook renamed the LLM's ``ScaleHeight`` to
     the text's ``scale height``, the name the graph holds, so the repair runs
     the hook on the chunk's re-parsed records with the chunk's text."""
-    from lightrag.kg_contract import kg_extraction_validator
+    from lightrag.kg_contract import contract_fingerprint, kg_extraction_validator
 
     class _HookedRepairer(_Repairer):
         def _build_global_config(self):
@@ -1303,6 +1303,10 @@ async def test_attribution_re_applies_the_extraction_hook():
         "c1": {
             "content": "The scale height of the thermosphere.",
             "llm_cache_list": ["cache-1"],
+            # extracted under this hook: the repair re-applies it
+            "llm_cache_contract": {
+                "cache-1": contract_fingerprint(None, None, kg_extraction_validator)
+            },
         }
     }
     cache = {
@@ -1327,3 +1331,89 @@ async def test_attribution_re_applies_the_extraction_hook():
     assert repairer.relation_chunks.data[
         make_relation_chunk_key("scale height", "thermosphere")
     ]["chunk_ids"] == ["c1"]
+
+
+def _hooked_repairer(chunk_contract, hook):
+    """One chunk whose cached extraction names ``ScaleHeight``, in a graph that
+    holds ``ScaleHeight`` and ``scale height``; the repair runs with ``hook``.
+    ``chunk_contract`` is the fingerprint the chunk row records for its cache
+    key (None: none recorded)."""
+
+    class _HookedRepairer(_Repairer):
+        def _build_global_config(self):
+            return {"kg_extraction_validator": hook}
+
+    row = {
+        "content": "The scale height of the thermosphere.",
+        "llm_cache_list": ["cache-1"],
+    }
+    if chunk_contract is not None:
+        row["llm_cache_contract"] = {"cache-1": chunk_contract}
+    cache = {
+        "cache-1": {
+            "cache_type": "extract",
+            "chunk_id": "c1",
+            "return": _extraction_payload(
+                entities=["ScaleHeight", "thermosphere"],
+                relationships=[("ScaleHeight", "thermosphere")],
+            ),
+            "create_time": 1,
+        }
+    }
+    graph = _Graph(
+        ["ScaleHeight", "scale height", "thermosphere"],
+        [("ScaleHeight", "thermosphere"), ("scale height", "thermosphere")],
+    )
+    return _HookedRepairer(
+        docs={"doc-1": _Doc(["c1"])}, chunks={"c1": row}, cache=cache, graph=graph
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["none", "other", "fails"])
+async def test_attribution_follows_the_contract_each_chunk_was_made_under(case):
+    """Fork (extraction contract): a chunk extracted without a contract or hook
+    is attributed from its plain extraction even with the hook configured; one
+    made under another configuration is attributed the same way and counted;
+    one the configured hook fails on is counted and adds nothing."""
+    from lightrag.kg_contract import contract_fingerprint, kg_extraction_validator
+
+    def failing(chunk_key, chunk_text, nodes, edges):
+        raise RuntimeError("hook down")
+
+    hook = failing if case == "fails" else kg_extraction_validator
+    chunk_contract = {
+        "none": None,
+        "other": "kgc-0000000000000000",
+        "fails": contract_fingerprint(None, None, failing),
+    }[case]
+    repairer = _hooked_repairer(chunk_contract, hook)
+    plan = await build_chunk_tracking_repair_plan(repairer)
+    try:
+        report = plan.report
+        rows = {
+            label: {
+                key: payload["chunk_ids"]
+                for keys in plan.disk.iter_keys("rows", label, 100)
+                for key, payload in plan.disk.row_payload(label, keys).items()
+            }
+            for label in ("entity_chunks", "relation_chunks")
+        }
+    finally:
+        plan.close(remove=True)
+
+    if case == "fails":
+        assert report.chunks_reprocess_failed == 1
+        assert report.chunks_unreproducible == 0
+        assert rows["entity_chunks"] == {}
+        assert any("could not be re-processed" in w for w in report.warnings)
+        return
+    assert report.chunks_reprocess_failed == 0
+    assert report.chunks_unreproducible == (1 if case == "other" else 0)
+    assert rows["entity_chunks"] == {"ScaleHeight": ["c1"], "thermosphere": ["c1"]}
+    assert rows["relation_chunks"] == {
+        make_relation_chunk_key("ScaleHeight", "thermosphere"): ["c1"]
+    }
+    assert any("another extraction contract" in w for w in report.warnings) == (
+        case == "other"
+    )

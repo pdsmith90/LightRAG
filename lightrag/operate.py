@@ -11,6 +11,7 @@ import re
 import json_repair
 from typing import Any, AsyncIterator, overload, Literal, Callable, Awaitable
 from collections import Counter, defaultdict
+from collections.abc import Collection
 
 from lightrag.exceptions import (
     IndexFlushError,
@@ -27,6 +28,7 @@ from lightrag.zotero_citations import (
 from lightrag.entity_name_guard import junk_entity_class
 from lightrag.entity_name_fold import alias_chunk_result, fold_chunk_result
 from lightrag.utils import (
+    CHUNK_CACHE_CONTRACT_FIELD,
     logger,
     compute_mdhash_id,
     Tokenizer,
@@ -88,7 +90,9 @@ from lightrag.chunk_schema import (
     strip_internal_multimodal_markup_for_extraction,
 )
 from lightrag.kg_contract import (
+    active_contract_fingerprint,
     check_chunk_relation_keywords,
+    contract_fingerprint,
     contract_system_prompt,
     inverse_table,
     orient_edge_records,
@@ -184,12 +188,20 @@ class KGRebuildReport:
     # because a new one would have needed the LLM; rebuilt after the re-ingest.
     kept_entities: set[str] = field(default_factory=set)
     kept_relationships: set[tuple[str, str]] = field(default_factory=set)
+    # Fork (extraction contract): chunks whose cached extraction the rebuild
+    # cannot re-process the way it was processed when extracted (made under
+    # another contract or hook, or the current hook failed on it or had no
+    # chunk text). The entities and relations left without a record from such a
+    # chunk get the structural repair (semantic fields kept, provenance
+    # rewritten) under either policy and are listed in degraded_*.
+    unreproducible_chunk_ids: set[str] = field(default_factory=set)
 
     @property
     def has_warnings(self) -> bool:
         return bool(
             self.missing_cache_chunk_ids
             or self.unusable_cache_chunk_ids
+            or self.unreproducible_chunk_ids
             or self.degraded_entities
             or self.degraded_relationships
         )
@@ -1460,6 +1472,95 @@ async def _run_kg_extraction_validator(
     return validated[0], validated[1]
 
 
+def _cached_extraction_mode(
+    chunk_data: dict[str, Any] | None,
+    results: list[tuple],
+    current_contract: str | None,
+) -> str:
+    """How a knowledge rebuild re-parses one chunk's cached extraction
+    (``results``, with cache ids: ``_get_cached_extraction_results``), from the
+    contract fingerprints its row records for those cache keys
+    (``llm_cache_contract``):
+
+    - ``baseline``: none of them carries a fingerprint (made without any
+      contract or hook, or before fingerprints were recorded): the plain
+      re-parse, which is all extraction did to it;
+    - ``contract``: every one carries the current configuration's fingerprint:
+      the current post-processing;
+    - ``unreproducible``: any other fingerprint, or a mix (caches of more than
+      one extraction run under different configurations): the plain re-parse,
+      and the items it leaves without a record get the structural repair."""
+    contracts = (chunk_data or {}).get(CHUNK_CACHE_CONTRACT_FIELD)
+    if not isinstance(contracts, dict):
+        contracts = {}
+    made_under = {
+        contracts.get(result[2]) if len(result) > 2 else None for result in results
+    }
+    if made_under == {None}:
+        return "baseline"
+    if made_under == {current_contract}:
+        return "contract"
+    return "unreproducible"
+
+
+async def _reparse_contract_extraction(
+    text_chunks_storage: BaseKVStorage,
+    chunk_id: str,
+    results: list[tuple],
+    chunk_data: dict[str, Any] | None,
+    *,
+    relationship_types: dict[str, str] | None,
+    relation_inverses: dict[str, str] | None,
+    kg_extraction_validator: Callable | None,
+    relation_keyword_counts: Counter | None = None,
+) -> tuple[dict, dict]:
+    """One chunk's cached passes post-processed as ``extract_entities`` did when
+    the chunk was extracted under the current configuration: each pass parsed
+    and its relation keywords checked (``relationship_types``), the passes
+    merged in order with the gleaning rules (``_merge_extraction_pass``), then
+    the extraction-quality hook on the merged records with the text it saw.
+    The records are returned before the name fold, which the caller applies as
+    extraction does, after all of this. Raises when a pass cannot be parsed,
+    the hook raises, or the hook needs the chunk text and the row has none:
+    records the hook has not judged must not reach the graph.
+
+    Every cached pass of the chunk is merged as one extraction: caches of
+    several runs under the same configuration (a chunk extracted again after a
+    prompt change) are not told apart."""
+    entities: dict = {}
+    relationships: dict = {}
+    for result in results:
+        pass_entities, pass_relationships = await _rebuild_from_extraction_result(
+            text_chunks_storage=text_chunks_storage,
+            chunk_id=chunk_id,
+            extraction_result=result[0],
+            timestamp=result[1],
+            chunk_data=chunk_data,
+            relationship_types=relationship_types,
+            relation_keyword_counts=relation_keyword_counts,
+            relation_inverses=relation_inverses,
+        )
+        await _merge_extraction_pass(
+            entities,
+            relationships,
+            pass_entities,
+            pass_relationships,
+            relation_inverses,
+        )
+    if kg_extraction_validator is not None:
+        content = (chunk_data or {}).get("content")
+        if not isinstance(content, str):
+            raise ValueError("chunk text not available for kg_extraction_validator")
+        entities, relationships = await _run_kg_extraction_validator(
+            kg_extraction_validator,
+            chunk_id,
+            _validator_chunk_text(content),
+            entities,
+            relationships,
+        )
+    return entities, relationships
+
+
 async def rebuild_knowledge_from_chunks(
     entities_to_rebuild: dict[str, list[str]],
     relationships_to_rebuild: dict[tuple[str, str], list[str]],
@@ -1541,6 +1642,7 @@ async def rebuild_knowledge_from_chunks(
         llm_response_cache,
         all_referenced_chunk_ids,
         text_chunks_storage=text_chunks_storage,
+        with_cache_ids=True,
     )
 
     missing_chunk_ids = all_referenced_chunk_ids - set(cached_results.keys())
@@ -1571,20 +1673,70 @@ async def rebuild_knowledge_from_chunks(
     chunk_entities = {}  # chunk_id -> {entity_name: [entity_data]}
     chunk_relationships = {}  # chunk_id -> {(src, tgt): [relationship_data]}
 
-    # Each chunk's records must be the ones its extraction stored, so the
-    # re-parse repeats what extract_entities did after its parser: the
-    # extraction contract's keyword check (relationship_types), the merge of the
-    # gleaning pass into the first (_merge_extraction_pass, which knows the
-    # contract's direction corrections), then the extraction-quality hook on the
-    # merged records with the text the hook saw. A name the hook renamed is then
-    # filed under the name the graph holds; without the hook it would stay under
-    # the LLM's spelling and the rebuild would miss it.
+    # Fork (extraction contract): each chunk's records must be the ones its
+    # extraction stored, so each chunk's cached extraction is re-parsed the way
+    # it was post-processed when it was extracted, which the contract
+    # fingerprint recorded with its cache references says
+    # (_cached_extraction_mode). A chunk made under the current configuration
+    # gets the current post-processing (_reparse_contract_extraction); one made
+    # without any contract or hook (every chunk extracted before fingerprints
+    # were recorded) gets the plain re-parse below, which is all extraction did
+    # to it. A chunk made under another configuration cannot be reproduced: it
+    # gets the plain re-parse, and an entity or relation for which such a chunk
+    # then yields no record keeps its stored description, type and keywords
+    # while its provenance is repaired (_rebuild_single_entity /
+    # _rebuild_single_relationship). So does one whose chunk the current
+    # post-processing failed on (the hook raised, the chunk text is missing):
+    # records the hook has not judged never reach the graph.
+    current_contract = active_contract_fingerprint(global_config)
     kg_extraction_validator = global_config.get("kg_extraction_validator")
     relationship_types = relation_types(global_config)
     relation_inverses = relation_inverse_table(global_config)
     relation_keyword_counts: Counter = Counter()
+    # Chunks whose records the current post-processing produced: only their
+    # relations are read in storage order with the inverse names.
+    contract_chunk_ids: set[str] = set()
+    unreproducible_reasons: Counter = Counter()
 
     for chunk_id, results in cached_results.items():
+        mode = _cached_extraction_mode(
+            chunk_data_by_id.get(chunk_id), results, current_contract
+        )
+        if mode == "contract":
+            try:
+                entities, relationships = await _reparse_contract_extraction(
+                    text_chunks_storage,
+                    chunk_id,
+                    results,
+                    chunk_data_by_id.get(chunk_id),
+                    relationship_types=relationship_types,
+                    relation_inverses=relation_inverses,
+                    kg_extraction_validator=kg_extraction_validator,
+                    relation_keyword_counts=relation_keyword_counts,
+                )
+            except Exception as e:
+                report.unreproducible_chunk_ids.add(chunk_id)
+                unreproducible_reasons["post-processing failed"] += 1
+                status_message = (
+                    f"Failed to re-process cached extraction result for chunk "
+                    f"{chunk_id} under the extraction contract: {e}; its entities "
+                    "and relations keep their stored descriptions"
+                )
+                logger.warning(status_message)
+                status_logger.log(status_message)
+                continue
+            # Fork (ENTITY_NAME_FOLD): as extraction, the fold comes after the
+            # gleaning merge and the hook; the graph may hold the LLM's spelling
+            # or the canonical one, so the records are filed under both.
+            entities, relationships = alias_chunk_result(entities, relationships)
+            chunk_entities[chunk_id] = entities
+            chunk_relationships[chunk_id] = relationships
+            contract_chunk_ids.add(chunk_id)
+            continue
+
+        if mode == "unreproducible":
+            report.unreproducible_chunk_ids.add(chunk_id)
+            unreproducible_reasons["extracted under another configuration"] += 1
         try:
             # Handle multiple extraction results per chunk
             chunk_entities[chunk_id] = defaultdict(list)
@@ -1598,16 +1750,10 @@ async def rebuild_knowledge_from_chunks(
                     extraction_result=result[0],
                     timestamp=result[1],
                     chunk_data=chunk_data_by_id.get(chunk_id),
-                    relationship_types=relationship_types,
-                    relation_keyword_counts=relation_keyword_counts,
-                    relation_inverses=relation_inverses,
                 )
-                if kg_extraction_validator is None:
-                    # Fork (ENTITY_NAME_FOLD): cached results carry the spelling
-                    # the LLM wrote; file them under the canonical name as well.
-                    entities, relationships = alias_chunk_result(
-                        entities, relationships
-                    )
+                # Fork (ENTITY_NAME_FOLD): cached results carry the spelling the
+                # LLM wrote; file them under the canonical name as well.
+                entities, relationships = alias_chunk_result(entities, relationships)
 
                 # Merge entities and relationships from this extraction result:
                 # keep the record with the longer description for a name or
@@ -1617,34 +1763,9 @@ async def rebuild_knowledge_from_chunks(
                     chunk_relationships[chunk_id],
                     entities,
                     relationships,
-                    relation_inverses,
                 )
-
-            if kg_extraction_validator is not None:
-                # The hook judged the merged records of the chunk, before the
-                # fold; so does the rebuild. Without the chunk's text the hook
-                # cannot run, and its records are not used.
-                chunk_data = chunk_data_by_id.get(chunk_id) or {}
-                if not isinstance(chunk_data.get("content"), str):
-                    raise ValueError(
-                        "chunk text not available for kg_extraction_validator"
-                    )
-                entities, relationships = await _run_kg_extraction_validator(
-                    kg_extraction_validator,
-                    chunk_id,
-                    _validator_chunk_text(chunk_data["content"]),
-                    dict(chunk_entities.pop(chunk_id)),
-                    dict(chunk_relationships.pop(chunk_id)),
-                )
-                entities, relationships = alias_chunk_result(entities, relationships)
-                chunk_entities[chunk_id] = entities
-                chunk_relationships[chunk_id] = relationships
 
         except Exception as e:
-            if kg_extraction_validator is not None:
-                # Records the hook has not seen must not reach the graph.
-                chunk_entities.pop(chunk_id, None)
-                chunk_relationships.pop(chunk_id, None)
             report.unusable_cache_chunk_ids.add(chunk_id)
             status_message = (
                 f"Failed to parse cached extraction result for chunk {chunk_id}: {e}"
@@ -1662,6 +1783,18 @@ async def rebuild_knowledge_from_chunks(
             )
             logger.warning(status_message)
             status_logger.log(status_message)
+
+    if report.unreproducible_chunk_ids:
+        detail = ", ".join(f"{n} {why}" for why, n in unreproducible_reasons.items())
+        status_message = (
+            f"KG rebuild: {len(report.unreproducible_chunk_ids)} chunk(s) whose "
+            f"cached extraction cannot be reproduced under the current extraction "
+            f"contract ({detail}); entities and relations they leave without a "
+            "record keep their stored descriptions and get their provenance "
+            "repaired"
+        )
+        logger.warning(status_message)
+        status_logger.log(status_message)
 
     # Get max async tasks limit from global_config for semaphore control
     graph_max_async = global_config.get("llm_model_max_async", 4) * 2
@@ -1696,6 +1829,7 @@ async def rebuild_knowledge_from_chunks(
                         structural_fallback=structural_fallback,
                         keep_summaries=keep_summaries,
                         kept=report.kept_entities if keep_summaries else None,
+                        unreproducible_chunk_ids=report.unreproducible_chunk_ids,
                     )
                     rebuilt_entities_count += 1
                     if degraded:
@@ -1739,6 +1873,8 @@ async def rebuild_knowledge_from_chunks(
                         structural_fallback=structural_fallback,
                         keep_summaries=keep_summaries,
                         kept=report.kept_relationships if keep_summaries else None,
+                        unreproducible_chunk_ids=report.unreproducible_chunk_ids,
+                        oriented_chunk_ids=contract_chunk_ids,
                     )
                     rebuilt_relationships_count += 1
                     if degraded:
@@ -1808,7 +1944,8 @@ async def _get_cached_extraction_results(
     llm_response_cache: BaseKVStorage,
     chunk_ids: set[str],
     text_chunks_storage: BaseKVStorage,
-) -> tuple[dict[str, list[tuple[str, int]]], dict[str, dict[str, Any]]]:
+    with_cache_ids: bool = False,
+) -> tuple[dict[str, list[tuple]], dict[str, dict[str, Any]]]:
     """Get cached extraction results for specific chunk IDs
 
     This function retrieves cached LLM extraction results for the given chunk IDs and returns
@@ -1820,6 +1957,10 @@ async def _get_cached_extraction_results(
         llm_response_cache: LLM response cache storage
         chunk_ids: Set of chunk IDs to get cached results for
         text_chunks_storage: Text chunks storage for retrieving chunk data and LLM cache references
+        with_cache_ids: Fork (extraction contract): each result is
+            ``(extraction_result, create_time, cache_id)`` instead of a pair, so
+            the caller can look up the contract each was made under
+            (``_cached_extraction_mode``).
 
     Returns:
         A tuple containing the cache results grouped by chunk ID and the
@@ -1881,7 +2022,11 @@ async def _get_cached_extraction_results(
             if chunk_id not in cached_results:
                 cached_results[chunk_id] = []
             # Store tuple with extraction result and creation time for sorting
-            cached_results[chunk_id].append((extraction_result, create_time))
+            cached_results[chunk_id].append(
+                (extraction_result, create_time, cache_id)
+                if with_cache_ids
+                else (extraction_result, create_time)
+            )
 
     # Sort extraction results by create_time for each chunk and collect earliest times
     chunk_earliest_times = {}
@@ -2205,8 +2350,15 @@ async def _rebuild_single_entity(
     structural_fallback: bool = False,
     keep_summaries: bool = False,
     kept: set[str] | None = None,
+    unreproducible_chunk_ids: Collection[str] = (),
 ) -> bool:
-    """Rebuild a single entity from cached extraction results"""
+    """Rebuild a single entity from cached extraction results.
+
+    Fork (extraction contract): when one of its surviving chunks is in
+    ``unreproducible_chunk_ids`` and yields no record for it, what that chunk
+    contributed cannot be recovered, so the entity gets the structural repair
+    (stored description and type kept, provenance rewritten; returns True)
+    under either policy instead of a description missing that contribution."""
 
     # Get current entity data
     current_entity = await knowledge_graph_inst.get_node(entity_name)
@@ -2306,13 +2458,22 @@ async def _rebuild_single_entity(
     for chunk_id in limited_chunk_ids:
         if chunk_id in chunk_entities and entity_name in chunk_entities[chunk_id]:
             all_entity_data.extend(chunk_entities[chunk_id][entity_name])
+    unreproduced = [
+        chunk_id
+        for chunk_id in limited_chunk_ids
+        if chunk_id in unreproducible_chunk_ids
+        and entity_name not in chunk_entities.get(chunk_id, ())
+    ]
 
-    if not all_entity_data:
-        if structural_fallback:
+    if not all_entity_data or unreproduced:
+        if structural_fallback or unreproduced:
             logger.warning(
-                "No cached entity data found for `%s`; preserving semantic "
+                "No cached entity data found for `%s`%s; preserving semantic "
                 "fields while repairing provenance",
                 entity_name,
+                f" in unreproducible chunk(s) {', '.join(unreproduced)}"
+                if unreproduced
+                else "",
             )
             file_paths = _surviving_chunk_file_paths(
                 limited_chunk_ids, chunk_data_by_id or {}, global_config
@@ -2496,11 +2657,19 @@ async def _rebuild_single_relationship(
     structural_fallback: bool = False,
     keep_summaries: bool = False,
     kept: set[tuple[str, str]] | None = None,
+    unreproducible_chunk_ids: Collection[str] = (),
+    oriented_chunk_ids: Collection[str] | None = None,
 ) -> bool:
     """Rebuild a single relationship from cached extraction results
 
     Note: This function assumes the caller has already acquired the appropriate
     keyed lock for the relationship pair to ensure thread safety.
+
+    Fork (extraction contract): ``unreproducible_chunk_ids`` as for
+    ``_rebuild_single_entity``. With ``relationship_inverses`` in the profile,
+    the records of the chunks in ``oriented_chunk_ids`` (all chunks when None)
+    are read in storage order under the inverse names; the others were stored
+    without that rule and are read as they are.
     """
 
     # Fork (extraction contract): with relationship_inverses in the profile the
@@ -2569,22 +2738,37 @@ async def _rebuild_single_relationship(
                         orient_edge_records(
                             edge_key,
                             chunk_relationships[chunk_id][edge_key],
-                            inverse_table,
+                            inverse_table
+                            if oriented_chunk_ids is None
+                            or chunk_id in oriented_chunk_ids
+                            else None,
                         )
                     )
+    unreproduced = [
+        chunk_id
+        for chunk_id in limited_chunk_ids
+        if chunk_id in unreproducible_chunk_ids
+        and (src, tgt) not in chunk_relationships.get(chunk_id, ())
+        and (tgt, src) not in chunk_relationships.get(chunk_id, ())
+    ]
 
-    degraded = not all_relationship_data
-    if degraded and not structural_fallback:
+    degraded = not all_relationship_data or bool(unreproduced)
+    if degraded and not (structural_fallback or unreproduced):
         logger.warning(f"No relation data found for `{src}-{tgt}`")
         return False
 
     if degraded:
         logger.warning(
-            "No cached relation data found for `%s`~`%s`; preserving semantic "
+            "No cached relation data found for `%s`~`%s`%s; preserving semantic "
             "fields while repairing provenance",
             src,
             tgt,
+            f" in unreproducible chunk(s) {', '.join(unreproduced)}"
+            if unreproduced
+            else "",
         )
+        # Records the other chunks gave are not merged into the kept fields.
+        all_relationship_data = []
 
     # Merge descriptions and keywords
     descriptions = [current_relationship.get("description", "")] if degraded else []
@@ -2599,8 +2783,8 @@ async def _rebuild_single_relationship(
     )
     seen_paths = set()
 
-    # ``all_relationship_data`` is empty by definition when ``degraded``
-    # (degraded == not all_relationship_data), so no guard is needed here.
+    # ``all_relationship_data`` is empty when ``degraded`` (emptied above when
+    # an unreproducible chunk made it so), so no guard is needed here.
     for rel_data in all_relationship_data:
         if rel_data.get("description"):
             descriptions.append(rel_data["description"])
@@ -4513,6 +4697,16 @@ async def extract_entities(
     relationship_types = prompt_profile.get("relationship_types") or None
     relation_inverses = inverse_table(prompt_profile.get("relationship_inverses"))
     relation_keyword_counts: Counter = Counter()
+    # The contract fingerprint of this post-processing (relation list, inverse
+    # names, hook), recorded with each extraction cache reference on the chunk
+    # row so a knowledge rebuild re-parses the chunk the same way. None (no
+    # contract, no hook) records nothing.
+    cache_contract = contract_fingerprint(
+        relationship_types,
+        prompt_profile.get("relationship_inverses"),
+        kg_extraction_validator,
+    )
+    cache_contract_kwargs = {"cache_contract": cache_contract} if cache_contract else {}
 
     max_total_records = global_config["entity_extract_max_records"]
     max_entity_records = global_config["entity_extract_max_entities"]
@@ -4723,6 +4917,7 @@ async def extract_entities(
             on_cache_skipped=_report_cache_skip,
             response_format=({"type": "json_object"} if use_json_extraction else None),
             llm_cache_identity=get_llm_cache_identity(global_config, "extract"),
+            **cache_contract_kwargs,
         )
 
         _report_truncation(final_result, "initial")
@@ -4810,6 +5005,7 @@ async def extract_entities(
                     {"type": "json_object"} if use_json_extraction else None
                 ),
                 llm_cache_identity=get_llm_cache_identity(global_config, "extract"),
+                **cache_contract_kwargs,
             )
 
             _report_truncation(glean_result, "gleaning")

@@ -5137,11 +5137,18 @@ def lazy_external_import(module_name: str, class_name: str) -> Callable[..., Any
     return import_class
 
 
+# Fork (extraction contract): the text-chunk row field mapping each extraction
+# cache key the chunk lists to the contract fingerprint its extraction was
+# post-processed under (lightrag/kg_contract.py). Absent: no contract, no hook.
+CHUNK_CACHE_CONTRACT_FIELD = "llm_cache_contract"
+
+
 async def update_chunk_cache_list(
     chunk_id: str,
     text_chunks_storage: "BaseKVStorage",
     cache_keys: list[str],
     cache_scenario: str = "batch_update",
+    cache_contract: str | None = None,
 ) -> bool:
     """Update chunk's llm_cache_list with the given cache keys
 
@@ -5150,6 +5157,14 @@ async def update_chunk_cache_list(
         text_chunks_storage: Text chunks storage instance
         cache_keys: List of cache keys to add to the list
         cache_scenario: Description of the cache scenario for logging
+        cache_contract: Fork (extraction contract): the contract fingerprint the
+            extraction behind these keys is post-processed under. It is recorded
+            per key in the row's ``llm_cache_contract`` mapping (cache key ->
+            fingerprint), which the knowledge rebuild reads to re-parse each
+            cached extraction the way it was post-processed. None (no contract,
+            no hook) records nothing and removes these keys from a mapping an
+            earlier run left on the row; a row without the mapping is written
+            exactly as before.
 
     Returns:
         True when the keys are recorded on the chunk row, were already there,
@@ -5185,7 +5200,24 @@ async def update_chunk_cache_list(
         existing_keys = set(chunk_data["llm_cache_list"])
         new_keys = [key for key in cache_keys if key not in existing_keys]
 
-        if new_keys:
+        # Fork (extraction contract): which contract each key was made under.
+        contracts = chunk_data.get(CHUNK_CACHE_CONTRACT_FIELD)
+        contracts = dict(contracts) if isinstance(contracts, dict) else None
+        contracts_changed = False
+        if cache_contract is not None:
+            contracts = contracts or {}
+            for key in cache_keys:
+                if contracts.get(key) != cache_contract:
+                    contracts[key] = cache_contract
+                    contracts_changed = True
+        elif contracts and any(key in contracts for key in cache_keys):
+            for key in cache_keys:
+                contracts.pop(key, None)
+            contracts_changed = True
+        if contracts_changed:
+            chunk_data[CHUNK_CACHE_CONTRACT_FIELD] = contracts
+
+        if new_keys or contracts_changed:
             chunk_data["llm_cache_list"].extend(new_keys)
 
             # Update the chunk in storage
@@ -5531,6 +5563,7 @@ async def use_llm_func_with_cache(
     llm_cache_identity: Any | None = None,
     text_chunks_storage: "BaseKVStorage | None" = None,
     on_cache_skipped: Callable[[str], None] | None = None,
+    cache_contract: str | None = None,
 ) -> tuple[str, int]:
     """Call LLM function with cache support and text sanitization
 
@@ -5577,6 +5610,10 @@ async def use_llm_func_with_cache(
             synchronous and must not raise: the extraction path publishes its
             summary from an await-free ``finally`` that also runs during a
             cancellation unwind.
+        cache_contract: Fork (extraction contract): the contract fingerprint
+            (``kg_contract.contract_fingerprint``) the caller post-processes
+            this extraction under; recorded with the chunk's reference to the
+            cache row (``update_chunk_cache_list``). None records nothing.
 
     Returns:
         tuple[str, int]: (LLM response text, timestamp)
@@ -5647,6 +5684,7 @@ async def use_llm_func_with_cache(
                 text_chunks_storage,
                 [cache_key],
                 scenario,
+                **({"cache_contract": cache_contract} if cache_contract else {}),
             )
 
         cached_result = await handle_cache(

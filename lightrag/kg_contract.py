@@ -52,11 +52,18 @@ are mathematical notation of three or more characters, renames or drops
 identifiers glued from several words, drops a relation whose endpoint is
 neither a declared entity nor present in the chunk text, and drops self-loops
 that a rename creates.
+
+Extraction records a fingerprint of this post-processing (``contract_fingerprint``:
+the relation type names, the inverse mapping and the hook) with each chunk's
+extraction cache references, so a knowledge rebuild re-parses every chunk the way it
+was post-processed when it was extracted (``operate._cached_extraction_mode``).
 """
 
 from __future__ import annotations
 
 import argparse
+import functools
+import hashlib
 import json
 import re
 import sys
@@ -386,6 +393,86 @@ def check_chunk_relation_keywords(
                 record = {**record, "keywords": keywords}
             checked.setdefault(key, []).append(record)
     return checked
+
+
+# ---- the contract fingerprint -----------------------------------------------------
+
+# Bump whenever the contract's own post-processing of a parsed extraction changes:
+# check_relation_keywords, the gleaning merge rules for the inverse table
+# (operate._merge_extraction_pass), reading a JSON list of keywords. Chunks
+# extracted under the old rules then no longer match the configuration, and a
+# knowledge rebuild treats them as unreproducible instead of applying new rules
+# to them.
+CONTRACT_RULES_VERSION = 1
+
+# Bump whenever the rules of validate_chunk (the shipped kg_extraction_validator)
+# change, for the same reason.
+VALIDATOR_RULES_VERSION = 1
+
+
+def validator_identity(validator: Any) -> str:
+    """A stable name for an extraction-quality hook, for the contract
+    fingerprint. The shipped ``kg_extraction_validator`` is named with
+    ``VALIDATOR_RULES_VERSION``. Any other hook is named by the module and
+    qualified name of its function (through ``functools.partial``) or of its
+    class, plus its ``kg_validator_version`` attribute when it has one: a caller
+    that changes what its hook does without renaming it must set or bump that
+    attribute, or the rebuild cannot tell its old output from its new one."""
+    if validator is kg_extraction_validator:
+        return f"{__name__}.kg_extraction_validator/v{VALIDATOR_RULES_VERSION}"
+    target = validator
+    while isinstance(target, functools.partial):
+        target = target.func
+    module = getattr(target, "__module__", None) or type(target).__module__
+    name = getattr(target, "__qualname__", None) or type(target).__qualname__
+    identity = f"{module}.{name}"
+    version = getattr(validator, "kg_validator_version", None)
+    if version is None:
+        version = getattr(target, "kg_validator_version", None)
+    if version is not None:
+        identity += f"/v{version}"
+    return identity
+
+
+def contract_fingerprint(
+    relationship_types: Mapping[str, str] | None,
+    relationship_inverses: Mapping[str, str] | None,
+    validator: Any = None,
+) -> str | None:
+    """A short stable digest of everything that decides how a chunk's parsed
+    extraction is post-processed before it reaches the graph: the declared
+    relation type names (the keyword check), the inverse mapping (the gleaning
+    direction rule, inverse names), the extraction-quality hook
+    (``validator_identity``) and the rules versions. None when there is none of
+    these: the post-processing extraction does without the contract.
+
+    Extraction records it with each chunk's extraction cache references (the
+    chunk row's ``llm_cache_contract``), and a knowledge rebuild compares it
+    with the current configuration's to decide how each chunk's cached
+    extraction is re-parsed."""
+    if not relationship_types and validator is None:
+        return None
+    payload = {
+        "rules": CONTRACT_RULES_VERSION if relationship_types else None,
+        "types": sorted(relationship_types or ()),
+        "inverses": sorted((relationship_inverses or {}).items()),
+        "validator": validator_identity(validator) if validator is not None else None,
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return f"kgc-{digest[:16]}"
+
+
+def active_contract_fingerprint(global_config: Mapping[str, Any]) -> str | None:
+    """``contract_fingerprint`` of the profile ``global_config`` carries and its
+    ``kg_extraction_validator``."""
+    profile = _active_profile(global_config)
+    return contract_fingerprint(
+        profile.get("relationship_types"),
+        profile.get("relationship_inverses"),
+        global_config.get("kg_extraction_validator"),
+    )
 
 
 # Running totals of this process for /health, by where the check ran: new LLM

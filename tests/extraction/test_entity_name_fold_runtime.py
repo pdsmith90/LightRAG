@@ -526,7 +526,7 @@ async def _merged_graph():
 
 
 async def _rebuild_merged(monkeypatch):
-    async def cached(llm_response_cache, chunk_ids, text_chunks_storage):
+    async def cached(llm_response_cache, chunk_ids, text_chunks_storage, **_kwargs):
         return {c: [(c, 1)] for c in sorted(chunk_ids) if c in CACHED}, {}
 
     async def parsed(*, chunk_id, **_kwargs):

@@ -191,7 +191,7 @@ async def test_upsert_text_chunks_tuple_order():
     row = rows[0]
     # SQL: (workspace, id, tokens, chunk_order_index, full_doc_id,
     #        content, file_path, llm_cache_list, heading, sidecar,
-    #        create_time, update_time)
+    #        create_time, update_time, llm_cache_contract)
     assert row[0] == "test_ws"  # workspace
     assert row[1] == "chunk-1"  # id
     assert row[2] == 42  # tokens
@@ -206,6 +206,30 @@ async def test_upsert_text_chunks_tuple_order():
         "id": "img-1",
         "refs": [],
     }  # sidecar
+    assert row[12] is None  # llm_cache_contract: NULL without a contract
+
+
+@pytest.mark.asyncio
+async def test_upsert_text_chunks_writes_the_extraction_contract():
+    """Fork (extraction contract): the per-key contract fingerprints go to the
+    llm_cache_contract column as JSON."""
+    storage = make_storage(NameSpace.KV_STORE_TEXT_CHUNKS)
+    data = {
+        "chunk-1": {
+            "tokens": 10,
+            "chunk_order_index": 0,
+            "full_doc_id": "doc-1",
+            "content": "plain text",
+            "file_path": "/a/b.txt",
+            "llm_cache_list": ["k1"],
+            "llm_cache_contract": {"k1": "kgc-0123456789abcdef"},
+        }
+    }
+    await storage.upsert(data)
+
+    sql, rows = storage._captured[0]
+    assert "llm_cache_contract" in sql
+    assert json.loads(rows[0][12]) == {"k1": "kgc-0123456789abcdef"}
 
 
 @pytest.mark.asyncio
