@@ -425,6 +425,35 @@ def test_the_schema_command_reports_a_missing_profile_file(tmp_path, capsys):
     assert "does not exist" in captured.err and str(missing) in captured.err
 
 
+def test_the_schema_command_takes_the_entity_type_prompt_file_value(
+    prompt_dir, capsys, monkeypatch, tmp_path
+):
+    """A bare file name is looked up in PROMPT_DIR/entity_type, as the server
+    looks up ENTITY_TYPE_PROMPT_FILE, from any current directory; stderr says
+    which file was used and stdout stays the schema."""
+    monkeypatch.chdir(tmp_path)
+    assert kg_contract.main(["--schema", "--profile", "contract.yml"]) == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == EXPECTED_V31_SCHEMA
+    used = prompt_dir / "entity_type" / "contract.yml"
+    assert f"profile: {used} (ENTITY_TYPE_PROMPT_FILE" in captured.err
+
+
+def test_the_schema_command_takes_a_path_and_says_so(capsys):
+    assert kg_contract.main(["--schema", "--profile", str(CONTRACT_SAMPLE)]) == 0
+    assert f"profile: {CONTRACT_SAMPLE} (path)" in capsys.readouterr().err
+
+
+def test_the_schema_command_names_both_places_for_a_missing_name(
+    prompt_dir, capsys, monkeypatch, tmp_path
+):
+    monkeypatch.chdir(tmp_path)
+    assert kg_contract.main(["--schema", "--profile", "absent.yml"]) == 2
+    err = capsys.readouterr().err
+    assert str(prompt_dir / "entity_type" / "absent.yml") in err
+    assert "nor in the current directory" in err
+
+
 def test_the_schema_command_needs_the_schema_flag():
     with pytest.raises(SystemExit) as exc:
         kg_contract.main(["--profile", str(CONTRACT_SAMPLE)])

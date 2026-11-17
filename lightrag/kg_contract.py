@@ -39,9 +39,9 @@ list. See ``ZLIGHTRAG.md`` for the write paths and their limits.
 
 The schema the extraction requests are constrained by is built by a front
 process, not by this code, so ``python -m lightrag.kg_contract --schema --profile
-PATH`` prints it for a profile: the entity types its guidance lists (read the
-way ENTITY_TYPE_STRICT reads them) plus ``Other``, and the profile's relation
-types, both as enums. Nothing on
+PROFILE`` prints it for a profile (the ``ENTITY_TYPE_PROMPT_FILE`` value, or a
+path): the entity types its guidance lists (read the way ENTITY_TYPE_STRICT reads
+them) plus ``Other``, and the profile's relation types, both as enums. Nothing on
 this side can make the front apply it, so the parser checks every extracted
 relation's keywords against the list (``check_relation_keywords``) and counts
 what it had to change.
@@ -722,6 +722,28 @@ def kg_extraction_validator(
 # ---- command line -----------------------------------------------------------------
 
 
+def resolve_profile_argument(value: str) -> tuple[Path, str]:
+    """The profile file ``--profile`` names, and how it was found. A bare file
+    name (what ``ENTITY_TYPE_PROMPT_FILE`` takes) is looked up where the server
+    looks it up, ``PROMPT_DIR/entity_type`` (``PROMPT_DIR`` defaults to
+    ``./prompts``), and in the current directory when it is not there; anything
+    else is a path."""
+    from lightrag.prompt import resolve_entity_type_prompt_path
+
+    try:
+        server_path = resolve_entity_type_prompt_path(value)
+    except ValueError:
+        return Path(value).resolve(), "path"
+    if server_path.exists():
+        return server_path, "ENTITY_TYPE_PROMPT_FILE, under PROMPT_DIR/entity_type"
+    if Path(value).exists():
+        return Path(value).resolve(), "path"
+    raise FileNotFoundError(
+        f"ENTITY_TYPE_PROMPT_FILE '{value}' is neither in PROMPT_DIR/entity_type "
+        f"('{server_path}') nor in the current directory."
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m lightrag.kg_contract",
@@ -735,16 +757,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--profile",
         required=True,
-        help="path of an entity-type profile (YAML) that declares relationship_types",
+        help="an entity-type profile (YAML) that declares relationship_types: the "
+        "ENTITY_TYPE_PROMPT_FILE value (a file name, looked up in "
+        "PROMPT_DIR/entity_type as the server does) or a path",
     )
     args = parser.parse_args(argv)
     if not args.schema:
         parser.error("nothing to do: pass --schema")
     try:
-        schema = schema_for_profile(args.profile)
+        profile_path, found_as = resolve_profile_argument(args.profile)
+        schema = schema_for_profile(profile_path)
     except (OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    # stdout carries the schema only; which file it came from goes to stderr.
+    print(f"profile: {profile_path} ({found_as})", file=sys.stderr)
     print(json.dumps(schema, indent=2, ensure_ascii=False))
     return 0
 
