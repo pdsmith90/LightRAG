@@ -448,7 +448,10 @@ after it) is stored with the chunk, and the knowledge rebuild after a document d
 the kept-summary rebuild of a re-ingest and the rollback purge read that and never call
 the hook (*Rebuilding from stored records*): a renamed or dropped name's records are
 found under the name the graph holds, so a deletion leaves the edge and its nodes with
-the surviving documents' chunk ids and text only, as without a hook, and a hook that is
+the surviving documents' chunk ids and text only, as without a hook, except a node that
+the surviving chunks name only as the end of a relation and hold no entity record for: it
+is rebuilt from its edges' current descriptions and keeps the deleted document's text
+(as on the base branch, with or without a hook). A hook that is
 changed, removed or raising later changes nothing a deletion rebuilds. The
 `lightrag-repair-chunk-tracking` tool attributes such a chunk from its stored records.
 Reported in the `/health` configuration.
@@ -532,10 +535,8 @@ contribution its own way, which is how extraction merged them.
 Chunks extracted before. Every chunk extracted before this rule, with or without the
 contract (production has none with it), carries no records and is rebuilt from its
 cache, as the base branch rebuilds it: switching the contract or the hook on does not
-change what a deletion rebuilds for them. A chunk extracted with the contract by an
-earlier version of this branch (which recorded a contract fingerprint,
-`llm_cache_contract`, now ignored) is rebuilt by the plain re-parse too. Re-ingest those
-documents to give them records. Switching the contract or the hook on does not re-check,
+change what a deletion rebuilds for them. Re-ingest those documents to give them
+records. Switching the contract or the hook on does not re-check,
 re-key or rename anything already in the graph; switching it off, or changing the list,
 the inverse names or the hook, changes nothing for chunks that have records. Tests:
 `tests/extraction/test_kg_contract_reproduce.py`,
