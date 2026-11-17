@@ -1490,6 +1490,8 @@ def search_library(
     mode: 'naive' (default, fast vector search ~5 s — best for verification and claim checks),
           'mix' (hybrid KG + lexical + vectors), 'hybrid', 'local' (entity-centric),
           or 'global' (theme/relationship-centric). Any other value falls back to 'naive'.
+          If a 'naive' search misses a paper you expect, retry once with 'mix': it is about
+          twice as slow and finds a few more.
     top_k: the knowledge-graph entities and relations retrieved, default 10,
     clamped to the proxy's configured maximum. Larger values fill the server's
     token budget with them and can starve document-chunk retrieval, leaving few or
