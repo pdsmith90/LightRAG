@@ -33,6 +33,7 @@ starting with [README.md](./README.md), applies as written.
 | [Sidecar relations](#sidecar-relations) | `SIDECAR_RELATIONS` | `all` (upstream behaviour) |
 | [Paper filter in the graph view](#paper-filter-in-the-graph-view) | none; reference lists via `ZOTERO_REFERENCES` | always active |
 | [Paper lookup that forgives typography, and one paper's passages](#paper-lookup-that-forgives-typography-and-one-papers-passages) | none | always active |
+| [Paper structure: related papers, topics, connections and the paper map](#paper-structure-related-papers-topics-connections-and-the-paper-map) | `ZOTERO_STRUCT_SCHEMA` | unset (off) |
 | [PostgreSQL edge removal in plain SQL](#postgresql-edge-removal-in-plain-sql) | none | always active |
 | [A document delete keeps cache rows another document lists](#a-document-delete-keeps-cache-rows-another-document-lists) | none | always active |
 | [Resume purge keeps a failed document retryable](#resume-purge-keeps-a-failed-document-retryable) | none | always active |
@@ -408,6 +409,86 @@ header `X-Paper-Search: 2` (a FastAPI request-validation 422 carries none). Code
 `lightrag/zotero_papers.py`, `PGKVStorage.rank_chunks_by_text`,
 `PGVectorStorage.rank_ids_by_vector`.
 
+### Paper structure: related papers, topics, connections and the paper map
+
+With `ZOTERO_STRUCT_SCHEMA` naming a PostgreSQL schema that holds the library's
+citation structure, the server answers four agent routes and the WebUI offers a paper
+map. Unset (the default), nothing reads the schema, the routes answer 501, `/health`
+is unchanged and the WebUI shows no map. They also answer 501 when the document-status
+storage is not PostgreSQL (the schema is read through its connection pool, so the
+graph storage does not matter), when the name is not a lower-case SQL identifier, or
+when a table is missing. The schema is built and loaded outside this repository (a
+script that reads the Zotero metadata and OpenAlex) and is rebuilt, never edited.
+
+The schema's tables, by the columns the server reads:
+
+| Table | Columns |
+|---|---|
+| `papers` | `paper_id` (`doi:<doi>` or `zot:<Zotero item key>`), `doi`, `title`, `year`, `venue_id`, `cited_by_count`, `n_refs_openalex` |
+| `venues` | `venue_id`, `display_name` |
+| `paper_attachments` | `attachment_key` (the Zotero storage key a corpus file starts with), `paper_id` |
+| `authors` | `author_id`, `display_name` |
+| `paper_authors` | `paper_id`, `author_id`, `position` |
+| `topics` | `topic_id` (`domain:`, `field:`, `subfield:`, `topic:` + id), `display_name`, `level`, `parent_id` |
+| `paper_topics` | `paper_id`, `topic_id` (topic level), `is_primary` |
+| `cites` | `citing_paper_id`, `cited_paper_id` (both library papers) |
+| `coupled` | `paper_a`, `paper_b`, `shared_refs`, `score` (bibliographic coupling) |
+
+The server reads the schema whole into memory on first use (about 10,500 papers and
+166,000 links in under a second against a local server) and reads it again when a
+rebuild changes the tables' OIDs or file nodes, which it checks at most once a minute;
+path searches and maps then run in memory in milliseconds, where per-request SQL would
+need recursive queries for every path. Which papers have text in the knowledge base
+comes from the document-status table itself: processed documents of the server's
+workspace, keyed by the attachment key their file path starts with, read at most every
+five minutes. A view the schema may carry for that join is not used. A paper is named
+by an attachment key, a DOI or a schema `paper_id`; papers in results carry `in_kb` and
+`key`, the attachment key for `POST /graph/papers/passages`.
+
+| Route | Parameters | Answer |
+|---|---|---|
+| `GET /graph/papers/related` | `paper`; `relations` (comma-separated `cites`, `cited_by`, `coupled`, `coauthor`; default all); `limit` 1..200 (20) | `paper`, `totals` per relation, `ranking`, `related` (each with `reasons`, `score`, `shared_refs` / `coupling_score`, `shared_authors`), `truncated`; `reason: not_in_structure` for an unknown paper |
+| `GET /graph/papers/topics` | `q` (words of the name), `level` (`domain`, `field`, `subfield`, `topic`), `limit` | `total`, `topics` (each with `path`, `n_papers`: a topic row under it, `n_primary`: primary topic under it) |
+| `GET /graph/papers/by_topic` | `topic` (id at any level, or words of its name), `limit`, `primary_only` | `topic`, `alternatives` (next name matches), `total`, `in_kb`, `ranking`, `papers`; `reason: no_topic` |
+| `GET /graph/papers/connect` | `a`, `b`, `paths` 1..5 (3), `max_hops` 1..8 (6) | `a`, `b`, `links` (`relation`, `shared_refs` / `coupling_score`, `shared_authors`, `same_topic` / `same_subfield` / `same_field`, `cited_by_both`, `cite_both`), `paths` (each with `hops`, `cost`, `papers` passed through and labelled `steps`); `reason`: `not_in_structure` (with `missing`), `same_paper`, `not_connected` |
+| `GET /graphs/paper/map` | `paper` (repeat, at most 10), `hops` 1..2 (1), `max_nodes` (capped by `MAX_GRAPH_NODES`) | the `/graphs` structure plus `paper` (the papers' summaries, `n_hop1` / `n_hop2` found, `shown_hop1` / `shown_hop2`, `ranking`); `paper.reason`: `too_many_papers`, `not_in_structure`, `no_links` |
+
+Rankings, also stated in each answer: related papers score 1.0 for a citation either
+way (+0.25 both ways), plus 2 x the coupling score, plus 0.25 per shared author (at
+most four); papers of a topic come with their primary topic under it first, then most
+cited by library papers, then most cited overall, then newest. Paths are the cheapest
+over citations (either direction) and coupling, where passing through a paper costs
+1 + 0.5 x log2(1 + its links), so a hub cited by hundreds of library papers costs about
+as much as two more ordinary steps; each later path avoids the papers of the earlier
+ones, and a direct link is reported once. Shared knowledge-graph entities are not part
+of `connect`: the paper filter's common view shows them. Topics label and filter; they
+do not enter retrieval, and no route changes passage retrieval.
+
+The map shows papers one or two steps from the chosen ones over citations and
+coupling: the chosen papers, then one-step papers by the strength of their links to
+them (1.0 per citation either way plus 2 x the coupling score), then two-step papers by
+the strength of the one-step papers they link to, each damped by log2(2 + its links),
+cut at the node limit. A node is a paper: its id the DOI (else an attachment key),
+its label "Family Year", `entity_type` the field of its primary topic (so the legend
+colours fields), and its properties title, year, venue, DOI, authors, topic,
+subfield, counts, `in_kb` and `attachment_key`. An edge runs from the citing to the
+cited paper (`DIRECTED`; coupling-only pairs are `UNDIRECTED`), with `keywords`
+`cites`, `cite each other`, `coupled` or both, and `weight` 1.0 per citation plus 2 x
+the coupling score. In the WebUI the picker's mode button reaches the map after
+"in common" (label `paper+map:<ids>`) while `/health` reports `zotero_struct: true`;
+in map mode the second button sets the reach, one or two steps (remembered per
+browser). Expanding a node adds that paper to the map's papers instead of expanding
+an entity, and map nodes and edges are not editable.
+
+The MCP proxy's `related_papers`, `papers_by_topic` and `connect_papers` call these
+routes (see [zotero-toolkit/mcp/README.md](./zotero-toolkit/mcp/README.md#paper-structure)).
+Code: `lightrag/zotero_struct.py`, `lightrag_webui/src/lib/paperFilter.ts`,
+`lightrag_webui/src/components/graph/PaperFilter.tsx`. Tests:
+`tests/test_zotero_struct.py` (offline, the SQL answered by a stub) and
+`tests/test_zotero_struct_pg_smoke.py` (`pg_smoke`: `--run-integration` and a scratch
+PostgreSQL named by the `POSTGRES_*` settings; it builds and drops a small schema of
+its own).
+
 ### PostgreSQL edge removal in plain SQL
 
 `PGGraphStorage.remove_edges` deletes edges with one plain-SQL statement per batch on
@@ -567,7 +648,9 @@ also triggers on pushes and pull requests to `zlightrag`, as does upstream's
 [.github/workflows/linting.yaml](./.github/workflows/linting.yaml). The exception is the Apache
 AGE integration test for the edge removal,
 `tests/kg/postgres_impl/test_postgres_remove_edges_age.py`, which needs
-`--run-integration` and a live AGE server; no workflow runs it.
+`--run-integration` and a live AGE server, and the paper-structure smoke test
+`tests/test_zotero_struct_pg_smoke.py`, which needs `--run-integration` and a scratch
+PostgreSQL; no workflow runs either.
 
 ## `zotero-toolkit/`
 
