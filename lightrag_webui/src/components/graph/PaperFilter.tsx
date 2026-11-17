@@ -3,8 +3,11 @@ import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import {
   Check,
+  CircleDot,
   FileText,
+  MapIcon,
   Network,
+  Orbit,
   Share2,
   Spline,
   SquaresIntersect,
@@ -16,20 +19,25 @@ import Badge from '@/components/ui/Badge'
 import Button from '@/components/ui/Button'
 import { controlButtonVariant } from '@/lib/constants'
 import {
+  MapHops,
   MAX_PAPERS,
   nextContext,
+  nextHops,
   nextMode,
   paperLabel,
   parsePaperLabel,
   PaperContext,
   PaperGraphMode,
+  readMapHops,
   readPaperContext,
   togglePaper,
+  writeMapHops,
   writePaperContext
 } from '@/lib/paperFilter'
 import { searchPapers, PaperSummary } from '@/api/lightrag'
 import { useSettingsStore } from '@/stores/settings'
 import { useGraphStore } from '@/stores/graph'
+import { useBackendState } from '@/stores/state'
 import { SearchHistoryManager } from '@/utils/SearchHistoryManager'
 
 // Papers seen in search results, so a chip can show a citation instead of a DOI.
@@ -49,17 +57,23 @@ export const __resetPaperFilterForTests = (): void => {
 const modeIcons = {
   paper: FileText,
   shared: Network,
-  common: SquaresIntersect
+  common: SquaresIntersect,
+  map: MapIcon
 }
 const contextIcons = {
   own: Spline,
   kb: Share2,
   linked: Waypoints
 }
+const hopsIcons = {
+  1: CircleDot,
+  2: Orbit
+}
 
 // Fork: shows the part of the graph that one or more papers contributed, the part
 // they share with the library papers they cite, or the part at least two of them
-// contributed, by setting a paper label (see lib/paperFilter).
+// contributed, or (with the server's paper structure) a map of the papers around
+// them, by setting a paper label (see lib/paperFilter).
 const PaperFilter = () => {
   const { t } = useTranslation()
   const label = useSettingsStore.use.queryLabel()
@@ -70,6 +84,9 @@ const PaperFilter = () => {
   const [pendingMode, setPendingMode] = useState<PaperGraphMode>('paper')
   const mode = current?.mode ?? pendingMode
   const [context, setContext] = useState<PaperContext>(readPaperContext)
+  const [hops, setHops] = useState<MapHops>(readMapHops)
+  // The map is offered only when the server reports its paper structure readable.
+  const mapAvailable = useBackendState.use.status()?.configuration?.zotero_struct === true
   // Bumped when a lookup fills knownPapers, to redraw the chips.
   const [, setKnownVersion] = useState(0)
 
@@ -137,37 +154,60 @@ const PaperFilter = () => {
   )
 
   const toggleMode = useCallback(() => {
-    const next = nextMode(mode, papers.length)
+    const next = nextMode(mode, papers.length, mapAvailable)
     setPendingMode(next)
     if (current) show(papers, next)
-  }, [mode, papers, current, show])
+  }, [mode, papers, current, show, mapAvailable])
 
-  const toggleContext = useCallback(() => {
-    const next = nextContext(context)
-    writePaperContext(next)
-    setContext(next)
-    // The context is not part of the label, so a refetch has to be asked for.
+  // Neither the density nor the map's reach is part of the label, so a change
+  // asks for a refetch.
+  const refetch = useCallback(() => {
     if (current) {
       useGraphStore.getState().setGraphDataFetchAttempted(false)
       useGraphStore.getState().incrementGraphDataVersion()
     }
-  }, [context, current])
+  }, [current])
+
+  const toggleContext = useCallback(() => {
+    if (mode === 'map') {
+      const next = nextHops(hops)
+      writeMapHops(next)
+      setHops(next)
+    } else {
+      const next = nextContext(context)
+      writePaperContext(next)
+      setContext(next)
+    }
+    refetch()
+  }, [mode, hops, context, refetch])
 
   const ModeIcon = modeIcons[mode]
-  const ContextIcon = contextIcons[context]
+  const ContextIcon = mode === 'map' ? hopsIcons[hops] : contextIcons[context]
+  // The tooltip names what a click shows next, which depends on the map.
+  const toMap = nextMode(mode, papers.length, mapAvailable) === 'map'
   const modeTooltip = t(
-    mode === 'common'
-      ? 'graphPanel.paperFilter.modeCommonTooltip'
-      : mode === 'shared'
-        ? 'graphPanel.paperFilter.modeSharedTooltip'
-        : 'graphPanel.paperFilter.modePaperTooltip'
+    mode === 'map'
+      ? 'graphPanel.paperFilter.modeMapTooltip'
+      : mode === 'common'
+        ? toMap
+          ? 'graphPanel.paperFilter.modeCommonMapTooltip'
+          : 'graphPanel.paperFilter.modeCommonTooltip'
+        : mode === 'shared'
+          ? toMap
+            ? 'graphPanel.paperFilter.modeSharedMapTooltip'
+            : 'graphPanel.paperFilter.modeSharedTooltip'
+          : 'graphPanel.paperFilter.modePaperTooltip'
   )
   const contextTooltip = t(
-    context === 'linked'
-      ? 'graphPanel.paperFilter.contextLinkedTooltip'
-      : context === 'kb'
-        ? 'graphPanel.paperFilter.contextKbTooltip'
-        : 'graphPanel.paperFilter.contextOwnTooltip'
+    mode === 'map'
+      ? hops === 2
+        ? 'graphPanel.paperFilter.mapTwoHopsTooltip'
+        : 'graphPanel.paperFilter.mapOneHopTooltip'
+      : context === 'linked'
+        ? 'graphPanel.paperFilter.contextLinkedTooltip'
+        : context === 'kb'
+          ? 'graphPanel.paperFilter.contextKbTooltip'
+          : 'graphPanel.paperFilter.contextOwnTooltip'
   )
 
   return (

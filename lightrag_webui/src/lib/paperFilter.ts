@@ -2,12 +2,17 @@
 // fetch, refresh, retry and history handling cover it unchanged: a label
 // `paper:<ids>` shows what the papers contributed, `paper+refs:<ids>` only what
 // they share with the library papers they cite, `paper+common:<ids>` what at
-// least two of them contributed. <ids> are DOIs or Zotero keys separated by
-// whitespace.
+// least two of them contributed, `paper+map:<ids>` the papers around them
+// over citations and coupling (a server with the paper structure only). <ids>
+// are DOIs or Zotero keys separated by whitespace.
 
 import type { PaperSummary } from '@/api/lightrag'
 
-export type PaperGraphMode = 'paper' | 'shared' | 'common'
+export type PaperGraphMode = 'paper' | 'shared' | 'common' | 'map'
+
+// How far the paper map reaches from the chosen papers: a viewing preference
+// like the density, so it is not part of the label either.
+export type MapHops = 1 | 2
 
 // How much of the wider knowledge base the graph shows around the papers:
 // their own relations, plus every relation between the shown entities, plus
@@ -19,10 +24,12 @@ export const MAX_PAPERS = 10
 const PREFIXES: Record<PaperGraphMode, string> = {
   paper: 'paper:',
   shared: 'paper+refs:',
-  common: 'paper+common:'
+  common: 'paper+common:',
+  map: 'paper+map:'
 }
 
 const CONTEXT_KEY = 'lightrag-paper-context'
+const HOPS_KEY = 'lightrag-paper-map-hops'
 
 // Relations and linking entities the selected papers did not contribute.
 export const CONTEXT_EDGE_COLOR = 'rgba(59,130,246,0.6)'
@@ -35,7 +42,7 @@ export const paperLabel = (papers: string[], mode: PaperGraphMode): string => {
 export const parsePaperLabel = (
   label: string | null | undefined
 ): { papers: string[]; mode: PaperGraphMode } | null => {
-  for (const mode of ['shared', 'common', 'paper'] as const) {
+  for (const mode of ['shared', 'common', 'map', 'paper'] as const) {
     const prefix = PREFIXES[mode]
     if (label?.startsWith(prefix)) {
       const papers = [...new Set(label.slice(prefix.length).split(/\s+/).filter(Boolean))]
@@ -48,10 +55,27 @@ export const parsePaperLabel = (
 export const togglePaper = (papers: string[], id: string): string[] =>
   papers.includes(id) ? papers.filter((p) => p !== id) : [...papers, id]
 
-// paper -> shared -> common; common needs two papers.
-export const nextMode = (mode: PaperGraphMode, n: number): PaperGraphMode => {
+// Expanding a paper-map node adds that paper to the map's papers: the next
+// label, or why not (the i18n key under graphPanel.paperFilter).
+export const expandMapLabel = (
+  papers: string[],
+  id: string
+): { label: string } | { reason: 'mapAlreadyChosen' | 'maxPapers' } => {
+  if (papers.includes(id)) return { reason: 'mapAlreadyChosen' }
+  if (papers.length >= MAX_PAPERS) return { reason: 'maxPapers' }
+  return { label: paperLabel([...papers, id], 'map') }
+}
+
+// paper -> shared -> common -> map; common needs two papers, the map a server
+// that reports the paper structure.
+export const nextMode = (
+  mode: PaperGraphMode,
+  n: number,
+  mapAvailable: boolean = false
+): PaperGraphMode => {
   if (mode === 'paper') return 'shared'
   if (mode === 'shared' && n >= 2) return 'common'
+  if ((mode === 'shared' || mode === 'common') && mapAvailable) return 'map'
   return 'paper'
 }
 
@@ -86,8 +110,34 @@ export const writePaperContext = (context: PaperContext): void => {
   }
 }
 
+export const nextHops = (hops: MapHops): MapHops => (hops === 1 ? 2 : 1)
+
+let currentHops: MapHops | null = null
+
+export const readMapHops = (): MapHops => {
+  if (currentHops === null) {
+    currentHops = 1
+    try {
+      if (localStorage.getItem(HOPS_KEY) === '2') currentHops = 2
+    } catch {
+      // storage unavailable: keep the default
+    }
+  }
+  return currentHops
+}
+
+export const writeMapHops = (hops: MapHops): void => {
+  currentHops = hops
+  try {
+    localStorage.setItem(HOPS_KEY, String(hops))
+  } catch {
+    // storage unavailable: the choice lasts until reload at most
+  }
+}
+
 export const __resetPaperContextForTests = (): void => {
   currentContext = null
+  currentHops = null
 }
 
 // A paper result that arrives after the selection changed is out of date: the
@@ -131,8 +181,22 @@ export const paperSummaryMessage = (
   if (summary.reason) {
     const many =
       papers.length >= 2 &&
-      ['not_in_kb', 'no_reference_list', 'no_references_in_kb'].includes(summary.reason)
+      ['not_in_kb', 'no_reference_list', 'no_references_in_kb', 'not_in_structure'].includes(
+        summary.reason
+      )
     return t(k(`reason.${summary.reason}${many ? '_many' : ''}`))
+  }
+
+  if (summary.mode === 'map') {
+    let map = t(k('mapSummary'), {
+      count: papers.length,
+      nodes,
+      hop1: summary.shown_hop1 ?? 0,
+      hop2: summary.shown_hop2 ?? 0
+    })
+    const unknown = papers.filter((p) => p.reason === 'not_in_structure').length
+    if (unknown) map += `; ${t(k('someNotInStructure'), { count: unknown })}`
+    return map
   }
 
   // Linking entities are in the node count but are not what the papers contributed.

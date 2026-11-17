@@ -5,9 +5,11 @@ import { errorMessage } from '@/lib/utils'
 import * as Constants from '@/lib/constants'
 import { useGraphStore, RawGraph, RawNodeType, RawEdgeType } from '@/stores/graph'
 import { toast } from 'sonner'
-import { queryGraphs, queryPaperGraph, PaperSummary } from '@/api/lightrag'
+import { queryGraphs, queryPaperGraph, queryPaperMap, PaperSummary } from '@/api/lightrag'
 import {
+  expandMapLabel,
   parsePaperLabel,
+  readMapHops,
   readPaperContext,
   paperSummaryMessage,
   paperNodeAttrs,
@@ -17,6 +19,7 @@ import {
 } from '@/lib/paperFilter'
 import { useBackendState } from '@/stores/state'
 import { useSettingsStore } from '@/stores/settings'
+import { SearchHistoryManager } from '@/utils/SearchHistoryManager'
 
 import { resolveNodeColor, DEFAULT_NODE_COLOR } from '@/utils/graphColor'
 import { hasEdgeSafe, addUndirectedEdgeSafe } from '@/utils/graphEdgeSafety'
@@ -170,7 +173,9 @@ const fetchGraph = async (label: string, maxDepth: number, maxNodes: number) => 
   try {
     console.log(`Fetching graph label: ${queryLabel}, depth: ${maxDepth}, nodes: ${maxNodes}`)
     rawData = paperFilter
-      ? await queryPaperGraph(paperFilter.papers, paperFilter.mode, readPaperContext(), maxNodes)
+      ? paperFilter.mode === 'map'
+        ? await queryPaperMap(paperFilter.papers, readMapHops(), maxNodes)
+        : await queryPaperGraph(paperFilter.papers, paperFilter.mode, readPaperContext(), maxNodes)
       : await queryGraphs(queryLabel, maxDepth, maxNodes)
   } catch (e) {
     // Record the backend error, then RETHROW so the caller's .catch() runs its
@@ -708,6 +713,25 @@ const useLightrangeGraph = () => {
   useEffect(() => {
     const nodeId = useGraphStore.getState().nodeToExpand
     if (!nodeId) return
+
+    // Fork: a paper-map node is a paper, not an entity, so the entity-graph
+    // expansion must not see its id: expanding it adds it to the map's papers.
+    const shownMap = parsePaperLabel(useSettingsStore.getState().queryLabel)
+    if (shownMap?.mode === 'map') {
+      const next = expandMapLabel(shownMap.papers, nodeId)
+      if ('reason' in next) {
+        toast.info(t(`graphPanel.paperFilter.${next.reason}`))
+      } else {
+        SearchHistoryManager.addToHistory(next.label)
+        useGraphStore.getState().setGraphDataFetchAttempted(false)
+        useSettingsStore.getState().setQueryLabel(next.label)
+        useGraphStore.getState().incrementGraphDataVersion()
+      }
+      window.setTimeout(() => {
+        useGraphStore.getState().triggerNodeExpand(null)
+      }, 0)
+      return
+    }
 
     const handleNodeExpand = async () => {
       const { sigmaGraph, rawGraph } = useGraphStore.getState()

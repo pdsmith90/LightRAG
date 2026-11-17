@@ -418,6 +418,22 @@
       "refreshCurrentLabelTooltip": "重新整理目前頁面圖形資料",
       "refreshingTooltip": "正在重新整理資料..."
     },
+    "paperFilter": {
+      "modeSharedMapTooltip": "僅顯示所選論文與其引用論文共有的內容。點擊顯示論文地圖：透過引用和書目耦合相連的周邊論文",
+      "modeCommonMapTooltip": "顯示至少兩篇所選論文貢獻的內容。點擊顯示論文地圖：透過引用和書目耦合相連的周邊論文",
+      "modeMapTooltip": "論文地圖：透過引用和書目耦合連接的所選論文周邊論文，依領域著色。點擊顯示論文貢獻的全部內容",
+      "mapOneHopTooltip": "顯示一步之內的論文。點擊擴展到兩步（最強連結優先，直至節點上限）",
+      "mapTwoHopsTooltip": "顯示兩步之內的論文。點擊僅顯示一步",
+      "mapSummary": "論文地圖：{{nodes}} 篇論文（一步 {{hop1}} 篇，兩步 {{hop2}} 篇）",
+      "someNotInStructure": "所選論文中有 {{count}} 篇不在引用結構中",
+      "mapAlreadyChosen": "這篇論文已是地圖的論文之一",
+      "mapAddPaperTooltip": "將這篇論文加入地圖的論文",
+      "reason": {
+        "not_in_structure": "這篇論文不在引用結構中",
+        "not_in_structure_many": "所選論文都不在引用結構中",
+        "no_links": "沒有引用或耦合連結：僅顯示所選論文"
+      }
+    },
     "emptyGraph": "無數據(請重載圖形數據)"
   },
   "retrievePanel": {

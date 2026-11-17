@@ -418,6 +418,22 @@
       "refreshCurrentLabelTooltip": "Graphdaten der aktuellen Seite aktualisieren",
       "refreshingTooltip": "Daten werden aktualisiert..."
     },
+    "paperFilter": {
+      "modeSharedMapTooltip": "Zeigt nur, was die Arbeiten mit den von ihnen zitierten Arbeiten teilen. Klicken für die Literaturkarte: die Arbeiten im Umfeld über Zitate und bibliographische Kopplung",
+      "modeCommonMapTooltip": "Zeigt, was mindestens zwei der gewählten Arbeiten beigetragen haben. Klicken für die Literaturkarte: die Arbeiten im Umfeld über Zitate und bibliographische Kopplung",
+      "modeMapTooltip": "Literaturkarte: die Arbeiten im Umfeld der gewählten über Zitate und bibliographische Kopplung, nach Fachgebiet gefärbt. Klicken, um alles zu zeigen, was die Arbeiten beigetragen haben",
+      "mapOneHopTooltip": "Zeigt Arbeiten einen Schritt entfernt. Klicken für zwei Schritte (stärkste Verbindungen zuerst, bis zur Knotengrenze)",
+      "mapTwoHopsTooltip": "Zeigt Arbeiten bis zu zwei Schritte entfernt. Klicken für nur einen Schritt",
+      "mapSummary": "Literaturkarte: {{nodes}} Arbeiten ({{hop1}} einen Schritt entfernt, {{hop2}} zwei Schritte)",
+      "someNotInStructure": "{{count}} der gewählten Arbeiten sind nicht in der Zitationsstruktur",
+      "mapAlreadyChosen": "Diese Arbeit gehört schon zu den Arbeiten der Karte",
+      "mapAddPaperTooltip": "Diese Arbeit zu den Arbeiten der Karte hinzufügen",
+      "reason": {
+        "not_in_structure": "Diese Arbeit ist nicht in der Zitationsstruktur",
+        "not_in_structure_many": "Keine der gewählten Arbeiten ist in der Zitationsstruktur",
+        "no_links": "Keine Zitat- oder Kopplungsverbindungen: nur die gewählten Arbeiten werden gezeigt"
+      }
+    },
     "emptyGraph": "Leer (Bitte erneut laden)"
   },
   "retrievePanel": {

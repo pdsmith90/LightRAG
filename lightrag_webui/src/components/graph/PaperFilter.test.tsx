@@ -7,6 +7,7 @@ import en from '@/locales/en.json'
 import { __setAxiosAdapterForTests } from '@/api/lightrag'
 import { useGraphStore } from '@/stores/graph'
 import { useSettingsStore } from '@/stores/settings'
+import { useBackendState } from '@/stores/state'
 import { AsyncSelect } from '@/components/ui/AsyncSelect'
 import { __resetPaperContextForTests } from '@/lib/paperFilter'
 import { SearchHistoryManager } from '@/utils/SearchHistoryManager'
@@ -36,7 +37,13 @@ const LIBRARY = [paper('10.1/a', 'Alpha 2020', ['AAAA1111']), paper('10.1/b', 'B
 const label = () => useSettingsStore.getState().queryLabel
 const version = () => useGraphStore.getState().graphDataVersion
 
+const setPaperMap = (available: boolean | undefined) =>
+  useBackendState.setState({
+    status: { status: 'healthy', configuration: { zotero_struct: available } } as any
+  })
+
 beforeEach(() => {
+  setPaperMap(undefined)
   localStorage.clear()
   __resetPaperFilterForTests()
   __resetPaperContextForTests()
@@ -188,6 +195,48 @@ describe('PaperFilter', () => {
     // The selection is untouched: the density is not part of the label.
     expect(label()).toBe('paper:10.1/a')
     expect(screen.getByRole('button', { name: strings.contextLinkedTooltip })).toBeTruthy()
+  })
+})
+
+describe('PaperFilter paper map', () => {
+  test('the map is offered only while the server reports its paper structure', () => {
+    setPaperMap(false)
+    useSettingsStore.getState().setQueryLabel('paper+refs:10.1/a')
+    const { unmount } = renderWithProviders(<PaperFilter />)
+    fireEvent.click(screen.getByRole('button', { name: strings.modeSharedTooltip }))
+    expect(label()).toBe('paper:10.1/a')
+    unmount()
+
+    setPaperMap(true)
+    useSettingsStore.getState().setQueryLabel('paper+refs:10.1/a')
+    renderWithProviders(<PaperFilter />)
+    fireEvent.click(screen.getByRole('button', { name: strings.modeSharedMapTooltip }))
+    expect(label()).toBe('paper+map:10.1/a')
+    fireEvent.click(screen.getByRole('button', { name: strings.modeMapTooltip }))
+    expect(label()).toBe('paper:10.1/a')
+  })
+
+  test('two papers reach the map after common', () => {
+    setPaperMap(true)
+    useSettingsStore.getState().setQueryLabel('paper+common:10.1/a 10.1/b')
+    renderWithProviders(<PaperFilter />)
+    fireEvent.click(screen.getByRole('button', { name: strings.modeCommonMapTooltip }))
+    expect(label()).toBe('paper+map:10.1/a 10.1/b')
+  })
+
+  test('on the map the density button sets the reach and refetches', () => {
+    setPaperMap(true)
+    useSettingsStore.getState().setQueryLabel('paper+map:10.1/a')
+    renderWithProviders(<PaperFilter />)
+    const before = version()
+
+    fireEvent.click(screen.getByRole('button', { name: strings.mapOneHopTooltip }))
+    expect(version()).toBe(before + 1)
+    expect(localStorage.getItem('lightrag-paper-map-hops')).toBe('2')
+    // the density for the other views is untouched, and so is the label
+    expect(localStorage.getItem('lightrag-paper-context')).toBe(null)
+    expect(label()).toBe('paper+map:10.1/a')
+    expect(screen.getAllByRole('button', { name: strings.mapTwoHopsTooltip }).length).toBe(1)
   })
 })
 

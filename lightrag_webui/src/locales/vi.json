@@ -418,6 +418,22 @@
       "refreshCurrentLabelTooltip": "Làm mới dữ liệu đồ thị trang hiện tại",
       "refreshingTooltip": "Đang làm mới dữ liệu..."
     },
+    "paperFilter": {
+      "modeSharedMapTooltip": "Chỉ hiển thị những gì các bài báo chia sẻ với các bài chúng trích dẫn. Nhấn để xem bản đồ bài báo: các bài xung quanh qua trích dẫn và ghép nối thư mục",
+      "modeCommonMapTooltip": "Hiển thị những gì ít nhất hai bài đã chọn đóng góp. Nhấn để xem bản đồ bài báo: các bài xung quanh qua trích dẫn và ghép nối thư mục",
+      "modeMapTooltip": "Bản đồ bài báo: các bài quanh những bài đã chọn qua trích dẫn và ghép nối thư mục, tô màu theo lĩnh vực. Nhấn để hiển thị mọi thứ các bài đã đóng góp",
+      "mapOneHopTooltip": "Đang hiển thị các bài cách một bước. Nhấn để mở rộng đến hai bước (liên kết mạnh nhất trước, đến giới hạn nút)",
+      "mapTwoHopsTooltip": "Đang hiển thị các bài cách tối đa hai bước. Nhấn để chỉ hiển thị một bước",
+      "mapSummary": "Bản đồ bài báo: {{nodes}} bài ({{hop1}} cách một bước, {{hop2}} cách hai bước)",
+      "someNotInStructure": "{{count}} bài đã chọn không có trong cấu trúc trích dẫn",
+      "mapAlreadyChosen": "Bài này đã là một trong các bài của bản đồ",
+      "mapAddPaperTooltip": "Thêm bài này vào các bài của bản đồ",
+      "reason": {
+        "not_in_structure": "Bài này không có trong cấu trúc trích dẫn",
+        "not_in_structure_many": "Không bài nào đã chọn có trong cấu trúc trích dẫn",
+        "no_links": "Không có liên kết trích dẫn hay ghép nối: chỉ hiển thị các bài đã chọn"
+      }
+    },
     "emptyGraph": "Trống (Thử Tải Lại)"
   },
   "retrievePanel": {

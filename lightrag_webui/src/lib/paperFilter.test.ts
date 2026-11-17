@@ -6,17 +6,21 @@ import {
   __resetPaperContextForTests,
   CONTEXT_EDGE_COLOR,
   clearsLabelOnEmpty,
+  expandMapLabel,
   isStalePaperResult,
   fadeColor,
   nextContext,
+  nextHops,
   nextMode,
   paperEdgeAttrs,
   paperLabel,
   paperNodeAttrs,
   paperSummaryMessage,
   parsePaperLabel,
+  readMapHops,
   readPaperContext,
   togglePaper,
+  writeMapHops,
   writePaperContext
 } from './paperFilter'
 
@@ -276,5 +280,86 @@ describe('paperSummaryMessage', () => {
         paperSummaryMessage(t, { ...base, reason: code, n_context_edges: 5, papers: [base] }, 0)
       ).toBe((en.graphPanel.paperFilter.reason as Record<string, string>)[code])
     }
+  })
+})
+
+describe('paper map', () => {
+  test('a map label has its own prefix and round-trips', () => {
+    expect(paperLabel(['10.1/a', 'ABCD1234'], 'map')).toBe('paper+map:10.1/a ABCD1234')
+    expect(parsePaperLabel('paper+map:10.1/a ABCD1234')).toEqual({
+      papers: ['10.1/a', 'ABCD1234'],
+      mode: 'map'
+    })
+    // not read as a paper label whose first id is "+map:..."
+    expect(parsePaperLabel('paper+map:10.1/a')?.mode).toBe('map')
+  })
+
+  test('the mode cycle offers the map only when the server has it', () => {
+    expect(nextMode('shared', 1, true)).toBe('map')
+    expect(nextMode('shared', 2, true)).toBe('common')
+    expect(nextMode('common', 2, true)).toBe('map')
+    expect(nextMode('map', 2, true)).toBe('paper')
+    expect(nextMode('map', 1, false)).toBe('paper')
+    // unavailable: the cycle is the one it always was
+    expect(nextMode('shared', 1, false)).toBe('paper')
+    expect(nextMode('common', 2)).toBe('paper')
+  })
+
+  test('expanding a map node adds it to the papers, at most ten', () => {
+    expect(expandMapLabel(['10.1/a'], 'ABCD1234')).toEqual({
+      label: 'paper+map:10.1/a ABCD1234'
+    })
+    expect(expandMapLabel(['10.1/a'], '10.1/a')).toEqual({ reason: 'mapAlreadyChosen' })
+    const ten = Array.from({ length: 10 }, (_, i) => `10.1/${i}`)
+    expect(expandMapLabel(ten, '10.1/new')).toEqual({ reason: 'maxPapers' })
+    expect(en.graphPanel.paperFilter.mapAlreadyChosen).toBeTruthy()
+  })
+
+  test('the reach is stored and read back, defaulting to one hop', () => {
+    const original = Object.getOwnPropertyDescriptor(globalThis, 'localStorage')
+    const data = new Map<string, string>()
+    Object.defineProperty(globalThis, 'localStorage', {
+      value: {
+        getItem: (k: string) => data.get(k) ?? null,
+        setItem: (k: string, v: string) => void data.set(k, v)
+      },
+      configurable: true
+    })
+    try {
+      __resetPaperContextForTests()
+      expect(readMapHops()).toBe(1)
+      writeMapHops(nextHops(readMapHops()))
+      expect(data.get('lightrag-paper-map-hops')).toBe('2')
+      __resetPaperContextForTests()
+      expect(readMapHops()).toBe(2)
+      expect(nextHops(2)).toBe(1)
+    } finally {
+      __resetPaperContextForTests()
+      if (original) Object.defineProperty(globalThis, 'localStorage', original)
+    }
+  })
+
+  test('a map summary counts the papers at each reach and the unknown ones', () => {
+    const t = (key: string, options: Record<string, unknown> = {}): string => {
+      const text = key.split('.').reduce<any>((node, part) => node?.[part], en)
+      expect(typeof text).toBe('string')
+      return (text as string).replace(/{{(\w+)}}/g, (_, name) => String(options[name]))
+    }
+    const seed = { paper: '10.1/a', doi: '10.1/a', keys: [], title: 'A', citation: 'A', year: '2020', n_refs: 1, n_cited: 1, n_cited_in_kb: 1 } as PaperSummary
+    const map = { ...seed, mode: 'map', hops: 2, shown_hop1: 20, shown_hop2: 9, papers: [seed] } as PaperSummary
+    expect(paperSummaryMessage(t, map, 30)).toBe(
+      'Paper map: 30 papers (20 one step away, 9 two steps away)'
+    )
+    const unknown = { ...map, papers: [seed, { paper: 'ZZZZ9999', reason: 'not_in_structure' } as PaperSummary] }
+    expect(paperSummaryMessage(t, unknown, 30)).toContain(
+      '; 1 of the selected papers are not in the paper structure'
+    )
+    const none = { ...map, reason: 'not_in_structure', papers: [seed, seed] }
+    expect(paperSummaryMessage(t, none, 0)).toBe(
+      en.graphPanel.paperFilter.reason.not_in_structure_many
+    )
+    expect(paperSummaryMessage(t, { ...map, reason: 'no_links' }, 1)).toBe(
+      en.graphPanel.paperFilter.reason.no_links
+    )
   })
 })

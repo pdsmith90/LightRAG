@@ -8,6 +8,13 @@ import { useTranslation } from 'react-i18next'
 import { GitBranchPlus, Scissors, Lock } from 'lucide-react'
 import EditablePropertyRow from './EditablePropertyRow'
 import { useSourceLabels } from '@/hooks/useSourceLabels'
+import { useSettingsStore } from '@/stores/settings'
+import { parsePaperLabel } from '@/lib/paperFilter'
+
+// Fork: the paper map's nodes are papers and its edges citations or coupling,
+// not entities and relations, so they are not edited.
+const usePaperMapShown = (): boolean =>
+  parsePaperLabel(useSettingsStore.use.queryLabel())?.mode === 'map'
 
 /**
  * Component that view properties of elements in graph.
@@ -264,6 +271,7 @@ const PropertyRow = ({
 
 const NodePropertiesView = ({ node, pipelineBusy }: { node: NodeType; pipelineBusy: boolean }) => {
   const { t } = useTranslation()
+  const paperMap = usePaperMapShown()
 
   const handleExpandNode = () => {
     useGraphStore.getState().triggerNodeExpand(node.id)
@@ -297,7 +305,11 @@ const NodePropertiesView = ({ node, pipelineBusy }: { node: NodeType; pipelineBu
             variant="ghost"
             className="h-7 w-7 border border-gray-400 hover:bg-gray-200 dark:border-gray-600 dark:hover:bg-gray-700"
             onClick={handleExpandNode}
-            tooltip={t('graphPanel.propertiesView.node.expandNode')}
+            tooltip={t(
+              paperMap
+                ? 'graphPanel.paperFilter.mapAddPaperTooltip'
+                : 'graphPanel.propertiesView.node.expandNode'
+            )}
           >
             <GitBranchPlus className="h-4 w-4 text-gray-700 dark:text-gray-300" />
           </Button>
@@ -337,7 +349,10 @@ const NodePropertiesView = ({ node, pipelineBusy }: { node: NodeType; pipelineBu
                 nodeId={String(node.id)}
                 entityId={node.properties['entity_id']}
                 entityType="node"
-                isEditable={name === 'description' || name === 'entity_id' || name === 'entity_type'}
+                isEditable={
+                  !paperMap &&
+                  (name === 'description' || name === 'entity_id' || name === 'entity_type')
+                }
                 truncate={node.properties['truncate']}
                 pipelineBusy={pipelineBusy}
               />
@@ -371,6 +386,7 @@ const NodePropertiesView = ({ node, pipelineBusy }: { node: NodeType; pipelineBu
 
 const EdgePropertiesView = ({ edge, pipelineBusy }: { edge: EdgeType; pipelineBusy: boolean }) => {
   const { t } = useTranslation()
+  const paperMap = usePaperMapShown()
   return (
     <div className="flex flex-col gap-2">
       <div className="flex justify-between items-center">
@@ -424,7 +440,7 @@ const EdgePropertiesView = ({ edge, pipelineBusy }: { edge: EdgeType; pipelineBu
                 entityType="edge"
                 sourceId={edge.sourceNode?.properties['entity_id'] || edge.source}
                 targetId={edge.targetNode?.properties['entity_id'] || edge.target}
-                isEditable={name === 'description' || name === 'keywords'}
+                isEditable={!paperMap && (name === 'description' || name === 'keywords')}
                 truncate={edge.properties['truncate']}
                 pipelineBusy={pipelineBusy}
               />

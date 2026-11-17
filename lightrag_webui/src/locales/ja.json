@@ -418,6 +418,22 @@
       "refreshCurrentLabelTooltip": "現在のページのグラフデータを更新",
       "refreshingTooltip": "データを更新中..."
     },
+    "paperFilter": {
+      "modeSharedMapTooltip": "選択した論文が引用先と共有するものだけを表示中。クリックで論文マップ（引用と書誌結合でつながる周辺の論文）を表示",
+      "modeCommonMapTooltip": "選択した論文のうち2本以上が寄与したものを表示中。クリックで論文マップ（引用と書誌結合でつながる周辺の論文）を表示",
+      "modeMapTooltip": "論文マップ：選択した論文の周辺を引用と書誌結合でたどり、分野ごとに色分け。クリックで論文が寄与したすべてを表示",
+      "mapOneHopTooltip": "1ステップ先の論文を表示中。クリックで2ステップまで表示（強いつながり順、ノード上限まで）",
+      "mapTwoHopsTooltip": "2ステップ先までの論文を表示中。クリックで1ステップのみ表示",
+      "mapSummary": "論文マップ：{{nodes}} 本（1ステップ {{hop1}} 本、2ステップ {{hop2}} 本）",
+      "someNotInStructure": "選択した論文のうち {{count}} 本は引用構造にありません",
+      "mapAlreadyChosen": "この論文はすでにマップの論文です",
+      "mapAddPaperTooltip": "この論文をマップの論文に追加",
+      "reason": {
+        "not_in_structure": "この論文は引用構造にありません",
+        "not_in_structure_many": "選択した論文はどれも引用構造にありません",
+        "no_links": "引用・書誌結合のつながりがありません：選択した論文のみ表示しています"
+      }
+    },
     "emptyGraph": "空（再読み込みをお試しください）"
   },
   "retrievePanel": {

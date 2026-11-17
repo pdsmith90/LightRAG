@@ -445,6 +445,15 @@
       "contextSuffix": " (+{{edges}} relations from the wider graph)",
       "contextLinkingSuffix": " (+{{edges}} relations and {{linking}} linking entities from the wider graph)",
       "someNotInKb": "{{count}} of the selected papers are not in the knowledge base",
+      "modeSharedMapTooltip": "Showing only what the papers share with the papers they cite. Click to show the paper map: the papers around them over citations and coupling",
+      "modeCommonMapTooltip": "Showing what at least two of the selected papers contributed. Click to show the paper map: the papers around them over citations and coupling",
+      "modeMapTooltip": "Paper map: the papers around the selected ones over citations and bibliographic coupling, coloured by field. Click to show everything the papers contributed",
+      "mapOneHopTooltip": "Showing papers one step away. Click to reach two steps (strongest links first, up to the node limit)",
+      "mapTwoHopsTooltip": "Showing papers up to two steps away. Click to show one step only",
+      "mapSummary": "Paper map: {{nodes}} papers ({{hop1}} one step away, {{hop2}} two steps away)",
+      "someNotInStructure": "{{count}} of the selected papers are not in the paper structure",
+      "mapAlreadyChosen": "This paper is already one of the map's papers",
+      "mapAddPaperTooltip": "Add this paper to the map's papers",
       "reason": {
         "not_in_kb": "This paper is not in the knowledge base",
         "no_references_file": "The server has no reference lists (zotero_references.json)",
@@ -455,7 +464,10 @@
         "no_references_in_kb_many": "None of the selected papers' references are in the knowledge base",
         "need_two_papers": "Pick at least two papers that are in the knowledge base",
         "nothing_in_common": "No entity was contributed by two of the selected papers",
-        "too_many_papers": "Too many papers selected (at most 10)"
+        "too_many_papers": "Too many papers selected (at most 10)",
+        "not_in_structure": "This paper is not in the paper structure",
+        "not_in_structure_many": "None of the selected papers is in the paper structure",
+        "no_links": "No citation or coupling links: only the selected papers are shown"
       }
     },
     "emptyGraph": "Empty(Try Reload Again)"

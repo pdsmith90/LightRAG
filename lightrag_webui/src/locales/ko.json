@@ -418,6 +418,22 @@
       "refreshCurrentLabelTooltip": "현재 페이지 그래프 데이터 새로고침",
       "refreshingTooltip": "데이터 새로고침 중..."
     },
+    "paperFilter": {
+      "modeSharedMapTooltip": "선택한 논문이 인용한 논문과 공유하는 것만 표시 중. 클릭하면 논문 지도(인용과 서지 결합으로 연결된 주변 논문)를 표시",
+      "modeCommonMapTooltip": "선택한 논문 중 두 편 이상이 기여한 것을 표시 중. 클릭하면 논문 지도(인용과 서지 결합으로 연결된 주변 논문)를 표시",
+      "modeMapTooltip": "논문 지도: 선택한 논문 주변을 인용과 서지 결합으로 연결하고 분야별로 색칠. 클릭하면 논문이 기여한 모든 것을 표시",
+      "mapOneHopTooltip": "한 단계 떨어진 논문 표시 중. 클릭하면 두 단계까지 표시(강한 연결 우선, 노드 한도까지)",
+      "mapTwoHopsTooltip": "두 단계까지 떨어진 논문 표시 중. 클릭하면 한 단계만 표시",
+      "mapSummary": "논문 지도: 논문 {{nodes}}편 (한 단계 {{hop1}}편, 두 단계 {{hop2}}편)",
+      "someNotInStructure": "선택한 논문 중 {{count}}편은 인용 구조에 없습니다",
+      "mapAlreadyChosen": "이 논문은 이미 지도의 논문입니다",
+      "mapAddPaperTooltip": "이 논문을 지도의 논문에 추가",
+      "reason": {
+        "not_in_structure": "이 논문은 인용 구조에 없습니다",
+        "not_in_structure_many": "선택한 논문 중 인용 구조에 있는 논문이 없습니다",
+        "no_links": "인용이나 서지 결합 연결이 없습니다: 선택한 논문만 표시합니다"
+      }
+    },
     "emptyGraph": "데이터 없음(새로고침을 시도해보세요)"
   },
   "retrievePanel": {

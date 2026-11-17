@@ -418,6 +418,22 @@
       "refreshCurrentLabelTooltip": "Refresh data graf halaman saat ini",
       "refreshingTooltip": "Memperbarui data..."
     },
+    "paperFilter": {
+      "modeSharedMapTooltip": "Hanya menampilkan apa yang dibagi makalah dengan makalah yang dikutipnya. Klik untuk peta makalah: makalah di sekitarnya lewat sitasi dan kopling bibliografis",
+      "modeCommonMapTooltip": "Menampilkan apa yang disumbangkan setidaknya dua makalah terpilih. Klik untuk peta makalah: makalah di sekitarnya lewat sitasi dan kopling bibliografis",
+      "modeMapTooltip": "Peta makalah: makalah di sekitar yang terpilih lewat sitasi dan kopling bibliografis, diwarnai menurut bidang. Klik untuk menampilkan semua yang disumbangkan makalah",
+      "mapOneHopTooltip": "Menampilkan makalah satu langkah. Klik untuk dua langkah (tautan terkuat dulu, hingga batas node)",
+      "mapTwoHopsTooltip": "Menampilkan makalah hingga dua langkah. Klik untuk satu langkah saja",
+      "mapSummary": "Peta makalah: {{nodes}} makalah ({{hop1}} satu langkah, {{hop2}} dua langkah)",
+      "someNotInStructure": "{{count}} makalah terpilih tidak ada dalam struktur sitasi",
+      "mapAlreadyChosen": "Makalah ini sudah termasuk makalah peta",
+      "mapAddPaperTooltip": "Tambahkan makalah ini ke makalah peta",
+      "reason": {
+        "not_in_structure": "Makalah ini tidak ada dalam struktur sitasi",
+        "not_in_structure_many": "Tidak satu pun makalah terpilih ada dalam struktur sitasi",
+        "no_links": "Tidak ada tautan sitasi atau kopling: hanya makalah terpilih yang ditampilkan"
+      }
+    },
     "emptyGraph": "Graf Kosong (Coba Muat Ulang)"
   },
   "retrievePanel": {

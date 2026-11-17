@@ -418,6 +418,22 @@
       "refreshCurrentLabelTooltip": "Actualiser les données du graphe de la page actuelle",
       "refreshingTooltip": "Actualisation des données en cours..."
     },
+    "paperFilter": {
+      "modeSharedMapTooltip": "Affiche seulement ce que les articles partagent avec les articles qu'ils citent. Cliquez pour la carte des articles : les articles voisins par citations et couplage bibliographique",
+      "modeCommonMapTooltip": "Affiche ce qu'au moins deux des articles choisis ont apporté. Cliquez pour la carte des articles : les articles voisins par citations et couplage bibliographique",
+      "modeMapTooltip": "Carte des articles : les articles autour de ceux choisis, par citations et couplage bibliographique, colorés par domaine. Cliquez pour tout ce que les articles ont apporté",
+      "mapOneHopTooltip": "Articles à un pas. Cliquez pour aller jusqu'à deux pas (liens les plus forts d'abord, jusqu'à la limite de nœuds)",
+      "mapTwoHopsTooltip": "Articles jusqu'à deux pas. Cliquez pour un seul pas",
+      "mapSummary": "Carte des articles : {{nodes}} articles ({{hop1}} à un pas, {{hop2}} à deux pas)",
+      "someNotInStructure": "{{count}} des articles choisis ne sont pas dans la structure des citations",
+      "mapAlreadyChosen": "Cet article fait déjà partie des articles de la carte",
+      "mapAddPaperTooltip": "Ajouter cet article aux articles de la carte",
+      "reason": {
+        "not_in_structure": "Cet article n'est pas dans la structure des citations",
+        "not_in_structure_many": "Aucun des articles choisis n'est dans la structure des citations",
+        "no_links": "Aucun lien de citation ou de couplage : seuls les articles choisis sont affichés"
+      }
+    },
     "emptyGraph": "Vide (Essayez de recharger)"
   },
   "retrievePanel": {
