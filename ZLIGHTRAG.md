@@ -271,14 +271,41 @@ collapsed. A profile that declares it switches the contract on:
   half-edited prompt.
 
 The contract needs `ENTITY_EXTRACTION_USE_JSON=true`; in text mode a profile with
-`relationship_types` is refused at startup. A profile without the key sends exactly the
-prompts it sent before (`tests/extraction/test_kg_contract.py`). The extraction cache keys
-on the prompt, so switching the contract on re-extracts instead of reusing cached results.
+`relationship_types` is refused at startup. A profile without the key, with no validator
+and no new setting, sends exactly the prompts and writes exactly the graph the base
+branch did: `tests/extraction/test_kg_contract_inert.py` compares both modes, with and
+without a profile, through gleaning, a second document and its deletion, against digests
+recorded from the base branch's own tree. The extraction cache keys on the prompt, so
+switching the contract on re-extracts instead of reusing cached results.
 
 The JSON schema that constrains the extraction requests is set by the process in front
-of the LLM server, not here. `python -m lightrag.kg_contract --schema --profile PATH`
+of the LLM server, not here. `python -m lightrag.kg_contract --schema --profile PROFILE`
 prints it for a profile: the entity types its guidance lists, read as `ENTITY_TYPE_STRICT`
 reads them and in order, plus `Other`, and the profile's relation types, both as enums.
+`PROFILE` is what `ENTITY_TYPE_PROMPT_FILE` takes, a file name looked up in
+`PROMPT_DIR/entity_type` as the server looks it up (or in the current directory when it
+is not there), or a path; the command prints the file it used, and how it found it, on
+stderr, so stdout holds the schema only.
+
+Nothing here can make the front apply that schema (a missing or invalid schema file, or
+a model the front does not attach it to, leaves `keywords` a free string), so the parser
+checks every relation the LLM extracted against the list: the first pass, the gleaning
+turn, and the cached results a knowledge rebuild re-parses (`check_relation_keywords`).
+A keyword that equals a declared type after trimming and case-folding is rewritten to
+the declared spelling (`Part_Of` to `part_of`; `part of` and `member of` match nothing);
+a field of several keywords keeps the declared types among them and loses the rest; a
+field with no declared type becomes `related_to` when the list declares it, and is
+otherwise dropped with its relation. Each change is counted: a document whose relations
+needed any logs one warning (also in the pipeline history) with the counts
+(`normalized`, `multi_type`, `related_to`, `dropped`, of `checked`), a rebuild that
+re-parsed such records logs one too, and `/health` shows the running totals of the
+worker process as `kg_contract_relation_keywords`, under `extraction` and `rebuild` (a
+rebuild re-counts records an extraction already counted). Any change counted under
+`extraction` means the schema is not being enforced upstream. Relations the code makes without the
+LLM (the sidecar fan-out) and relations a caller gives (`create_relation`,
+`edit_relation`, `insert_custom_kg`) are not checked. Without `relationship_types`
+nothing is checked or counted.
+
 A sample profile for a geoscience paper corpus, with relation list v3.1 (17 types, each
 defined by what its source and target must be, and their inverse names), is
 `prompts/samples/entity_type_prompt.kg_contract.sample.yml`. `/health` reports the
@@ -302,8 +329,13 @@ its inverse name; a type the mapping does not name is symmetric. It needs
 lower-case snake case, not a declared type and the inverse of one type only, or the
 profile is refused at load. With it, every write path below puts a relation into sorted
 order and, when that flips an extracted or given relation "A t B", stores the inverse name
-of `t`, so **a stored edge (src, tgt) with keyword k always reads "src k tgt"**:
-Constellation `has_part` GRACE, and the two chunks above give `has_part,has_property`.
+of `t`, so a stored edge (src, tgt) with keyword k reads "src k tgt" whenever k is a
+declared type or inverse name: Constellation `has_part` GRACE, and the two chunks above
+give `has_part,has_property`. Every keyword of an LLM-extracted relation is one, because
+the parser checks it against the list (above). A keyword that is neither, given by a
+caller (`create_relation`, `edit_relation`, `insert_custom_kg`), made by the code (the
+sidecar links), or stored before the profile declared the list, is kept as written and
+not inverted when its pair is flipped, so it can read backwards.
 In a keyword field that holds several comma-separated types after merges, each declared
 type or inverse name is rewritten on its own (exact match); symmetric types and any other
 keyword stay as they are. The LLM never sees an inverse name: the prompt, the guidance and
@@ -327,8 +359,9 @@ The write paths and what each does with the key:
 
 | path | with `relationship_inverses` |
 |---|---|
+| gleaning merge (`_merge_extraction_pass`) | within one chunk, a gleaning relation that states a first-pass relation's pair the other way round with the same type replaces it (the gleaning turn is the correction); one of another type is a second relation and is kept beside it |
 | extraction merge (`merge_nodes_and_edges`) | the records of a pair the sort flips get the inverse names before the merge; the stored edge's keywords already read in stored order |
-| rebuild after a deletion, and the kept-summary rebuild (`_rebuild_single_relationship`) | cached extraction records filed under the reversed pair are inverted; the edge is written back in sorted order |
+| rebuild after a deletion, and the kept-summary rebuild (`rebuild_knowledge_from_chunks`, `_rebuild_single_relationship`) | each chunk's cached first pass and gleaning are merged by the gleaning rule above, so a direction correction is reproduced; cached extraction records filed under the reversed pair are inverted; the edge is written back in sorted order |
 | `ENTITY_NAME_FOLD` and `KG_CONTRACT_VALIDATOR` renames | no change needed: both rename endpoints before the merge and keep the extracted direction, so the merge orients the renamed pair |
 | entity rename (`edit_entity`), entity merge (`merge_entities`, and `edit_entity` with `allow_merge`) | the stored keywords read in the old sorted pair; the renamed or redirected pair is re-sorted, inverted when it flips, and written in sorted order before duplicates are joined |
 | `create_relation`, `edit_relation`, `insert_custom_kg` | keywords given with (source, target) read "source keywords target"; they are inverted when the stored order is the other way, and the edge is written in sorted order |
@@ -352,6 +385,11 @@ Limits:
   endpoints without touching keywords (only rows written before the storage kept sorted
   order); and a bulk tool that renames entities directly in the database must apply
   `kg_contract.orient_relation` to each edge it re-keys.
+- Sidecar links (`SIDECAR_RELATIONS=all`) are undirected containment links: their
+  keywords, `associated with, contained in`, say that the entity and the table, drawing
+  or equation occur together, whichever order the pair is stored in. They are not
+  declared types, so they are neither checked nor inverted; read them without a
+  direction, or filter them out by keyword or by the sidecar entity's type.
 - Readers take the keywords as text: the relation vector content (the keywords, the
   sorted pair and the description), the web UI edge label and `get_relation_info` show
   the stored keywords; the query context does not include keywords. None of them assumes
@@ -380,9 +418,23 @@ sees each chunk's parsed records before the merge (see *Extraction Quality Hook*
 
 Names are looked up in the chunk text after the same normalization extraction applies to
 names, case-folded. The rename and the grounding depend on the chunk's text, so one name
-can be kept in one chunk and renamed in another. The knowledge rebuild after a deletion
-re-parses cached extractions without the hook (true of any validator), so there a renamed
-name's records stay under the spelling the LLM wrote and do not reach the renamed node.
+can be kept in one chunk and renamed in another.
+
+The knowledge rebuild re-parses each surviving chunk's cached extraction (after a
+document deletion, in the kept-summary rebuild of a re-ingest and in the rollback purge)
+and runs the configured `kg_extraction_validator`, this one or any other, on it again:
+on the chunk's first pass and gleaning merged as extraction merged them, with the text
+the hook received at extraction, rebuilt from the stored chunk (markup stripped and
+sanitized the same way), before the `ENTITY_NAME_FOLD` aliases. So a renamed or dropped
+name's records are found under the name the graph holds, and a deletion leaves the edge
+and its nodes with the surviving documents' chunk ids and text only, as without a
+hook. The hook must therefore decide the same way given the same chunk and records (a
+rule of the name and the chunk text does). A hook that raises in the rebuild, or a
+chunk whose text is missing, makes that chunk's cached extraction unusable for the
+rebuild: none of its records are used, and the chunk is reported like any unreadable
+cache (`KGRebuildReport.unusable_cache_chunk_ids` and a pipeline-history line). The
+`lightrag-repair-chunk-tracking` tool applies the hook (from `KG_CONTRACT_VALIDATOR`) the
+same way when it attributes chunks. Without a hook the rebuild is what it was.
 Reported in the `/health` configuration.
 Off by default.
 
@@ -452,7 +504,9 @@ changes keys: existing variant nodes are not merged by the switch itself.
 `SIDECAR_RELATIONS=none` keeps a table/equation/drawing sidecar entity but no longer
 links it to every entity extracted from its chunk with an "associated with, contained
 in" edge (upstream behaviour, `all`). On a paper corpus those edges were about a tenth
-of the graph, every one generic.
+of the graph, every one generic. The links carry no direction: with the extraction
+contract on they are stored in either order and their keywords are left as they are
+(see *Direction in the graph*).
 
 ### Paper filter in the graph view
 

@@ -734,6 +734,15 @@ Contract:
 - **Coverage.** Every path that extracts goes through it: the document pipeline
   and `ainsert_custom_chunks` alike. `ainsert_custom_kg` does not extract — the
   caller supplies the graph directly — so it is not filtered.
+- **The knowledge rebuild runs it again.** After a document deletion (and in
+  the kept-summary and rollback rebuilds) each surviving chunk's cached
+  extraction is re-parsed, its passes merged as at extraction, and the hook
+  called on the result with the same `chunk_text`, rebuilt from the stored
+  chunk, so the rebuild finds the records under the names the hook gave them.
+  A hook must therefore decide the same way for the same chunk and records. A
+  hook that raises there makes that chunk's cached extraction unusable for the
+  rebuild (reported in `KGRebuildReport.unusable_cache_chunk_ids`) instead of
+  failing the deletion.
 - **Multimodal entities are not shown to the hook.** For a drawing / table /
   equation chunk, LightRAG synthesizes one entity from the sidecar and links it
   to the chunk's surviving entities. That injection happens *after* the hook, so
