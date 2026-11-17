@@ -1589,11 +1589,11 @@ async def rebuild_knowledge_from_chunks(
             logger.warning(status_message)
             status_logger.log(status_message)
             continue
-        # Fork (ENTITY_NAME_FOLD): stored in the spelling the LLM wrote, before
-        # the fold; filed under the canonical name as well, as cached results.
-        chunk_entities[chunk_id], chunk_relationships[chunk_id] = alias_chunk_result(
-            entities, relationships
-        )
+        # Fork (ENTITY_NAME_FOLD): stored under the names the merge used, after
+        # the fold, so they are filed as stored; the fold map in force now is
+        # not consulted for this chunk.
+        chunk_entities[chunk_id] = entities
+        chunk_relationships[chunk_id] = relationships
 
     for chunk_id, results in cached_results.items():
         if chunk_id in stored_records:
@@ -4490,7 +4490,7 @@ async def extract_entities(
     relation_inverses = inverse_table(prompt_profile.get("relationship_inverses"))
     relation_keyword_counts: Counter = Counter()
     # With the contract or a hook, each chunk's accepted records (what reaches
-    # the merge, before the name fold) are stored with the chunk, and a
+    # the merge, after the name fold) are stored with the chunk, and a
     # knowledge rebuild reads them instead of re-running this post-processing.
     store_records = stores_accepted_records(relationship_types, kg_extraction_validator)
 
@@ -4957,18 +4957,12 @@ async def extract_entities(
                         )
 
         # Fork (extraction contract): what this chunk hands the merge is final
-        # here (the name fold comes later, for all chunks at once). Each
-        # relation gets its keywords for the other reading order, resolved now,
-        # and the records are stored with the chunk for the knowledge rebuild.
-        # A failed write fails the chunk.
+        # here but for the name fold, which comes later, for all chunks at
+        # once. Each relation gets its keywords for the other reading order,
+        # resolved now; the fold renames the pair without changing which end
+        # is the source. The records are stored after the fold (below).
         if store_records:
             add_reverse_keywords(maybe_edges, relation_inverses)
-            if text_chunks_storage is not None:
-                await write_chunk_kg_records(
-                    text_chunks_storage,
-                    chunk_key,
-                    accepted_records(maybe_nodes, maybe_edges),
-                )
 
         processed_chunks += 1
         entities_count = len(maybe_nodes)
@@ -5168,6 +5162,19 @@ async def extract_entities(
     # Fork (ENTITY_NAME_FOLD): canonical spellings before the results reach the
     # write-ahead anchors and the merge, which must name the same nodes.
     chunk_results = [fold_chunk_result(nodes, edges) for nodes, edges in chunk_results]
+
+    # Fork (extraction contract): each chunk's records are stored with it as
+    # the merge will consume them, under the names and pairs the fold gave, so
+    # a knowledge rebuild finds them under the graph's names without a fold
+    # map. Every write lands before this function returns, so nothing reaches
+    # the merge unstored; a failed write fails the document's extraction.
+    if store_records and text_chunks_storage is not None:
+        for (chunk_key, _chunk_dp), (nodes, edges) in zip(
+            ordered_chunks, chunk_results
+        ):
+            await write_chunk_kg_records(
+                text_chunks_storage, chunk_key, accepted_records(nodes, edges)
+            )
 
     # If all tasks completed successfully, chunk_results already contains the results
     # Return the chunk_results for later processing in merge_nodes_and_edges

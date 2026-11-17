@@ -12,8 +12,10 @@ lightrag/kg_contract.py), whatever the configuration is at that time.
   branch, even when the contract or hook is on later; an entity or relation fed
   by both kinds of chunk gets each chunk's contribution its way.
 - A chunk extracted again with neither loses its stored records.
-- With the name fold armed, the stored records (in the LLM's spelling) are
-  filed under both spellings, as cached results are.
+- The stored records carry the names the merge used, after the name fold, so
+  a rebuild finds them whatever the fold map is then (off, not armed, another
+  canonical, another alias file); cached results are still filed under both
+  spellings.
 
 Each test drives a real LightRAG instance (JSON and NetworkX storages) through
 inserts, a reopen with another configuration and a deletion. All names are
@@ -850,3 +852,253 @@ async def test_a_gleaning_direction_correction_survives_a_deletion(
     edge = alone["edges"][("Alpha Unit", "Zeta System")]
     assert (edge["keywords"], edge["description"]) == ("part_of", CORRECTED[3])
     assert rebuilt == alone
+
+
+# ------------------------------------------- the name fold at extraction and rebuild
+
+# The fold map extraction runs under: the key of "Soil Moisture" spells
+# "Soil moisture" (the best-connected member), "Water Cycle" "Water cycle".
+FOLD_ROWS = [
+    ("Soil moisture", "concept", 10),
+    ("soil moisture", "concept", 1),
+    ("Water cycle", "concept", 3),
+]
+# The same graph read again after the degrees changed: the key's canonical is
+# now the lower-case spelling.
+MOVED_ROWS = [
+    ("Soil moisture", "concept", 1),
+    ("soil moisture", "concept", 10),
+    ("Water cycle", "concept", 3),
+]
+FOLD_DOCS = {
+    "A": "Report one. Soil moisture is part of the water cycle.",
+    "B": "Report two. Soil moisture is part of the water cycle.",
+    "C": "Report three. Soil moisture is part of the water cycle.",
+}
+FOLD_TAGS = {"A": "alpha-doc", "B": "bravo-doc", "C": "charlie-doc"}
+
+
+def _fold_names_llm(case):
+    """``plain``: the LLM writes ``Soil Moisture`` and ``Water Cycle``, both
+    folded. ``flip``: it writes ``soil moisture``, which sorts after ``Water
+    Cycle`` while the folded pair sorts the other way round. ``join``: it also
+    writes ``soil moistures`` and relates the two spellings, which the fold
+    joins into one name."""
+
+    def first(text):
+        tag = FOLD_TAGS[_tag(text)]
+        soil = "soil moisture" if case == "flip" else "Soil Moisture"
+        entities = [
+            (soil, "Concept", f"SM {tag}."),
+            ("Water Cycle", "Concept", f"WC {tag}."),
+        ]
+        relations = [(soil, "Water Cycle", "part_of", f"SM in WC {tag}.")]
+        if case == "join":
+            entities.append(("soil moistures", "Concept", f"SMs {tag}."))
+            relations.append(
+                ("Soil Moisture", "soil moistures", "same_as", f"SM is SMs {tag}.")
+            )
+        return _reply(entities, relations)
+
+    return _llm(first)
+
+
+def _arm(state):
+    """The fold map in force: ``FOLD_ROWS`` at extraction; at rebuild one of
+    the states a restart can leave it in."""
+    entity_name_fold.disarm()
+    if state in ("extraction", "same"):
+        entity_name_fold.load_fold_map(FOLD_ROWS)
+    elif state == "moved":
+        entity_name_fold.load_fold_map(MOVED_ROWS)
+    elif state in ("aliased", "extraction-aliased"):
+        entity_name_fold.load_aliases([("Soil Moisture", "Moisture of soil")])
+        entity_name_fold.load_fold_map(FOLD_ROWS)
+    # "off" and "unarmed": no map
+
+
+def _never_armed(rag):
+    """ENTITY_NAME_FOLD on, but the startup map build has not finished within
+    its wait: the deletion logs the error and goes on unfolded."""
+    import asyncio
+    import time
+
+    rag._fold_map_task = asyncio.get_running_loop().create_future()
+    rag._fold_map_deadline = time.monotonic()
+    return rag._fold_map_task
+
+
+async def _fold_rebuild(
+    tmp_path, llm, inserts, delete, state, legacy=(), extraction="extraction"
+):
+    """Insert ``inserts`` (those in ``legacy`` without the contract, the others
+    with it) under the map ``extraction``, reopen under ``state`` and delete
+    ``delete``: the graph, normalized."""
+    path, workspace = tmp_path / f"rag_{uuid4().hex}", f"kgc_{uuid4().hex}"
+    try:
+        for doc_id in inserts:
+            profile = None if doc_id in legacy else "contract.yml"
+            rag = await _open(path, workspace, llm, profile=profile)
+            _arm(extraction)  # opening the storages disarms the map
+            try:
+                await rag.ainsert(
+                    FOLD_DOCS[doc_id], ids=[doc_id], file_paths=[f"{doc_id}.txt"]
+                )
+            finally:
+                await rag.finalize_storages()
+        rag = await _open(path, workspace, llm, profile="contract.yml")
+        _arm(state)
+        pending = _never_armed(rag) if state == "unarmed" else None
+        try:
+            if delete:
+                assert (await rag.adelete_by_doc_id(delete)).status == "success"
+            graph = _normalized(_graph(rag))
+            for node in graph["nodes"].values():
+                node["description"] = "<SEP>".join(
+                    sorted(node["description"].split("<SEP>"))
+                )
+            return graph
+        finally:
+            if pending is not None:
+                pending.cancel()
+            await rag.finalize_storages()
+    finally:
+        entity_name_fold.disarm()
+
+
+@pytest.mark.parametrize("state", ["same", "off", "unarmed", "moved", "aliased"])
+@pytest.mark.parametrize("case", ["plain", "flip", "join"])
+async def test_a_deletion_rebuilds_folded_names_whatever_the_fold_is_now(
+    prompt_dir, tmp_path, case, state
+):
+    """COLD4-02: the records are stored under the names the merge used (after
+    ENTITY_NAME_FOLD), so a deletion rebuilds the folded node and its edge from
+    them whatever the fold map is at rebuild time: the same, switched off, not
+    armed within its wait, a key's canonical moved, or an alias added. The
+    graph is that of the surviving document alone, with nothing of the deleted
+    one. A pair the fold flips keeps the direction the merge gave it; a pair
+    the fold joins stays dropped."""
+    llm = _fold_names_llm(case)
+    alone = await _fold_rebuild(tmp_path, llm, ["A"], None, "same")
+    rebuilt = await _fold_rebuild(tmp_path, llm, ["A", "B"], "B", state)
+
+    assert set(alone["nodes"]) == {"Soil moisture", "Water cycle"}
+    assert set(alone["edges"]) == {("Soil moisture", "Water cycle")}
+    edge = alone["edges"][("Soil moisture", "Water cycle")]
+    assert (edge["keywords"], edge["source_id"]) == ("part_of", "A-chunk-000")
+    if case == "join":
+        node = alone["nodes"]["Soil moisture"]
+        assert node["description"] == "SM alpha-doc.<SEP>SMs alpha-doc."
+    assert "bravo-doc" not in repr(rebuilt)
+    assert rebuilt == alone
+
+
+async def test_a_deletion_after_an_alias_is_removed(prompt_dir, tmp_path):
+    """An alias file in force at extraction joins ``Soil Moisture`` into
+    ``Moisture of soil``; the deletion runs after it was removed. The records
+    name the node the merge wrote, so the rebuild still finds them."""
+    llm = _fold_names_llm("plain")
+    alone = await _fold_rebuild(
+        tmp_path, llm, ["A"], None, "aliased", extraction="extraction-aliased"
+    )
+    rebuilt = await _fold_rebuild(
+        tmp_path, llm, ["A", "B"], "B", "same", extraction="extraction-aliased"
+    )
+    assert set(alone["edges"]) == {("Moisture of soil", "Water cycle")}
+    assert "bravo-doc" not in repr(rebuilt)
+    assert rebuilt == alone
+
+
+async def test_the_stored_records_carry_the_names_the_merge_used(prompt_dir, tmp_path):
+    """The records stored with a chunk are the ones the merge consumed: after
+    the fold, the joined relation absent."""
+    path, workspace = tmp_path / f"rag_{uuid4().hex}", f"kgc_{uuid4().hex}"
+    rag = await _open(path, workspace, _fold_names_llm("join"), profile="contract.yml")
+    _arm("extraction")
+    try:
+        await rag.ainsert(FOLD_DOCS["A"], ids=["A"], file_paths=["A.txt"])
+        row = await rag.text_chunks.get_by_id("A-chunk-000")
+    finally:
+        entity_name_fold.disarm()
+        await rag.finalize_storages()
+    records = row[CHUNK_KG_RECORDS_FIELD]
+    assert sorted(r["entity_name"] for r in records["entities"]) == [
+        "Soil moisture",
+        "Soil moisture",
+        "Water cycle",
+    ]
+    assert [(r["src_id"], r["tgt_id"]) for r in records["relations"]] == [
+        ("Soil moisture", "Water cycle")
+    ]
+
+
+@pytest.mark.parametrize("state", ["same", "off"])
+async def test_an_item_fed_by_a_legacy_chunk_and_a_folded_stored_one(
+    prompt_dir, tmp_path, state
+):
+    """Document A extracted without the contract (no records), C and B with
+    it, all under the fold; B is deleted. Each chunk contributes its own way:
+    C's stored records under the names the merge used, whatever the fold is
+    now; A's re-parsed cache under the LLM's spelling, found through the fold
+    map of the rebuild as on the base branch, so with the fold off A's text is
+    not found (its chunk id stays). B's text is gone either way."""
+    llm = _fold_names_llm("plain")
+    alone = await _fold_rebuild(tmp_path, llm, ["A", "C"], None, "same", legacy="A")
+    rebuilt = await _fold_rebuild(
+        tmp_path, llm, ["A", "C", "B"], "B", state, legacy="A"
+    )
+    assert "bravo-doc" not in repr(rebuilt)
+    if state == "same":
+        assert rebuilt == alone
+        return
+    node = rebuilt["nodes"]["Soil moisture"]
+    assert node["description"] == "SM charlie-doc."
+    assert node["source_id"].split("<SEP>") == ["A-chunk-000", "C-chunk-000"]
+    edge = rebuilt["edges"][("Soil moisture", "Water cycle")]
+    assert (edge["keywords"], edge["description"]) == (
+        "part_of",
+        "SM in WC charlie-doc.",
+    )
+
+
+def _pass_through(chunk_key, chunk_text, maybe_nodes, maybe_edges):
+    return maybe_nodes, maybe_edges
+
+
+async def test_extraction_stores_exactly_what_it_returns_for_the_merge():
+    """Under the fold, the records written for a chunk are the chunk's result
+    as extract_entities returns it to the merge: names folded, the order the
+    fold flips kept as the folded pair, the relation the fold joins absent.
+    The merge and the rebuild orient the same records the same way."""
+    from lightrag.kg_contract import accepted_records, oriented_record
+    from lightrag.operate import extract_entities
+
+    async def llm(prompt, system_prompt=None, history_messages=None, **_):
+        return _reply(
+            [
+                ("Soil Moisture", "Concept", "SM."),
+                ("soil moistures", "Concept", "SMs."),
+                ("Water Cycle", "Concept", "WC."),
+            ],
+            [
+                ("soil moisture", "Water Cycle", "part_of", "SM in WC."),
+                ("Soil Moisture", "soil moistures", "same_as", "joined."),
+            ],
+        )
+
+    config = _extract_config(_pass_through)
+    config["role_llm_funcs"] = {r: llm for r in ("extract", "keyword", "query", "vlm")}
+    store = _ChunkStore()
+    entity_name_fold.load_fold_map(FOLD_ROWS)
+    try:
+        [(nodes, edges)] = await extract_entities(
+            CHUNKS, config, text_chunks_storage=store
+        )
+    finally:
+        entity_name_fold.disarm()
+    stored = store.written["c1"]
+    assert stored == accepted_records(nodes, edges)
+    assert sorted(nodes) == ["Soil moisture", "Water cycle"]
+    [relation] = stored["relations"]
+    assert (relation["src_id"], relation["tgt_id"]) == ("Soil moisture", "Water cycle")
+    assert oriented_record(relation)["keywords"] == "part_of"
