@@ -8,6 +8,8 @@ import { toast } from 'sonner'
 import { queryGraphs, queryPaperGraph, queryPaperMap, PaperSummary } from '@/api/lightrag'
 import {
   expandMapLabel,
+  isPaperMapUnavailable,
+  mapFallbackLabel,
   parsePaperLabel,
   readMapHops,
   readPaperContext,
@@ -45,6 +47,17 @@ class GraphBuildError extends Error {
     super('Graph build/apply failed')
     this.name = 'GraphBuildError'
     this.cause = cause
+  }
+}
+
+// Fork: the server has no paper map (its paper structure is off, or it predates the
+// route) while the label asks for one. A fixed answer, so it is not retried.
+class PaperMapUnavailableError extends Error {
+  papers: string[]
+  constructor(papers: string[]) {
+    super('The server has no paper map')
+    this.name = 'PaperMapUnavailableError'
+    this.papers = papers
   }
 }
 
@@ -178,6 +191,10 @@ const fetchGraph = async (label: string, maxDepth: number, maxNodes: number) => 
         : await queryPaperGraph(paperFilter.papers, paperFilter.mode, readPaperContext(), maxNodes)
       : await queryGraphs(queryLabel, maxDepth, maxNodes)
   } catch (e) {
+    // Fork: a stale map label against a server without the map is not a transient failure.
+    if (paperFilter?.mode === 'map' && isPaperMapUnavailable(e)) {
+      throw new PaperMapUnavailableError(paperFilter.papers)
+    }
     // Record the backend error, then RETHROW so the caller's .catch() runs its
     // bounded-retry path. Returning null here would resolve the promise
     // "successfully" and the .then() handler would treat a transient
@@ -253,6 +270,7 @@ const fetchGraph = async (label: string, maxDepth: number, maxNodes: number) => 
     rawGraph.edges = rawData.edges
     rawGraph.nodeIdMap = nodeIdMap
     rawGraph.edgeIdMap = edgeIdMap
+    rawGraph.isPaperMap = paperFilter?.mode === 'map'
 
     console.log('Graph data loaded')
   }
@@ -632,6 +650,22 @@ const useLightrangeGraph = () => {
           fetchInProgressRef.current = false
           state.setLastSuccessfulQueryLabel('') // Clear last successful query label on error
 
+          // Fork: no paper map on this server. Say so once, do not retry, and show the
+          // same papers in the plain paper view instead.
+          if (error instanceof PaperMapUnavailableError) {
+            lastFetchSignatureRef.current = fetchSignature
+            retryStateRef.current = { signature: '', attempts: 0 }
+            toast.error(t('graphPanel.paperFilter.mapUnavailable'))
+            if (useSettingsStore.getState().queryLabel === currentQueryLabel) {
+              const fallback = mapFallbackLabel(error.papers)
+              SearchHistoryManager.addToHistory(fallback)
+              state.setGraphDataFetchAttempted(false)
+              useSettingsStore.getState().setQueryLabel(fallback)
+              state.incrementGraphDataVersion()
+            }
+            return
+          }
+
           // Terminal failure: the network fetch succeeded but building/applying
           // the graph failed. This is deterministic, so do NOT retry (that would
           // re-fetch identical data and fail identically). Stamp the signature
@@ -716,16 +750,25 @@ const useLightrangeGraph = () => {
 
     // Fork: a paper-map node is a paper, not an entity, so the entity-graph
     // expansion must not see its id: expanding it adds it to the map's papers.
-    const shownMap = parsePaperLabel(useSettingsStore.getState().queryLabel)
-    if (shownMap?.mode === 'map') {
-      const next = expandMapLabel(shownMap.papers, nodeId)
-      if ('reason' in next) {
-        toast.info(t(`graphPanel.paperFilter.${next.reason}`))
-      } else {
-        SearchHistoryManager.addToHistory(next.label)
-        useGraphStore.getState().setGraphDataFetchAttempted(false)
-        useSettingsStore.getState().setQueryLabel(next.label)
-        useGraphStore.getState().incrementGraphDataVersion()
+    // The graph on screen decides, not the label: after a failed map fetch the label
+    // may name a map while the entity graph is still shown, and a map stays a map
+    // while its label is being changed.
+    const shownGraph = useGraphStore.getState().rawGraph
+    if (shownGraph?.isPaperMap) {
+      const shownMap = parsePaperLabel(useSettingsStore.getState().queryLabel)
+      if (shownMap?.mode === 'map') {
+        const next = expandMapLabel(
+          shownMap.papers,
+          shownGraph.getNode(nodeId) ?? { id: nodeId }
+        )
+        if ('reason' in next) {
+          toast.info(t(`graphPanel.paperFilter.${next.reason}`))
+        } else {
+          SearchHistoryManager.addToHistory(next.label)
+          useGraphStore.getState().setGraphDataFetchAttempted(false)
+          useSettingsStore.getState().setQueryLabel(next.label)
+          useGraphStore.getState().incrementGraphDataVersion()
+        }
       }
       window.setTimeout(() => {
         useGraphStore.getState().triggerNodeExpand(null)

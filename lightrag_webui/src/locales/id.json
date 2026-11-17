@@ -426,6 +426,8 @@
       "mapTwoHopsTooltip": "Menampilkan makalah hingga dua langkah. Klik untuk satu langkah saja",
       "mapSummary": "Peta makalah: {{nodes}} makalah ({{hop1}} satu langkah, {{hop2}} dua langkah)",
       "someNotInStructure": "{{count}} makalah terpilih tidak ada dalam struktur sitasi",
+      "mapLinksThinned": "menampilkan {{shown}} dari {{found}} tautan: yang terkuat untuk setiap makalah",
+      "mapUnavailable": "Server ini tidak memiliki peta makalah (struktur makalahnya mati atau tidak ada). Menampilkan graf makalah itu sendiri",
       "mapAlreadyChosen": "Makalah ini sudah termasuk makalah peta",
       "mapAddPaperTooltip": "Tambahkan makalah ini ke makalah peta",
       "reason": {

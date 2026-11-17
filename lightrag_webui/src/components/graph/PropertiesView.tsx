@@ -8,13 +8,11 @@ import { useTranslation } from 'react-i18next'
 import { GitBranchPlus, Scissors, Lock } from 'lucide-react'
 import EditablePropertyRow from './EditablePropertyRow'
 import { useSourceLabels } from '@/hooks/useSourceLabels'
-import { useSettingsStore } from '@/stores/settings'
-import { parsePaperLabel } from '@/lib/paperFilter'
 
 // Fork: the paper map's nodes are papers and its edges citations or coupling,
-// not entities and relations, so they are not edited.
-const usePaperMapShown = (): boolean =>
-  parsePaperLabel(useSettingsStore.use.queryLabel())?.mode === 'map'
+// not entities and relations, so they are not edited. The graph on screen says
+// whether it is a map (marked when it was loaded), not the query label.
+const usePaperMapShown = (): boolean => useGraphStore.use.rawGraph()?.isPaperMap === true
 
 /**
  * Component that view properties of elements in graph.

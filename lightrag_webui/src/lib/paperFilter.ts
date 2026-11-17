@@ -55,16 +55,51 @@ export const parsePaperLabel = (
 export const togglePaper = (papers: string[], id: string): string[] =>
   papers.includes(id) ? papers.filter((p) => p !== id) : [...papers, id]
 
+// How a chosen paper may be written: a DOI (bare, `doi:` or as a doi.org link), an
+// attachment key or a structure id (`zot:<item key>`), compared without case.
+const normalizePaperId = (id: string): string =>
+  id
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\/(dx\.)?doi\.org\//, '')
+    .replace(/^doi:/, '')
+
+// A paper-map node (as the server sends it) is one of the chosen papers when its id, DOI,
+// attachment key or structure id is one of them: a paper chosen by its key appears on the
+// map under its DOI.
+export const isChosenMapNode = (
+  papers: string[],
+  node: { id: string; properties?: Record<string, any> }
+): boolean => {
+  const props = node.properties ?? {}
+  const ids = [node.id, props.doi, props.attachment_key, props.paper_id]
+    .filter((id): id is string => typeof id === 'string' && id.trim() !== '')
+    .map(normalizePaperId)
+  return papers.some((p) => ids.includes(normalizePaperId(p)))
+}
+
 // Expanding a paper-map node adds that paper to the map's papers: the next
 // label, or why not (the i18n key under graphPanel.paperFilter).
 export const expandMapLabel = (
   papers: string[],
-  id: string
+  node: { id: string; properties?: Record<string, any> }
 ): { label: string } | { reason: 'mapAlreadyChosen' | 'maxPapers' } => {
-  if (papers.includes(id)) return { reason: 'mapAlreadyChosen' }
+  if (isChosenMapNode(papers, node)) return { reason: 'mapAlreadyChosen' }
   if (papers.length >= MAX_PAPERS) return { reason: 'maxPapers' }
-  return { label: paperLabel([...papers, id], 'map') }
+  return { label: paperLabel([...papers, node.id], 'map') }
 }
+
+// A server without the paper structure answers the map route with 501 (the setting is off or
+// the schema is missing) or, when it predates the route, 404. Anything else is a failure that
+// may pass.
+export const isPaperMapUnavailable = (error: unknown): boolean => {
+  const status = (error as { status?: number } | null)?.status
+  return status === 501 || status === 404
+}
+
+// The label a map label falls back to when the server has no paper map: the same papers in
+// the plain paper view (what the mode button shows after the map).
+export const mapFallbackLabel = (papers: string[]): string => paperLabel(papers, 'paper')
 
 // paper -> shared -> common -> map; common needs two papers, the map a server
 // that reports the paper structure.
@@ -194,6 +229,9 @@ export const paperSummaryMessage = (
       hop1: summary.shown_hop1 ?? 0,
       hop2: summary.shown_hop2 ?? 0
     })
+    const found = summary.n_links ?? 0
+    const shown = summary.shown_links ?? found
+    if (shown < found) map += `; ${t(k('mapLinksThinned'), { shown, found })}`
     const unknown = papers.filter((p) => p.reason === 'not_in_structure').length
     if (unknown) map += `; ${t(k('someNotInStructure'), { count: unknown })}`
     return map

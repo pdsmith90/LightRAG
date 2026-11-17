@@ -452,6 +452,8 @@
       "mapTwoHopsTooltip": "Showing papers up to two steps away. Click to show one step only",
       "mapSummary": "Paper map: {{nodes}} papers ({{hop1}} one step away, {{hop2}} two steps away)",
       "someNotInStructure": "{{count}} of the selected papers are not in the paper structure",
+      "mapLinksThinned": "{{shown}} of the {{found}} links between them shown, the strongest for each paper",
+      "mapUnavailable": "This server has no paper map (its paper structure is off or missing). Showing the papers' own graph instead",
       "mapAlreadyChosen": "This paper is already one of the map's papers",
       "mapAddPaperTooltip": "Add this paper to the map's papers",
       "reason": {

@@ -426,6 +426,8 @@
       "mapTwoHopsTooltip": "顯示兩步之內的論文。點擊僅顯示一步",
       "mapSummary": "論文地圖：{{nodes}} 篇論文（一步 {{hop1}} 篇，兩步 {{hop2}} 篇）",
       "someNotInStructure": "所選論文中有 {{count}} 篇不在引用結構中",
+      "mapLinksThinned": "顯示 {{found}} 條連結中的 {{shown}} 條：每篇論文最強的連結",
+      "mapUnavailable": "此伺服器沒有論文地圖（論文結構未啟用或缺失），改為顯示論文本身的圖譜",
       "mapAlreadyChosen": "這篇論文已是地圖的論文之一",
       "mapAddPaperTooltip": "將這篇論文加入地圖的論文",
       "reason": {

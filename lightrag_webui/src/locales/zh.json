@@ -426,6 +426,8 @@
       "mapTwoHopsTooltip": "显示两步之内的论文。点击仅显示一步",
       "mapSummary": "论文地图：{{nodes}} 篇论文（一步 {{hop1}} 篇，两步 {{hop2}} 篇）",
       "someNotInStructure": "所选论文中有 {{count}} 篇不在引用结构中",
+      "mapLinksThinned": "显示 {{found}} 条链接中的 {{shown}} 条：每篇论文最强的链接",
+      "mapUnavailable": "此服务器没有论文地图（论文结构未启用或缺失），改为显示论文自身的图谱",
       "mapAlreadyChosen": "这篇论文已是地图的论文之一",
       "mapAddPaperTooltip": "将这篇论文加入地图的论文",
       "reason": {

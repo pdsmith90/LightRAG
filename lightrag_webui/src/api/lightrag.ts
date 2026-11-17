@@ -642,6 +642,9 @@ export type PaperSummary = {
   n_hop2?: number
   shown_hop1?: number
   shown_hop2?: number
+  // Links among the papers shown: found, and drawn after the server thinned them.
+  n_links?: number
+  shown_links?: number
   references_available?: boolean
   cited_sharing?: number
   n_linking?: number

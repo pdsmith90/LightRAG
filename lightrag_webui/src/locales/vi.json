@@ -426,6 +426,8 @@
       "mapTwoHopsTooltip": "Đang hiển thị các bài cách tối đa hai bước. Nhấn để chỉ hiển thị một bước",
       "mapSummary": "Bản đồ bài báo: {{nodes}} bài ({{hop1}} cách một bước, {{hop2}} cách hai bước)",
       "someNotInStructure": "{{count}} bài đã chọn không có trong cấu trúc trích dẫn",
+      "mapLinksThinned": "hiển thị {{shown}} trong {{found}} liên kết: những liên kết mạnh nhất của mỗi bài",
+      "mapUnavailable": "Máy chủ này không có bản đồ bài báo (cấu trúc bài báo bị tắt hoặc thiếu). Đang hiển thị đồ thị của chính các bài thay thế",
       "mapAlreadyChosen": "Bài này đã là một trong các bài của bản đồ",
       "mapAddPaperTooltip": "Thêm bài này vào các bài của bản đồ",
       "reason": {

@@ -61,6 +61,9 @@ export class RawGraph {
   edgeIdMap: Record<string, number> = {}
   // edgeDynamicIdMap: map edge dynamic id to index in edges array (SigmaGraph has DynamicId as key)
   edgeDynamicIdMap: Record<string, number> = {}
+  // Fork: true for a paper map (nodes are papers, edges citations or coupling), set when it is
+  // loaded, so what is edited or expanded follows the graph on screen, not the query label.
+  isPaperMap = false
 
   getNode = (nodeId: string) => {
     const nodeIndex = this.nodeIdMap[nodeId]

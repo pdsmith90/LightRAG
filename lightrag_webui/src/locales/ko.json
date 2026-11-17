@@ -426,6 +426,8 @@
       "mapTwoHopsTooltip": "두 단계까지 떨어진 논문 표시 중. 클릭하면 한 단계만 표시",
       "mapSummary": "논문 지도: 논문 {{nodes}}편 (한 단계 {{hop1}}편, 두 단계 {{hop2}}편)",
       "someNotInStructure": "선택한 논문 중 {{count}}편은 인용 구조에 없습니다",
+      "mapLinksThinned": "링크 {{found}}개 중 {{shown}}개 표시: 논문별로 가장 강한 링크",
+      "mapUnavailable": "이 서버에는 논문 지도가 없습니다(논문 구조가 꺼져 있거나 없습니다). 대신 논문 자체의 그래프를 표시합니다",
       "mapAlreadyChosen": "이 논문은 이미 지도의 논문입니다",
       "mapAddPaperTooltip": "이 논문을 지도의 논문에 추가",
       "reason": {

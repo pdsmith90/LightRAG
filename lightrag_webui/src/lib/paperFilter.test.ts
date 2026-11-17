@@ -7,7 +7,10 @@ import {
   CONTEXT_EDGE_COLOR,
   clearsLabelOnEmpty,
   expandMapLabel,
+  isChosenMapNode,
+  isPaperMapUnavailable,
   isStalePaperResult,
+  mapFallbackLabel,
   fadeColor,
   nextContext,
   nextHops,
@@ -306,13 +309,52 @@ describe('paper map', () => {
   })
 
   test('expanding a map node adds it to the papers, at most ten', () => {
-    expect(expandMapLabel(['10.1/a'], 'ABCD1234')).toEqual({
+    expect(expandMapLabel(['10.1/a'], { id: 'ABCD1234' })).toEqual({
       label: 'paper+map:10.1/a ABCD1234'
     })
-    expect(expandMapLabel(['10.1/a'], '10.1/a')).toEqual({ reason: 'mapAlreadyChosen' })
+    expect(expandMapLabel(['10.1/a'], { id: '10.1/a' })).toEqual({ reason: 'mapAlreadyChosen' })
     const ten = Array.from({ length: 10 }, (_, i) => `10.1/${i}`)
-    expect(expandMapLabel(ten, '10.1/new')).toEqual({ reason: 'maxPapers' })
+    expect(expandMapLabel(ten, { id: '10.1/new' })).toEqual({ reason: 'maxPapers' })
     expect(en.graphPanel.paperFilter.mapAlreadyChosen).toBeTruthy()
+  })
+
+  test('a node is a chosen paper by its DOI, attachment key or structure id', () => {
+    // chosen by key, shown under its DOI (the server's node id)
+    const node = {
+      id: '10.1/a',
+      properties: { doi: '10.1/a', attachment_key: 'AAAA0001', paper_id: 'doi:10.1/a' }
+    }
+    expect(isChosenMapNode(['AAAA0001'], node)).toBe(true)
+    expect(isChosenMapNode(['aaaa0001'], node)).toBe(true)
+    expect(isChosenMapNode(['10.1/A'], node)).toBe(true)
+    expect(isChosenMapNode(['https://doi.org/10.1/a'], node)).toBe(true)
+    expect(isChosenMapNode(['doi:10.1/a'], node)).toBe(true)
+    expect(isChosenMapNode(['10.1/b', 'BBBB0001'], node)).toBe(false)
+    // a paper without a DOI: its structure id or the key it is shown under
+    const report = {
+      id: 'KKKK0001',
+      properties: { paper_id: 'zot:ITEM0001', attachment_key: 'KKKK0001' }
+    }
+    expect(isChosenMapNode(['zot:ITEM0001'], report)).toBe(true)
+    expect(isChosenMapNode(['KKKK0001'], report)).toBe(true)
+    expect(isChosenMapNode(['10.1/a'], report)).toBe(false)
+    expect(isChosenMapNode([], node)).toBe(false)
+    // expanding such a node says it is already chosen instead of adding it
+    expect(expandMapLabel(['AAAA0001'], node)).toEqual({ reason: 'mapAlreadyChosen' })
+    expect(expandMapLabel(['AAAA0001'], { id: '10.1/b', properties: { doi: '10.1/b' } })).toEqual({
+      label: 'paper+map:AAAA0001 10.1/b'
+    })
+  })
+
+  test('only a 501 or 404 means the server has no paper map', () => {
+    expect(isPaperMapUnavailable(Object.assign(new Error('x'), { status: 501 }))).toBe(true)
+    expect(isPaperMapUnavailable(Object.assign(new Error('x'), { status: 404 }))).toBe(true)
+    expect(isPaperMapUnavailable(Object.assign(new Error('x'), { status: 500 }))).toBe(false)
+    expect(isPaperMapUnavailable(Object.assign(new Error('x'), { status: 422 }))).toBe(false)
+    expect(isPaperMapUnavailable(new Error('Network Error'))).toBe(false)
+    expect(isPaperMapUnavailable(null)).toBe(false)
+    expect(mapFallbackLabel(['10.1/a', 'AAAA0001'])).toBe('paper:10.1/a AAAA0001')
+    expect(en.graphPanel.paperFilter.mapUnavailable).toBeTruthy()
   })
 
   test('the reach is stored and read back, defaulting to one hop', () => {
@@ -354,6 +396,14 @@ describe('paper map', () => {
     expect(paperSummaryMessage(t, unknown, 30)).toContain(
       '; 1 of the selected papers are not in the paper structure'
     )
+    // links the server thinned are said so; all links shown say nothing
+    const thinned = { ...map, n_links: 25209, shown_links: 4000 }
+    expect(paperSummaryMessage(t, thinned, 30)).toBe(
+      'Paper map: 30 papers (20 one step away, 9 two steps away); ' +
+        '4000 of the 25209 links between them shown, the strongest for each paper'
+    )
+    const whole = { ...map, n_links: 12, shown_links: 12 }
+    expect(paperSummaryMessage(t, whole, 30)).toBe(paperSummaryMessage(t, map, 30))
     const none = { ...map, reason: 'not_in_structure', papers: [seed, seed] }
     expect(paperSummaryMessage(t, none, 0)).toBe(
       en.graphPanel.paperFilter.reason.not_in_structure_many

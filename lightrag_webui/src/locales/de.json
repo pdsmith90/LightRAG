@@ -426,6 +426,8 @@
       "mapTwoHopsTooltip": "Zeigt Arbeiten bis zu zwei Schritte entfernt. Klicken für nur einen Schritt",
       "mapSummary": "Literaturkarte: {{nodes}} Arbeiten ({{hop1}} einen Schritt entfernt, {{hop2}} zwei Schritte)",
       "someNotInStructure": "{{count}} der gewählten Arbeiten sind nicht in der Zitationsstruktur",
+      "mapLinksThinned": "{{shown}} von {{found}} Verbindungen gezeigt, die stärksten jeder Arbeit",
+      "mapUnavailable": "Dieser Server hat keine Literaturkarte (seine Literaturstruktur ist aus oder fehlt). Stattdessen wird der Graph der Arbeiten gezeigt",
       "mapAlreadyChosen": "Diese Arbeit gehört schon zu den Arbeiten der Karte",
       "mapAddPaperTooltip": "Diese Arbeit zu den Arbeiten der Karte hinzufügen",
       "reason": {

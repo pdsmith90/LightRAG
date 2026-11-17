@@ -426,6 +426,8 @@
       "mapTwoHopsTooltip": "2ステップ先までの論文を表示中。クリックで1ステップのみ表示",
       "mapSummary": "論文マップ：{{nodes}} 本（1ステップ {{hop1}} 本、2ステップ {{hop2}} 本）",
       "someNotInStructure": "選択した論文のうち {{count}} 本は引用構造にありません",
+      "mapLinksThinned": "{{found}} 本のリンクのうち {{shown}} 本を表示：各論文の強いリンク",
+      "mapUnavailable": "このサーバーには論文マップがありません（論文構造がオフか未設定です）。代わりに論文自体のグラフを表示します",
       "mapAlreadyChosen": "この論文はすでにマップの論文です",
       "mapAddPaperTooltip": "この論文をマップの論文に追加",
       "reason": {
