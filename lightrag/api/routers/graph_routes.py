@@ -7,7 +7,7 @@ import traceback
 from fastapi import APIRouter, Depends, Query, HTTPException, Response
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from lightrag import zotero_citations, zotero_papers
+from lightrag import zotero_citations, zotero_papers, zotero_struct
 from lightrag.base import DeletionResult
 from lightrag.exceptions import (
     AdminWriteHoldExceededError,
@@ -253,6 +253,15 @@ class PaperPassagesRequest(BaseModel):
         return question.strip()
 
 
+def _struct_unavailable(exc: zotero_struct.Unavailable) -> HTTPException:
+    """501, as for a storage that lacks a capability: the paper structure is
+    off, the document-status storage is not PostgreSQL, or the schema is
+    missing. The message is self-authored and names no host or path."""
+    return HTTPException(
+        status_code=501, detail=f"Paper structure is not available: {exc}"
+    )
+
+
 def create_graph_routes(rag, api_key: Optional[str] = None):
     # Fresh router per call. A module-level instance would accumulate
     # duplicate routes when the factory is invoked more than once in the
@@ -473,6 +482,145 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             logger.error(f"Error getting paper graph for '{paper}': {str(e)}")
             logger.error(traceback.format_exc())
             raise internal_server_error(e)
+
+    # Fork: the library's citation structure (lightrag/zotero_struct.py). Every
+    # route answers 501 while ZOTERO_STRUCT_SCHEMA is unset, the doc-status
+    # storage is not PostgreSQL, or the schema is missing.
+    async def _struct_call(what: str, call):
+        try:
+            return await call
+        except zotero_struct.Unavailable as e:
+            raise _struct_unavailable(e)
+        except Exception as e:
+            logger.error(f"Error {what}: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise internal_server_error(e)
+
+    @router.get("/graph/papers/related", dependencies=[Depends(combined_auth)])
+    async def get_related_papers(
+        paper: str = Query(
+            ...,
+            min_length=1,
+            max_length=300,
+            description="Zotero attachment key, DOI or structure paper id",
+        ),
+        relations: Optional[str] = Query(
+            None,
+            description="Comma-separated subset of cites, cited_by, coupled, coauthor (default: all)",
+        ),
+        limit: int = Query(20, ge=1, le=zotero_struct.MAX_LIMIT),
+    ):
+        """Papers linked to one paper by citation (either way), coupling or a shared author (fork).
+
+        Returns ``paper``, ``totals`` per relation, ``ranking`` (how the
+        score is made) and ``related`` (best first: ``reasons``,
+        ``score``, coupling ``shared_refs`` / ``coupling_score``,
+        ``shared_authors``, ``in_kb`` and ``key`` for the passages route);
+        ``reason: "not_in_structure"`` when the paper is unknown.
+        """
+        wanted = None
+        if relations is not None:
+            wanted = [r.strip() for r in relations.split(",") if r.strip()]
+            unknown = [r for r in wanted if r not in zotero_struct.RELATIONS]
+            if unknown or not wanted:
+                raise HTTPException(
+                    status_code=422,
+                    detail="relations takes "
+                    + ", ".join(zotero_struct.RELATIONS)
+                    + (f"; unknown: {', '.join(unknown)}" if unknown else ""),
+                )
+        return await _struct_call(
+            f"finding papers related to '{paper}'",
+            zotero_struct.related_papers(rag, paper, wanted, limit),
+        )
+
+    @router.get("/graph/papers/topics", dependencies=[Depends(combined_auth)])
+    async def get_paper_topics(
+        q: Optional[str] = Query(
+            None, max_length=200, description="Words of the topic name"
+        ),
+        level: Optional[Literal["domain", "field", "subfield", "topic"]] = Query(None),
+        limit: int = Query(20, ge=1, le=zotero_struct.MAX_LIMIT),
+    ):
+        """Topics whose name holds every word of ``q``, at any level or one (fork).
+
+        Each carries ``topic_id``, ``name``, ``level``, ``path`` (domain to
+        topic), ``n_papers`` (papers with a topic under it) and ``n_primary``
+        (papers whose primary topic is under it); ``total`` counts them all.
+        """
+        return await _struct_call(
+            f"listing topics for '{q}'",
+            zotero_struct.list_topics(rag, q or "", level, limit),
+        )
+
+    @router.get("/graph/papers/by_topic", dependencies=[Depends(combined_auth)])
+    async def get_papers_by_topic(
+        topic: str = Query(
+            ...,
+            min_length=1,
+            max_length=200,
+            description="Topic id at any level (topic:, subfield:, field:, domain:) or words of its name",
+        ),
+        limit: int = Query(20, ge=1, le=zotero_struct.MAX_LIMIT),
+        primary_only: bool = Query(
+            False, description="Only papers whose primary topic is under the topic"
+        ),
+    ):
+        """The papers under one topic, ranked (fork).
+
+        Returns ``topic``, ``alternatives`` (other name matches), ``total``,
+        ``in_kb``, ``ranking`` and ``papers``; ``reason: "no_topic"`` when
+        nothing matches.
+        """
+        return await _struct_call(
+            f"listing papers of topic '{topic}'",
+            zotero_struct.papers_by_topic(rag, topic, limit, primary_only),
+        )
+
+    @router.get("/graph/papers/connect", dependencies=[Depends(combined_auth)])
+    async def get_paper_connection(
+        a: str = Query(..., min_length=1, max_length=300),
+        b: str = Query(..., min_length=1, max_length=300),
+        paths: int = Query(3, ge=1, le=zotero_struct.MAX_PATHS),
+        max_hops: int = Query(6, ge=1, le=zotero_struct.MAX_HOPS),
+    ):
+        """What connects two papers: paths over citations and coupling, and direct links (fork).
+
+        Returns ``a``, ``b``, ``links`` (citation, coupling, shared authors,
+        same topic / subfield / field, papers citing both, library papers
+        both cite) and ``paths`` (cheapest first, hub papers penalised, each
+        step labelled with its relation). Shared entities are not part of
+        it: ``/graphs/paper?mode=common`` shows them.
+        """
+        return await _struct_call(
+            f"connecting '{a}' and '{b}'",
+            zotero_struct.connect_papers(rag, a, b, paths, max_hops),
+        )
+
+    @router.get("/graphs/paper/map", dependencies=[Depends(combined_auth)])
+    async def get_paper_map(
+        paper: list[str] = Query(
+            ...,
+            description="Zotero attachment key or DOI of a paper; repeat for several papers",
+        ),
+        hops: int = Query(1, ge=1, le=2),
+        max_nodes: int = Query(1000, description="Maximum nodes to return", ge=1),
+    ):
+        """A graph of papers around a few papers: citations and coupling, one or two hops (fork).
+
+        Returns the ``/graphs`` structure (papers as nodes, ``entity_type``
+        the field of their primary topic) plus ``paper``, the chosen papers'
+        summaries and the view's counts; ``paper.reason`` says why a graph
+        is empty or has no edges.
+        """
+        if any(len(p) > 300 for p in paper):
+            raise HTTPException(status_code=422, detail="a paper id is too long")
+        return await _struct_call(
+            f"getting the paper map for '{paper}'",
+            zotero_struct.paper_map(
+                rag, paper, hops, min(max_nodes, rag.max_graph_nodes)
+            ),
+        )
 
     @router.get("/graph/entity/exists", dependencies=[Depends(combined_auth)])
     async def check_entity_exists(
