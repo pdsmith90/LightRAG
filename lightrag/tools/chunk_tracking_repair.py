@@ -864,8 +864,11 @@ async def _accumulate_cached_attribution(
         )
         # Fork (extraction contract): a chunk extracted with the contract or an
         # extraction hook is attributed from the records its extraction
-        # accepted, which name what the graph got (a hook's renames included);
-        # it counts as a chunk with its cache. The others as before.
+        # accepted (a hook's renames included). They carry the model's
+        # spelling from before the name fold, and this tool does no fold
+        # aliasing, so a name the fold changed gets no attribution from them
+        # (as on the base from the cache). Such a chunk counts as a chunk with
+        # its cache. The others as before.
         stored_records = await read_chunk_kg_records(
             rag.text_chunks, batch, chunk_data_by_id
         )

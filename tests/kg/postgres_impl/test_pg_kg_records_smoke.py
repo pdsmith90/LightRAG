@@ -8,6 +8,9 @@ accepted extraction records (``kg_records``, lightrag/kg_contract.py).
   start-up is refused when the feature is on (and goes ahead when it is off).
 - The general chunk statements (the ones the base branch also issues) work on
   a table that has the column and rows that use it.
+- A same-named table with the column in another schema does not make the
+  start-up lookup say the column is there: the lookup follows the session's
+  search path, as the three statements that name the column do.
 
 Same markers and guard as ``tests/kg/pgtable_impl/test_pgtable_smoke.py``:
 skipped unless pytest runs with ``--run-integration`` and ``POSTGRES_PASSWORD``
@@ -17,6 +20,7 @@ Names are invented.
 
 import asyncio
 import os
+import shutil
 import uuid
 
 import numpy as np
@@ -211,7 +215,7 @@ async def _embed(texts):
     return np.ones((len(texts), 8))
 
 
-def _rag(tmp_path, validator):
+def _rag(tmp_path, validator, profile=None):
     from lightrag import LightRAG
     from lightrag.kg_contract import kg_extraction_validator
     from lightrag.utils import EmbeddingFunc
@@ -225,6 +229,8 @@ def _rag(tmp_path, validator):
         llm_model_func=llm,
         embedding_func=EmbeddingFunc(embedding_dim=8, func=_embed),
         kv_storage="PGKVStorage",
+        addon_params={"entity_type_prompt_file": profile} if profile else {},
+        entity_extraction_use_json=True,
         **({"kg_extraction_validator": kg_extraction_validator} if validator else {}),
     )
 
@@ -262,3 +268,114 @@ async def test_a_held_lock_refuses_start_up_only_when_the_column_is_needed(
         assert await _has_column(conn) is False
     finally:
         await conn.close()
+
+
+OTHER_SCHEMA = "kgrecords_other"
+
+
+async def _our_table_has_column(conn) -> bool:
+    """Does the table an unqualified LIGHTRAG_DOC_CHUNKS resolves to have it?"""
+    return await conn.fetchval(
+        "SELECT EXISTS (SELECT 1 FROM pg_attribute "
+        "WHERE attrelid = to_regclass('lightrag_doc_chunks') "
+        "AND attname = 'kg_records' AND NOT attisdropped)"
+    )
+
+
+@pytest.fixture
+async def other_schema(chunks):
+    """Our chunk table has no column (``chunks``); a second schema, outside the
+    search path, holds a table of the same name WITH one. The start-up probe is
+    run again with both in place."""
+    conn = await _connect()
+    try:
+        await conn.execute(f"DROP SCHEMA IF EXISTS {OTHER_SCHEMA} CASCADE")
+        await conn.execute(f"CREATE SCHEMA {OTHER_SCHEMA}")
+        await conn.execute(
+            f"CREATE TABLE {OTHER_SCHEMA}.lightrag_doc_chunks "
+            "(id text, kg_records jsonb)"
+        )
+        assert await _our_table_has_column(conn) is False
+    finally:
+        await conn.close()
+    await chunks.db._migrate_text_chunks_add_heading_sidecar()
+    try:
+        yield chunks
+    finally:
+        conn = await _connect()
+        try:
+            await conn.execute(f"DROP SCHEMA IF EXISTS {OTHER_SCHEMA} CASCADE")
+        finally:
+            await conn.close()
+
+
+async def test_a_same_named_table_in_another_schema_does_not_count(other_schema):
+    """With neither contract nor hook the flag stays false and the default
+    path's statements (the clear that extraction issues for its chunks, the
+    read) run against our table."""
+    from lightrag.operate import extract_entities
+    from lightrag.prompt import resolve_entity_extraction_prompt_profile
+    from lightrag.utils import read_chunk_kg_records
+
+    chunks = other_schema
+    assert chunks.db.chunk_kg_records_column is False
+    await chunks.upsert({"c1": _row()})
+
+    async def llm(prompt, system_prompt=None, history_messages=None, **_):
+        return '{"entities": [], "relationships": []}'
+
+    config = {
+        "role_llm_funcs": {r: llm for r in ("extract", "keyword", "query", "vlm")},
+        "entity_extract_max_gleaning": 0,
+        "entity_extract_max_records": 100,
+        "entity_extract_max_entities": 40,
+        "addon_params": {},
+        "llm_model_max_async": 1,
+        "entity_extraction_use_json": True,
+        "_entity_extraction_prompt_profile": resolve_entity_extraction_prompt_profile(
+            {}, True
+        ),
+    }
+    await extract_entities({"c1": _row()}, config, text_chunks_storage=chunks)
+    assert await read_chunk_kg_records(chunks, ["c1"], {}) == {}
+    conn = await _connect()
+    try:
+        assert await _our_table_has_column(conn) is False
+    finally:
+        await conn.close()
+
+
+@pytest.mark.parametrize("feature", ["hook", "contract"])
+async def test_start_up_adds_the_column_to_our_table_not_the_other_one(
+    other_schema, tmp_path, monkeypatch, feature
+):
+    """With the hook or the contract on, start-up adds the column to OUR table
+    (the other schema's table already has it) and records round-trip."""
+    from lightrag.utils import read_chunk_kg_records, write_chunk_kg_records
+    from tests.extraction.test_kg_contract import CONTRACT_SAMPLE
+
+    if feature == "contract":
+        (tmp_path / "entity_type").mkdir()
+        shutil.copy(CONTRACT_SAMPLE, tmp_path / "entity_type" / "contract.yml")
+        monkeypatch.setenv("PROMPT_DIR", str(tmp_path))
+    rag = _rag(
+        tmp_path,
+        validator=feature == "hook",
+        profile="contract.yml" if feature == "contract" else None,
+    )
+    try:
+        await asyncio.wait_for(rag.initialize_storages(), 60)
+        assert rag.text_chunks.db.chunk_kg_records_column is True
+        conn = await _connect()
+        try:
+            assert await _our_table_has_column(conn) is True
+        finally:
+            await conn.close()
+        await rag.text_chunks.upsert({"c1": _row()})
+        await write_chunk_kg_records(rag.text_chunks, "c1", RECORDS)
+        assert await read_chunk_kg_records(rag.text_chunks, ["c1"], {}) == {
+            "c1": RECORDS
+        }
+        await rag.text_chunks.delete(["c1"])
+    finally:
+        await rag.finalize_storages()
