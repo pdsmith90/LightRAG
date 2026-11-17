@@ -252,7 +252,10 @@ and a stock or older server 404, and the tools say so in a sentence instead of f
 The proxy never reads the structure itself. `paper` takes a Zotero key, a DOI, a
 structure id (`doi:…`, `zot:…`) as they are; words are looked up as for
 `paper_passages`, and exactly one paper must fit. `limit` is clamped to 1..50 and
-`paths` to 1..5.
+`paths` to 1..5 (a value below 1 counts as 1). `connect_papers` searches up to 6
+steps and says, when it finds no route, that none of at most that many steps over
+citations (either direction) and coupling exists; its step labels are told apart within
+one answer ("Okafor 2010a" and "Okafor 2010b").
 
 ## Install
 

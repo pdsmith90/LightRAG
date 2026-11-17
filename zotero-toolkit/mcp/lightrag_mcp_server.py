@@ -2325,7 +2325,12 @@ def connect_papers(a: str, b: str, paths: int = 3) -> str:
             out.append(f"   via {_struct_row(p)}")
     if not routes:
         out.append(
-            "No route over citations and coupling within 6 steps"
+            (
+                data.get("message")
+                or "No route of at most 6 steps over citations (either direction) "
+                "and bibliographic coupling links the two papers"
+            )
+            + "; a longer route may exist."
             if data.get("reason") == "not_connected"
             else "No route."
         )

@@ -413,11 +413,13 @@ header `X-Paper-Search: 2` (a FastAPI request-validation 422 carries none). Code
 
 With `ZOTERO_STRUCT_SCHEMA` naming a PostgreSQL schema that holds the library's
 citation structure, the server answers four agent routes and the WebUI offers a paper
-map. Unset (the default), nothing reads the schema, the routes answer 501, `/health`
-is unchanged and the WebUI shows no map. They also answer 501 when the document-status
-storage is not PostgreSQL (the schema is read through its connection pool, so the
-graph storage does not matter), when the name is not a lower-case SQL identifier, or
-when a table is missing. The schema is built and loaded outside this repository (a
+map. Unset (the default), nothing reads the schema, every route answers 501 (the map
+route too, whatever it is asked for), `/health` is unchanged and the WebUI shows no map.
+They also answer 501 when the document-status storage is not PostgreSQL (the schema is
+read through its connection pool, so the graph storage does not matter), when the name
+is not a lower-case SQL identifier, when a table is missing, or when a table is dropped
+while the schema is being read (one retry under a fresh table check first; nothing
+half-read is kept, and the failure stands until the next check). The schema is built and loaded outside this repository (a
 script that reads the Zotero metadata and OpenAlex) and is rebuilt, never edited.
 
 The schema's tables, by the columns the server reads:
@@ -436,8 +438,11 @@ The schema's tables, by the columns the server reads:
 
 The server reads the schema whole into memory on first use (about 10,500 papers and
 166,000 links in under a second against a local server) and reads it again when a
-rebuild changes the tables' OIDs or file nodes, which it checks at most once a minute;
-path searches and maps then run in memory in milliseconds, where per-request SQL would
+rebuild changes the tables' OIDs or file nodes, which it checks at most once a minute
+(the large tables come in eight slices, so no single fetch holds the event loop long,
+and the rows are converted in a worker thread; `/health`'s `zotero_struct` key, present
+only while the setting is set, shares the once-a-minute check and gives up after three
+seconds, answering `false`); path searches and maps then run in memory in milliseconds, where per-request SQL would
 need recursive queries for every path. Which papers have text in the knowledge base
 comes from the document-status table itself: processed documents of the server's
 workspace, keyed by the attachment key their file path starts with, read at most every
@@ -450,8 +455,8 @@ by an attachment key, a DOI or a schema `paper_id`; papers in results carry `in_
 | `GET /graph/papers/related` | `paper`; `relations` (comma-separated `cites`, `cited_by`, `coupled`, `coauthor`; default all); `limit` 1..200 (20) | `paper`, `totals` per relation, `ranking`, `related` (each with `reasons`, `score`, `shared_refs` / `coupling_score`, `shared_authors`), `truncated`; `reason: not_in_structure` for an unknown paper |
 | `GET /graph/papers/topics` | `q` (words of the name), `level` (`domain`, `field`, `subfield`, `topic`), `limit` | `total`, `topics` (each with `path`, `n_papers`: a topic row under it, `n_primary`: primary topic under it) |
 | `GET /graph/papers/by_topic` | `topic` (id at any level, or words of its name), `limit`, `primary_only` | `topic`, `alternatives` (next name matches), `total`, `in_kb`, `ranking`, `papers`; `reason: no_topic` |
-| `GET /graph/papers/connect` | `a`, `b`, `paths` 1..5 (3), `max_hops` 1..8 (6) | `a`, `b`, `links` (`relation`, `shared_refs` / `coupling_score`, `shared_authors`, `same_topic` / `same_subfield` / `same_field`, `cited_by_both`, `cite_both`), `paths` (each with `hops`, `cost`, `papers` passed through and labelled `steps`); `reason`: `not_in_structure` (with `missing`), `same_paper`, `not_connected` |
-| `GET /graphs/paper/map` | `paper` (repeat, at most 10), `hops` 1..2 (1), `max_nodes` (capped by `MAX_GRAPH_NODES`) | the `/graphs` structure plus `paper` (the papers' summaries, `n_hop1` / `n_hop2` found, `shown_hop1` / `shown_hop2`, `ranking`); `paper.reason`: `too_many_papers`, `not_in_structure`, `no_links` |
+| `GET /graph/papers/connect` | `a`, `b`, `paths` 1..5 (3), `max_hops` 1..8 (6) | `a`, `b`, `links` (`relation`, `shared_refs` / `coupling_score`, `shared_authors`, `same_topic` / `same_subfield` / `same_field`, `cited_by_both`, `cite_both`), `paths` (each with `hops`, `cost`, `papers` passed through and labelled `steps`), `max_hops`; `reason`: `not_in_structure` (with `missing`), `same_paper`, `not_connected` (with a `message` naming the step limit and the links) |
+| `GET /graphs/paper/map` | `paper` (repeat, at most 10), `hops` 1..2 (1), `max_nodes` (capped by `MAX_GRAPH_NODES`) | the `/graphs` structure plus `paper` (the papers' summaries, `n_hop1` / `n_hop2` found, `shown_hop1` / `shown_hop2`, `n_links` found among the shown papers and `shown_links` drawn, `ranking`); `is_truncated` also when links were dropped; `paper.reason`: `too_many_papers`, `not_in_structure`, `no_links` |
 
 Rankings, also stated in each answer: related papers score 1.0 for a citation either
 way (+0.25 both ways), plus 2 x the coupling score, plus 0.25 per shared author (at
@@ -459,26 +464,41 @@ most four); papers of a topic come with their primary topic under it first, then
 cited by library papers, then most cited overall, then newest. Paths are the cheapest
 over citations (either direction) and coupling, where passing through a paper costs
 1 + 0.5 x log2(1 + its links), so a hub cited by hundreds of library papers costs about
-as much as two more ordinary steps; each later path avoids the papers of the earlier
-ones, and a direct link is reported once. Shared knowledge-graph entities are not part
+as much as two more ordinary steps; the search is exact under the step limit (the
+cheapest path of at most `max_hops` steps is found whenever one exists, even where a
+costlier, shorter route is the only one that fits); each later path avoids the papers of
+the earlier ones, and a direct link is reported once. Papers on one answer's paths are
+labelled "Family Year" with a, b, ... after equal labels, as on the map. Shared knowledge-graph entities are not part
 of `connect`: the paper filter's common view shows them. Topics label and filter; they
 do not enter retrieval, and no route changes passage retrieval.
 
 The map shows papers one or two steps from the chosen ones over citations and
 coupling: the chosen papers, then one-step papers by the strength of their links to
-them (1.0 per citation either way plus 2 x the coupling score), then two-step papers by
+them (1.0 when either cites the other, once even if both do, plus 2 x the coupling
+score), then two-step papers by
 the strength of the one-step papers they link to, each damped by log2(2 + its links),
-cut at the node limit. A node is a paper: its id the DOI (else an attachment key),
+cut at the node limit. Links among the shown papers are thinned, since a two-step map
+of a much cited paper has tens of thousands: every link of a chosen paper is kept, each
+other paper keeps its six strongest (ties broken by id), and at most four times the
+node limit are drawn, the weakest links of papers that were not chosen going first;
+`paper.n_links` and `paper.shown_links` say how many there were and how many are drawn.
+A node is a paper: its id the DOI (else an attachment key),
 its label "Family Year", `entity_type` the field of its primary topic (so the legend
 colours fields), and its properties title, year, venue, DOI, authors, topic,
 subfield, counts, `in_kb` and `attachment_key`. An edge runs from the citing to the
 cited paper (`DIRECTED`; coupling-only pairs are `UNDIRECTED`), with `keywords`
-`cites`, `cite each other`, `coupled` or both, and `weight` 1.0 per citation plus 2 x
-the coupling score. In the WebUI the picker's mode button reaches the map after
+`cites`, `cite each other`, `coupled` or both, and `weight` 1.0 for a citation either
+way (once when both papers cite each other) plus 2 x the coupling score. The response
+is encoded in the thread that builds the map. In the WebUI the picker's mode button reaches the map after
 "in common" (label `paper+map:<ids>`) while `/health` reports `zotero_struct: true`;
 in map mode the second button sets the reach, one or two steps (remembered per
 browser). Expanding a node adds that paper to the map's papers instead of expanding
-an entity, and map nodes and edges are not editable.
+an entity (unless the node already is one of the chosen papers, by DOI, attachment key
+or structure id, which the WebUI says), and map nodes and edges are not editable. Both
+follow the graph on screen: it is marked as a map when it loads, so an entity graph left
+on screen by a failed map fetch stays editable. A map label against a server without the
+map (501, or 404 from an older server) shows one message and falls back to the papers'
+own graph, without retrying.
 
 The MCP proxy's `related_papers`, `papers_by_topic` and `connect_papers` call these
 routes (see [zotero-toolkit/mcp/README.md](./zotero-toolkit/mcp/README.md#paper-structure)).
@@ -487,7 +507,8 @@ Code: `lightrag/zotero_struct.py`, `lightrag_webui/src/lib/paperFilter.ts`,
 `tests/test_zotero_struct.py` (offline, the SQL answered by a stub) and
 `tests/test_zotero_struct_pg_smoke.py` (`pg_smoke`: `--run-integration` and a scratch
 PostgreSQL named by the `POSTGRES_*` settings; it builds and drops a small schema of
-its own).
+its own, deletes only the document-status rows it inserted, and skips itself when
+`POSTGRES_WORKSPACE` is set, because the storage would then ignore its own workspace).
 
 ### PostgreSQL edge removal in plain SQL
 

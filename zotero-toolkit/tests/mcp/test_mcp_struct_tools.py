@@ -340,3 +340,92 @@ def test_connect_papers_points_to_the_common_view_for_shared_entities(load_serve
     srv = load_server()
     tools = {t.name: t for t in anyio.run(srv.mcp.list_tools)}
     assert "mode=common" in tools["connect_papers"].description
+
+
+def test_not_connected_says_within_how_many_steps_and_over_which_links(
+    load_server, fake_lightrag
+):
+    _route(
+        fake_lightrag,
+        "/graph/papers/connect",
+        lambda p: (
+            200,
+            {
+                "a": ME,
+                "b": CONNECT["b"],
+                "links": CONNECT["links"],
+                "paths": [],
+                "reason": "not_connected",
+                "max_hops": 6,
+                "message": "No route of at most 6 steps over citations (either "
+                "direction) and bibliographic coupling links the two papers",
+            },
+        ),
+    )
+    srv = load_server()
+    out = srv.connect_papers("AAAA0001", "10.9/e")
+    assert out.splitlines()[-1] == (
+        "No route of at most 6 steps over citations (either direction) and "
+        "bibliographic coupling links the two papers; a longer route may exist."
+    )
+    # a server that predates the message still names the steps and the links
+    _route(
+        fake_lightrag,
+        "/graph/papers/connect",
+        lambda p: (
+            200,
+            {**CONNECT, "paths": [], "reason": "not_connected"},
+        ),
+    )
+    out = srv.connect_papers("AAAA0001", "10.9/e")
+    assert "at most 6 steps over citations (either direction)" in out.splitlines()[-1]
+
+
+def test_connect_labels_are_the_servers_so_equal_papers_stay_apart(
+    load_server, fake_lightrag
+):
+    twin = dict(CONNECT["b"], label="Okafor 2010b")
+    data = {
+        **CONNECT,
+        "a": dict(ME, label="Okafor 2010a"),
+        "b": twin,
+        "paths": [
+            {
+                "hops": 1,
+                "cost": 1.0,
+                "papers": [],
+                "steps": [
+                    {
+                        "from": "Okafor 2010a",
+                        "relation": ["cites"],
+                        "to": "Okafor 2010b",
+                    }
+                ],
+            }
+        ],
+    }
+    _route(fake_lightrag, "/graph/papers/connect", lambda p: (200, data))
+    out = load_server().connect_papers("AAAA0001", "10.9/e")
+    assert "1. (1 step) Okafor 2010a —cites→ Okafor 2010b" in out
+
+
+def test_lower_limits_are_clamped_to_one(load_server, fake_lightrag):
+    _route(fake_lightrag, "/graph/papers/related", lambda p: (200, RELATED))
+    _route(
+        fake_lightrag, "/graph/papers/by_topic", lambda p: (200, {"reason": "no_topic"})
+    )
+    _route(fake_lightrag, "/graph/papers/topics", lambda p: (200, {"total": 0}))
+    _route(fake_lightrag, "/graph/papers/connect", lambda p: (200, CONNECT))
+    srv = load_server()
+    srv.related_papers("AAAA0001", limit=0)
+    srv.related_papers("AAAA0001", limit=-7)
+    srv.papers_by_topic("geophysics", limit=0)
+    srv.papers_by_topic("geo", limit=-1, topics_only=True)
+    srv.connect_papers("AAAA0001", "10.9/e", paths=0)
+    srv.connect_papers("AAAA0001", "10.9/e", paths=-2)
+    related = fake_lightrag.calls("/graph/papers/related")
+    assert [c["params"]["limit"] for c in related] == ["1", "1"]
+    assert fake_lightrag.calls("/graph/papers/by_topic")[0]["params"]["limit"] == "1"
+    assert fake_lightrag.calls("/graph/papers/topics")[0]["params"]["limit"] == "1"
+    connect = fake_lightrag.calls("/graph/papers/connect")
+    assert [c["params"]["paths"] for c in connect] == ["1", "1"]
