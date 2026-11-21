@@ -12,6 +12,7 @@ import faulthandler
 import io
 import json
 import os
+import resource
 import signal
 import stat
 import sys
@@ -54,8 +55,10 @@ def fake_convert_killing(sentinels):
 
 def _native_crash():
     """Die by SIGSEGV, as a crash inside a C extension would. pytest's faulthandler (inherited through fork)
-    would print a fatal-error trace for it; the crash is expected here."""
+    would print a fatal-error trace for it; the crash is expected here. The core size limit is zeroed first:
+    on a host that stores core files, each probe otherwise left one behind (three per run of this file)."""
     faulthandler.disable()
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     os.kill(os.getpid(), signal.SIGSEGV)
 
 
