@@ -187,6 +187,8 @@ class _DB:
         self.schema = schema
         self.calls: list[tuple[str, list | None]] = []
         self.filenode = 1
+        # table name -> the v2 columns the schema carries
+        self.columns: dict[str, list[str]] = {}
         # table name -> the errors its next reads raise, one per read
         self.fail: dict[str, list[Exception]] = {}
 
@@ -201,6 +203,13 @@ class _DB:
             return [
                 {"relname": t, "oid": i, "filenode": self.filenode}
                 for i, t in enumerate(zs._TABLES)
+            ]
+        if name == "columns":  # a v1 schema has none of the v2 columns
+            assert params == [self.schema]
+            return [
+                {"table_name": t, "column_name": c}
+                for t, cs in self.columns.items()
+                for c in cs
             ]
         if name == "documents":
             workspace, status = params

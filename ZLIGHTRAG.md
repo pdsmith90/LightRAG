@@ -753,6 +753,21 @@ The schema's tables, by the columns the server reads:
 | `cites` | `citing_paper_id`, `cited_paper_id` (both library papers) |
 | `coupled` | `paper_a`, `paper_b`, `shared_refs`, `score` (bibliographic coupling) |
 
+A schema built by the citation-graph builder (v2) adds the following. Every item is
+optional and found by what the schema has, so a v1 schema loads and answers exactly as
+before: the columns are looked up in `information_schema.columns` once per load, the
+tables in the same catalog check as the nine above (their OIDs and file nodes are part of
+the fingerprint, so a swap that adds one is seen).
+
+| Table | Columns the server reads |
+|---|---|
+| `papers` (more columns) | `tldr`, `s2_citation_count`, `s2_influential_citation_count` |
+| `cites` (more columns) | `source` (`openalex`, `s2` or `both`), `is_influential` (null: Semantic Scholar has no row), `n_contexts`, `intents` (the union over the contexts) |
+| `external_works` | `work_id`, `doi`, `title`, `year`, `cited_by_count`, `first_author`, `venue`, `n_library_citers`: works the library cites but does not hold (about 47,000 rows) |
+| `cites_external` | `citing_paper_id`, `work_id` (about 170,000 rows) |
+| `cite_contexts` | `citing_paper_id`, `cited_paper_id`, `ordinal`, `context`, `intents`: the citing sentences |
+| `paper_embeddings` | `paper_id`, `embedding` (a pgvector `vector(768)`, SPECTER2) |
+
 The server reads the schema whole into memory on first use (about 10,500 papers and
 166,000 links in under a second against a local server) and reads it again when a
 rebuild changes the tables' OIDs or file nodes, which it checks at most once a minute
@@ -767,12 +782,24 @@ five minutes. A view the schema may carry for that join is not used. A paper is 
 by an attachment key, a DOI or a schema `paper_id`; papers in results carry `in_kb` and
 `key`, the attachment key for `POST /graph/papers/passages`.
 
+The v2 columns and the outside works (`external_works` with `cites_external`) are read
+into memory with the rest, in the same slices. The citation contexts and the
+embeddings are not: they are text and vectors, and stay in the database; each request
+that needs them asks through the same connection pool (the schema name checked as
+above, every request value bound as a parameter). `/health` adds `zotero_struct_tables`
+next to `zotero_struct`, only while the setting is set: the sorted list of the optional
+tables the last check found (empty while the structure cannot be read).
+
 | Route | Parameters | Answer |
 |---|---|---|
 | `GET /graph/papers/related` | `paper`; `relations` (comma-separated `cites`, `cited_by`, `coupled`, `coauthor`; default all); `limit` 1..200 (20) | `paper`, `totals` per relation, `ranking`, `related` (each with `reasons`, `score`, `shared_refs` / `coupling_score`, `shared_authors`), `truncated`; `reason: not_in_structure` for an unknown paper |
 | `GET /graph/papers/topics` | `q` (words of the name: each a whole word of it, or the start of one when it has four letters or more), `level` (`domain`, `field`, `subfield`, `topic`), `limit` | `total`, `topics` (each with `path`, `n_papers`: a topic row under it, `n_primary`: primary topic under it) |
 | `GET /graph/papers/by_topic` | `topic` (id at any level, or words of its name, matched as for `topics`), `limit`, `primary_only` | `topic`, `alternatives` (next name matches), `total`, `in_kb`, `ranking`, `papers`; `reason: no_topic` (also for a blank `topic`) |
 | `GET /graph/papers/connect` | `a`, `b`, `paths` 1..5 (3), `max_hops` 1..8 (6) | `a`, `b`, `links` (`relation`, `shared_refs` / `coupling_score`, `shared_authors`, `same_topic` / `same_subfield` / `same_field`, `cited_by_both`, `cite_both`), `paths` (each with `hops`, `cost`, `papers` passed through and labelled `steps`), `max_hops`; `reason`: `not_in_structure` (with `missing`), `same_paper`, `not_connected` (with a `message` naming the step limit and the links) |
+| `GET /graph/papers/citation` | `citing`, `cited` (each an attachment key, DOI or schema id) | `citing`, `cited` (summaries), `edge` (`source`, `is_influential`, `intents`, `n_contexts`; each null on a schema without the columns) and `contexts` (at most 20, in `ordinal` order: `ordinal`, `text`, `intents`); `reason`: `no_citation` (the library has no such edge; `cited_cites_citing` says whether it runs the other way), `not_in_structure` (with `missing`), `no_contexts_table` (the edge facts are still returned) |
+| `GET /graph/papers/similar` | `paper`; `limit` 1..50 (10); `in_kb` (default false: only papers with text in the knowledge base) | `paper`, `similar` (nearest first: the paper summary plus `similarity`, the cosine, to four decimals, and `links`: how the library relates it to `paper`, from `cites`, `cited_by`, `coupled`, `coauthor`; empty for similar work that is not linked at all), `ranking`; `reason`: `not_in_structure`, `no_embeddings` (no table), `no_embedding` (this paper has none) |
+| `GET /graph/papers/outside` | `paper`; `limit` 1..200 (20) | `paper`, `total`, `ranking`, `works` (each with `work_id`, `doi`, `title`, `year`, `first_author`, `venue`, `cited_by_count`, `n_library_citers` and `also_cited_by`: up to 5 other library papers that cite it, most cited by the library first), `truncated`; `reason`: `not_in_structure`, `no_external_works` |
+| `GET /graph/papers/missing` | `limit` 1..200 (50); `topic` (id at any level or words of its name, matched as for `by_topic`); `min_citers` (2) | `total`, `ranking`, `works` as for `outside` (`also_cited_by` names the citers, under the topic when one is given), `truncated`, `min_citers`; with `topic` also `topic`, `alternatives` and `n_citers_in_topic` per work; `reason`: `no_topic`, `no_external_works` |
 | `GET /graphs/paper/map` | `paper` (repeat, at most 10), `hops` 1..2 (1), `max_nodes` (default 150; capped by `MAX_GRAPH_NODES`) | the `/graphs` structure plus `paper` (the papers' summaries, `n_papers` found and `shown_papers` shown, `max_nodes` the limit applied and `max_nodes_cap` the server's, `n_hop1` / `n_hop2` found, `shown_hop1` / `shown_hop2`, `n_links` found among the shown papers, `shown_links` drawn and `links_thinned`, `ranking`); `is_truncated` only when papers were left out; `paper.reason`: `too_many_papers`, `not_in_structure`, `no_links` |
 
 Rankings, also stated in each answer: related papers score 1.0 for a citation either
@@ -788,6 +815,26 @@ the earlier ones, and a direct link is reported once. Papers on one answer's pat
 labelled "Family Year" with a, b, ... after equal labels, as on the map. Shared knowledge-graph entities are not part
 of `connect`: the paper filter's common view shows them. Topics label and filter; they
 do not enter retrieval, and no route changes passage retrieval.
+
+What a v2 schema adds to the older routes is additive: no score or order changes. Every
+paper summary (`paper`, `related`, `papers`, `connect`'s `a` and `b`, the citation and
+similar routes) gains `tldr`, `s2_citation_count` and `s2_influential_citation_count`,
+null where Semantic Scholar has none, and only when the schema has the columns. A
+`related` row with a `cites` or `cited_by` reason gains `citation` (`source`,
+`is_influential`, `intents`, `n_contexts`); `connect`'s `links` gains the same
+`citation` when one paper cites the other. Where two papers cite each other, or both
+reasons are asked for, the object merges the two edges: the source they share (else
+`both`), influential when either is, the intents united, the contexts added up. The
+map's edges gain `is_influential`, `intents` (a comma-joined string, as `keywords` is)
+and `n_contexts`, and its nodes the TLDR and the counts, each only where it is not
+null. `similar` ranks by cosine similarity of the SPECTER2 embeddings alone (one
+SQL query, `ORDER BY embedding <=> (the paper's embedding) LIMIT n`); `links` is read
+from the loaded structure, so similar work the paper never cites shows up with an empty
+list. `outside` and `missing` rank outside works by how many library papers cite them
+(`n_library_citers`), then by their own citation count (OpenAlex), then by id; with a
+`topic`, `missing` counts only citers whose topics include the topic or a topic under it
+(any level, as `by_topic` counts) and keeps works with at least `min_citers` of them,
+ranking by that count first.
 
 The map shows papers one or two steps from the chosen ones over citations and
 coupling: the chosen papers, then one-step papers by the strength of their links to

@@ -608,6 +608,85 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             zotero_struct.connect_papers(rag, a, b, paths, max_hops),
         )
 
+    @router.get("/graph/papers/citation", dependencies=[Depends(combined_auth)])
+    async def get_paper_citation(
+        citing: str = Query(..., min_length=1, max_length=300),
+        cited: str = Query(..., min_length=1, max_length=300),
+    ):
+        """How one library paper cites another: the citing sentences, their intents and whether the citation is influential (fork).
+
+        Returns ``citing`` and ``cited`` (paper summaries), ``edge`` (``source``,
+        ``is_influential``, ``intents``, ``n_contexts``) and ``contexts`` (at
+        most 20: ``ordinal``, ``text``, ``intents``). ``reason``:
+        ``no_citation`` (the library has no such edge; ``cited_cites_citing``
+        says whether it runs the other way), ``not_in_structure`` (with
+        ``missing``), ``no_contexts_table`` (the edge facts are still returned).
+        """
+        return await _struct_call(
+            f"getting the citation of '{cited}' by '{citing}'",
+            zotero_struct.citation_context(rag, citing, cited),
+        )
+
+    @router.get("/graph/papers/similar", dependencies=[Depends(combined_auth)])
+    async def get_similar_papers(
+        paper: str = Query(..., min_length=1, max_length=300),
+        limit: int = Query(10, ge=1, le=zotero_struct.MAX_SIMILAR),
+        in_kb: bool = Query(
+            False, description="Only papers with text in the knowledge base"
+        ),
+    ):
+        """The papers with the nearest SPECTER2 embeddings, cited or not (fork).
+
+        Returns ``paper`` and ``similar`` (best first: ``similarity``, cosine,
+        and ``links``, how the library relates the paper to it: ``cites``,
+        ``cited_by``, ``coupled``, ``coauthor``; empty when unlinked).
+        ``reason``: ``not_in_structure``, ``no_embeddings`` (no such table),
+        ``no_embedding`` (this paper has none).
+        """
+        return await _struct_call(
+            f"finding papers similar to '{paper}'",
+            zotero_struct.similar_papers(rag, paper, limit, in_kb),
+        )
+
+    @router.get("/graph/papers/outside", dependencies=[Depends(combined_auth)])
+    async def get_outside_works(
+        paper: str = Query(..., min_length=1, max_length=300),
+        limit: int = Query(20, ge=1, le=zotero_struct.MAX_LIMIT),
+    ):
+        """The works outside the library that one paper cites, ranked by how many library papers cite them (fork).
+
+        Returns ``paper``, ``total``, ``ranking`` and ``works`` (each with
+        ``doi``, ``title``, ``year``, ``first_author``, ``venue``,
+        ``n_library_citers`` and ``also_cited_by``: up to 5 other library
+        papers citing it). ``reason``: ``not_in_structure``,
+        ``no_external_works``.
+        """
+        return await _struct_call(
+            f"listing the outside works cited by '{paper}'",
+            zotero_struct.outside_works(rag, paper, limit),
+        )
+
+    @router.get("/graph/papers/missing", dependencies=[Depends(combined_auth)])
+    async def get_missing_works(
+        limit: int = Query(50, ge=1, le=zotero_struct.MAX_LIMIT),
+        topic: Optional[str] = Query(
+            None,
+            max_length=200,
+            description="Count only citers under this topic (id at any level or words of its name)",
+        ),
+        min_citers: int = Query(2, ge=1),
+    ):
+        """What the library cites but does not hold: outside works cited by many library papers (fork).
+
+        Returns ``total``, ``ranking`` and ``works`` as ``/graph/papers/outside``;
+        with ``topic`` only citers under it count and each work carries
+        ``n_citers_in_topic``. ``reason``: ``no_topic``, ``no_external_works``.
+        """
+        return await _struct_call(
+            "listing the works the library cites but does not hold",
+            zotero_struct.missing_works(rag, topic or "", limit, min_citers),
+        )
+
     @router.get("/graphs/paper/map", dependencies=[Depends(combined_auth)])
     async def get_paper_map(
         paper: list[str] = Query(

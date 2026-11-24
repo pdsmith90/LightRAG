@@ -24,6 +24,14 @@ Rules for callers:
   (``doi:<doi>`` / ``zot:<item key>``). Request text is only ever compared with
   loaded values or bound as a parameter; the schema name, the one identifier in
   the SQL, is checked against _IDENT_RE.
+- A schema built by the citation-graph builder (v2) adds columns and tables the
+  v1 schema lacks. Each is optional and found by what is there: the columns
+  through ``information_schema.columns`` once per load, the tables in the same
+  catalog query as the nine required ones (and in the fingerprint, so a swap that
+  adds one is seen). The outside works and their citers are read whole with the
+  rest; the citation contexts (text) and the embeddings (vectors) stay in the
+  database and are asked for per request, through the same pool. A v1 schema
+  loads and answers exactly as before.
 
 Fork-local (no upstream counterpart).
 """
@@ -59,6 +67,13 @@ _TABLES = (
     "cites",
     "coupled",
 )
+# v2 additions: tables the schema may carry, and the columns of papers / cites
+# that are read when present.
+_OPTIONAL = ("cite_contexts", "cites_external", "external_works", "paper_embeddings")
+_V2_COLUMNS = {
+    "papers": ("tldr", "s2_citation_count", "s2_influential_citation_count"),
+    "cites": ("source", "is_influential", "n_contexts", "intents"),
+}
 _CHECK_INTERVAL = 60.0
 _DOCS_TTL = 300.0
 # how long /health waits for the catalog check before answering "not available"
@@ -69,6 +84,10 @@ LEVELS = ("domain", "field", "subfield", "topic")
 MAX_LIMIT = 200
 MAX_PATHS = 5
 MAX_HOPS = 8
+MAX_CONTEXTS = 20
+MAX_SIMILAR = 50
+# outside works: other library papers named with a work that one paper cites
+ALSO_CITED_BY = 5
 
 # related_papers: score = _W_CITE for a citation either way (+ _W_BOTH when it
 # runs both ways) + _W_COUPLED * coupling score + _W_AUTHOR per shared author
@@ -111,7 +130,7 @@ FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
 WHERE n.nspname = $1 AND c.relkind = 'r'""",
     "papers": """-- zotero_struct:papers
 SELECT p.paper_id, p.doi, p.title, p.year, p.cited_by_count, p.n_refs_openalex,
-       v.display_name AS venue
+       v.display_name AS venue{x}
 FROM "{s}".papers p LEFT JOIN "{s}".venues v ON v.venue_id = p.venue_id""",
     "attachments": """-- zotero_struct:attachments
 SELECT attachment_key, paper_id FROM "{s}".paper_attachments WHERE paper_id IS NOT NULL""",
@@ -126,11 +145,37 @@ SELECT topic_id, display_name, level, parent_id FROM "{s}".topics""",
 SELECT paper_id, topic_id, is_primary FROM "{s}".paper_topics
 WHERE mod(hashtext(paper_id) & 2147483647, $1) = $2""",
     "cites": """-- zotero_struct:cites
-SELECT citing_paper_id, cited_paper_id FROM "{s}".cites
+SELECT citing_paper_id, cited_paper_id{x} FROM "{s}".cites
 WHERE mod(hashtext(citing_paper_id) & 2147483647, $1) = $2""",
     "coupled": """-- zotero_struct:coupled
 SELECT paper_a, paper_b, shared_refs, score FROM "{s}".coupled
 WHERE mod(hashtext(paper_a) & 2147483647, $1) = $2""",
+    "columns": """-- zotero_struct:columns
+SELECT table_name, column_name FROM information_schema.columns
+WHERE table_schema = $1 AND table_name IN ('papers', 'cites')""",
+    "external_works": """-- zotero_struct:external_works
+SELECT work_id, doi, title, year, cited_by_count, first_author, venue, n_library_citers
+FROM "{s}".external_works
+WHERE mod(hashtext(work_id) & 2147483647, $1) = $2""",
+    "cites_external": """-- zotero_struct:cites_external
+SELECT citing_paper_id, work_id FROM "{s}".cites_external
+WHERE mod(hashtext(citing_paper_id) & 2147483647, $1) = $2""",
+    # Asked per request, not loaded.
+    "contexts": """-- zotero_struct:contexts
+SELECT ordinal, context, intents FROM "{s}".cite_contexts
+WHERE citing_paper_id = $1 AND cited_paper_id = $2
+ORDER BY ordinal LIMIT $3""",
+    "similar": """-- zotero_struct:similar
+SELECT paper_id,
+       1 - (embedding <=> (SELECT embedding FROM "{s}".paper_embeddings
+                           WHERE paper_id = $1)) AS similarity
+FROM "{s}".paper_embeddings
+WHERE paper_id <> $1 AND ($3::text[] IS NULL OR paper_id = ANY($3::text[]))
+ORDER BY embedding <=> (SELECT embedding FROM "{s}".paper_embeddings
+                        WHERE paper_id = $1)
+LIMIT $2""",
+    "has_embedding": """-- zotero_struct:has_embedding
+SELECT 1 AS found FROM "{s}".paper_embeddings WHERE paper_id = $1""",
     # The server's own workspace and processed documents only.
     "documents": """-- zotero_struct:documents
 SELECT file_path FROM LIGHTRAG_DOC_STATUS WHERE workspace = $1 AND status = $2""",
@@ -168,6 +213,22 @@ class _Struct:
     n_papers: dict[str, int] = field(default_factory=dict)
     n_primary: dict[str, int] = field(default_factory=dict)
     fingerprint: tuple = ()
+    # v2, empty on a v1 schema: papers' extra columns (column -> value per paper),
+    # the columns of cites that were read, and per citation (a, b) its row
+    paper_extra: dict[str, list] = field(default_factory=dict)
+    cite_cols: frozenset = frozenset()
+    cite_meta: dict[tuple[int, int], dict] = field(default_factory=dict)
+    # v2: works outside the library (rows), their numbers by work id, the papers
+    # citing each, and the works each paper cites
+    ext: list[dict] = field(default_factory=list)
+    ext_index: dict[str, int] = field(default_factory=dict)
+    ext_citers: list[list[int]] = field(default_factory=list)
+    paper_ext: list[list[int]] = field(default_factory=list)
+
+    @property
+    def tables(self) -> list[str]:
+        """The optional tables the schema has."""
+        return sorted(t for t, _ in self.fingerprint if t in _OPTIONAL)
 
     def ancestors(self, topic_id: str) -> list[str]:
         out, seen = [], set()
@@ -187,6 +248,12 @@ class _Struct:
 
 def _build(rows: dict[str, list[dict]], fingerprint: tuple) -> _Struct:
     st = _Struct(fingerprint=fingerprint)
+    have = rows.get("columns") or {}
+    extra = [c for c in _V2_COLUMNS["papers"] if c in have.get("papers", ())]
+    st.paper_extra = {c: [] for c in extra}
+    st.cite_cols = frozenset(
+        c for c in _V2_COLUMNS["cites"] if c in have.get("cites", ())
+    )
     for r in rows["papers"]:
         idx = len(st.ids)
         pid = r["paper_id"]
@@ -201,6 +268,8 @@ def _build(rows: dict[str, list[dict]], fingerprint: tuple) -> _Struct:
         st.venue.append(r.get("venue") or "")
         st.cited_by_count.append(r.get("cited_by_count"))
         st.n_refs.append(r.get("n_refs_openalex"))
+        for c in extra:
+            st.paper_extra[c].append(r.get(c))
     n = len(st.ids)
     st.keys = [[] for _ in range(n)]
     st.authors = [[] for _ in range(n)]
@@ -254,6 +323,13 @@ def _build(rows: dict[str, list[dict]], fingerprint: tuple) -> _Struct:
         st.cites_in[b].add(a)
         st.adj[a].add(b)
         st.adj[b].add(a)
+        if st.cite_cols:
+            st.cite_meta[(a, b)] = {
+                "source": r.get("source"),
+                "is_influential": r.get("is_influential"),
+                "intents": sorted(r.get("intents") or []),
+                "n_contexts": r.get("n_contexts"),
+            }
     for r in rows["coupled"]:
         a, b = st.index.get(r["paper_a"]), st.index.get(r["paper_b"])
         if a is None or b is None or a == b:
@@ -263,7 +339,36 @@ def _build(rows: dict[str, list[dict]], fingerprint: tuple) -> _Struct:
         st.coupled[b][a] = link
         st.adj[a].add(b)
         st.adj[b].add(a)
+    if "external_works" in rows and "cites_external" in rows:
+        _build_external(st, rows)
     return st
+
+
+def _build_external(st: _Struct, rows: dict[str, list[dict]]) -> None:
+    for r in rows["external_works"]:
+        st.ext_index[r["work_id"]] = len(st.ext)
+        st.ext.append(
+            {
+                "work_id": r["work_id"],
+                "doi": norm_doi(r.get("doi") or "") or None,
+                "title": re.sub(r"\s+", " ", r.get("title") or "").strip(),
+                "year": r.get("year"),
+                "first_author": r.get("first_author") or None,
+                "venue": r.get("venue") or None,
+                "cited_by_count": r.get("cited_by_count"),
+                "n_library_citers": r.get("n_library_citers"),
+            }
+        )
+    st.ext_citers = [[] for _ in st.ext]
+    st.paper_ext = [[] for _ in st.ids]
+    for r in rows["cites_external"]:
+        i, j = st.index.get(r["citing_paper_id"]), st.ext_index.get(r["work_id"])
+        if i is not None and j is not None:
+            st.paper_ext[i].append(j)
+            st.ext_citers[j].append(i)
+    for j, w in enumerate(st.ext):
+        if w["n_library_citers"] is None:
+            w["n_library_citers"] = len(st.ext_citers[j])
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +385,7 @@ _state: dict = {
     "loop": None,
     "docs": None,  # (owner, workspace, read at, keys)
     "known": None,  # (schema, available, reason): the last answer, for /health
+    "tables": [],  # the optional tables the last check found, for /health
 }
 
 
@@ -325,7 +431,16 @@ async def _fingerprint(db, schema: str) -> tuple:
             + ", ".join(missing)
             + ")",
         )
-    return tuple(sorted((t, found[t]) for t in _TABLES))
+    present = _TABLES + tuple(t for t in _OPTIONAL if t in found)
+    return tuple(sorted((t, found[t]) for t in present))
+
+
+def _fp_names(fp: tuple) -> set[str]:
+    return {t for t, _ in fp}
+
+
+def _optional(fp: tuple) -> list[str]:
+    return sorted(t for t in _fp_names(fp) if t in _OPTIONAL)
 
 
 _LOADED = (
@@ -341,7 +456,14 @@ _LOADED = (
 # so no single fetch holds the event loop for long while its rows are decoded;
 # the loop runs between slices and the conversion into the structure happens in
 # a worker thread.
-_CHUNKED = ("authors", "paper_topics", "cites", "coupled")
+_CHUNKED = (
+    "authors",
+    "paper_topics",
+    "cites",
+    "coupled",
+    "external_works",
+    "cites_external",
+)
 _CHUNKS = 8
 
 
@@ -351,9 +473,21 @@ async def _read_tables(db, schema: str, fp: tuple) -> tuple[tuple, dict]:
     tried once more under a fresh fingerprint, then reported as unavailable."""
     for attempt in (1, 2):
         try:
-            rows = {}
-            for name in _LOADED:
-                sql = _SQL[name].format(s=schema)
+            cols: dict[str, set[str]] = {}
+            for r in await db.query(_SQL["columns"], [schema], multirows=True) or []:
+                cols.setdefault(r["table_name"], set()).add(r["column_name"])
+            rows: dict = {"columns": cols}
+            names = _LOADED
+            if {"external_works", "cites_external"} <= _fp_names(fp):
+                names += ("external_works", "cites_external")
+            for name in names:
+                alias = "p." if name == "papers" else ""
+                extra = "".join(
+                    f", {alias}{c}"
+                    for c in _V2_COLUMNS.get(name, ())
+                    if c in cols.get(name, ())
+                )
+                sql = _SQL[name].format(s=schema, x=extra)
                 if name not in _CHUNKED:
                     rows[name] = await db.query(sql, multirows=True) or []
                     continue
@@ -411,11 +545,12 @@ async def _structure(rag) -> _Struct:
                 f"zotero_struct: read {len(st.ids)} papers, {len(rows['cites'])} "
                 f"citations and {len(rows['coupled'])} coupling pairs from "
                 f"'{schema}' in {time.monotonic() - started:.1f}s"
+                + (f" (also {', '.join(st.tables)})" if st.tables else "")
             )
     except Unavailable as e:
-        _state["known"] = (schema, False, e.reason)
+        _state.update(known=(schema, False, e.reason), tables=[])
         raise
-    _state["known"] = (schema, True, None)
+    _state.update(known=(schema, True, None), tables=st.tables)
     return st
 
 
@@ -457,18 +592,25 @@ async def available(rag) -> bool:
     _state["avail_checked"] = now
     try:
         db, schema, _ = _db(rag)
-        await asyncio.wait_for(_fingerprint(db, schema), _AVAILABLE_TIMEOUT)
+        fp = await asyncio.wait_for(_fingerprint(db, schema), _AVAILABLE_TIMEOUT)
     except Unavailable as e:
-        _state["known"] = (schema, False, e.reason)
+        _state.update(known=(schema, False, e.reason), tables=[])
         return False
     except Exception as e:
         logger.warning(
             f"zotero_struct: availability check failed: {e or type(e).__name__}"
         )
-        _state["known"] = (schema, False, "error")
+        _state.update(known=(schema, False, "error"), tables=[])
         return False
-    _state["known"] = (schema, True, None)
+    _state.update(known=(schema, True, None), tables=_optional(fp))
     return True
+
+
+def optional_tables() -> list[str]:
+    """The optional v2 tables the last check found, sorted (empty while the
+    structure cannot be read). For /health, after :func:`available`."""
+    known = _state["known"]
+    return list(_state["tables"]) if known and known[1] else []
 
 
 def _reset_for_tests() -> None:
@@ -482,6 +624,7 @@ def _reset_for_tests() -> None:
         loop=None,
         docs=None,
         known=None,
+        tables=[],
     )
 
 
@@ -547,7 +690,7 @@ def _lite(st: _Struct, idx: int, kb: set[str]) -> dict:
     """A paper as the agent routes list it."""
     key = _kb_key(st, idx, kb)
     names = [name for _, name in st.authors[idx]]
-    return {
+    out = {
         "paper_id": st.ids[idx],
         "doi": st.doi[idx] or None,
         "label": _short(st, idx),
@@ -565,6 +708,9 @@ def _lite(st: _Struct, idx: int, kb: set[str]) -> dict:
         "cites_library": len(st.cites_out[idx]),
         "cited_by_count": st.cited_by_count[idx],
     }
+    for col, values in st.paper_extra.items():  # v2: tldr and Semantic Scholar counts
+        out[col] = values[idx]
+    return out
 
 
 def _link_weight(st: _Struct, a: int, b: int) -> float:
@@ -575,6 +721,41 @@ def _link_weight(st: _Struct, a: int, b: int) -> float:
     if b in st.coupled[a]:
         w += _W_COUPLED * st.coupled[a][b][1]
     return w
+
+
+_NO_CITATION_FACTS = {
+    "source": None,
+    "is_influential": None,
+    "intents": [],
+    "n_contexts": None,
+}
+
+
+def _citation_facts(st: _Struct, edges: list[tuple[int, int]]) -> dict | None:
+    """The facts of the citations among ``edges`` (pairs, citing first), as one
+    object: source, is_influential, intents, n_contexts. None when the schema
+    has no such columns or none of the pairs is a citation. Two directions
+    merge: the source is the one both share, else 'both'; influential when
+    either is; the intents are united and the contexts added up."""
+    found = [st.cite_meta[e] for e in edges if e in st.cite_meta]
+    if not found:
+        return None
+    if len(found) == 1:
+        return dict(found[0])
+    sources = {m["source"] for m in found}
+    flags = [m["is_influential"] for m in found if m["is_influential"] is not None]
+    counts = [m["n_contexts"] for m in found if m["n_contexts"] is not None]
+    return {
+        "source": sources.pop() if len(sources) == 1 else "both",
+        "is_influential": any(flags) if flags else None,
+        "intents": sorted({i for m in found for i in m["intents"]}),
+        "n_contexts": sum(counts) if counts else None,
+    }
+
+
+def _citation_between(st: _Struct, a: int, b: int) -> dict | None:
+    """_citation_facts of the citations between two papers, either way."""
+    return _citation_facts(st, [(a, b), (b, a)])
 
 
 def _relation(st: _Struct, a: int, b: int) -> list[str]:
@@ -653,6 +834,11 @@ def _related(
             item["coupling_score"] = e["coupling_score"]
         if e["shared"]:
             item["shared_authors"] = sorted(set(e["shared"]))
+        edges = [(idx, j)] * ("cites" in e["reasons"]) + [(j, idx)] * (
+            "cited_by" in e["reasons"]
+        )
+        if citation := _citation_facts(st, edges):
+            item["citation"] = citation
         related.append(item)
     totals["papers"] = len(found)
     totals["in_kb"] = sum(1 for j in found if _kb_key(st, j, kb))
@@ -906,6 +1092,8 @@ def _connect(
         links[f"same_{level}"] = (
             name if name and name == st.level_of(b, level) else None
         )
+    if citation := _citation_between(st, a, b):
+        links["citation"] = citation
     links["cited_by_both"] = len(st.cites_in[a] & st.cites_in[b])
     links["cite_both"] = len(st.cites_out[a] & st.cites_out[b])
     if b in st.coupled[a]:
@@ -1175,6 +1363,8 @@ def _map_graph(
             or (st.keys[v][0] if st.keys[v] else None),
             "attachment_keys": st.keys[v] or None,
         }
+        for col, values in st.paper_extra.items():
+            props[col] = values[v]
         kg.nodes.append(
             KnowledgeGraphNode(
                 id=node_ids[v],
@@ -1205,6 +1395,13 @@ def _map_graph(
             props["direction"] = (
                 "both" if cites_uv and cites_vu else "source cites target"
             )
+        if citation := _citation_between(st, u, v):
+            if citation["is_influential"] is not None:
+                props["is_influential"] = citation["is_influential"]
+            if citation["intents"]:
+                props["intents"] = ", ".join(citation["intents"])
+            if citation["n_contexts"] is not None:
+                props["n_contexts"] = citation["n_contexts"]
         kg.edges.append(
             KnowledgeGraphEdge(
                 id=f"{node_ids[u]}-{node_ids[v]}",
@@ -1276,3 +1473,216 @@ async def paper_map(
     return await asyncio.to_thread(
         lambda: finish(_map_graph(st, kb, asked, hops, limit, node_cap))
     )
+
+
+# ---------------------------------------------------------------------------
+# v2: how a paper cites another, similar papers, works outside the library
+# ---------------------------------------------------------------------------
+
+
+async def _ask(rag, name: str, params: list, multirows: bool = True):
+    """One per-request query through the pool (the schema name is checked by
+    :func:`_db`; request values travel as parameters)."""
+    db, schema, _ = _db(rag)
+    return await db.query(_SQL[name].format(s=schema), params, multirows=multirows)
+
+
+async def citation_context(rag, citing: str, cited: str) -> dict:
+    """How one library paper cites another: both papers, the ``edge`` (source,
+    is_influential, intents, n_contexts; null while the schema has no such
+    columns) and the ``contexts`` (the citing sentences, in order, at most
+    MAX_CONTEXTS). ``reason``: ``not_in_structure`` (``missing`` names what
+    matched no paper), ``no_citation`` (the library has no such edge;
+    ``cited_cites_citing`` says whether the cited paper cites the other one),
+    ``no_contexts_table`` (the edge facts are still returned). Raises
+    :class:`Unavailable`."""
+    st = await _structure(rag)
+    kb = await _kb_keys(rag)
+    ia, ib = _resolve(st, citing), _resolve(st, cited)
+    if ia is None or ib is None:
+        missing = [t for t, i in ((citing, ia), (cited, ib)) if i is None]
+        return {"reason": "not_in_structure", "missing": missing}
+    out: dict = {
+        "citing": _lite(st, ia, kb),
+        "cited": _lite(st, ib, kb),
+        "edge": None,
+        "contexts": [],
+    }
+    if ib not in st.cites_out[ia]:
+        out["reason"] = "no_citation"
+        out["cited_cites_citing"] = ia in st.cites_out[ib]
+        return out
+    out["edge"] = _citation_facts(st, [(ia, ib)]) or dict(_NO_CITATION_FACTS)
+    if "cite_contexts" not in st.tables:
+        out["reason"] = "no_contexts_table"
+    elif out["edge"]["n_contexts"] or "n_contexts" not in st.cite_cols:
+        rows = await _ask(rag, "contexts", [st.ids[ia], st.ids[ib], MAX_CONTEXTS])
+        out["contexts"] = [
+            {
+                "ordinal": r["ordinal"],
+                "text": r["context"],
+                "intents": sorted(r.get("intents") or []),
+            }
+            for r in rows or []
+        ]
+    return out
+
+
+def _links(st: _Struct, a: int, b: int) -> list[str]:
+    """How paper a is linked to paper b: cites, cited_by, coupled, coauthor."""
+    out = _relation(st, a, b)
+    if {aid for aid, _ in st.authors[a]} & {aid for aid, _ in st.authors[b]}:
+        out.append("coauthor")
+    return out
+
+
+async def similar_papers(rag, paper: str, limit: int = 10, in_kb: bool = False) -> dict:
+    """The papers whose SPECTER2 embeddings are closest to one paper's (cosine
+    similarity, best first), each with ``links``: how the library already
+    relates them to it (cites, cited_by, coupled, coauthor; empty when they are
+    unlinked, which is similar work the paper does not cite). ``in_kb`` keeps
+    papers with text in the knowledge base. ``reason``: ``not_in_structure``,
+    ``no_embeddings`` (the schema has no such table), ``no_embedding`` (this
+    paper has none). Raises :class:`Unavailable`."""
+    st = await _structure(rag)
+    kb = await _kb_keys(rag)
+    idx = _resolve(st, paper)
+    if idx is None:
+        return {"paper": None, "asked": paper, "reason": "not_in_structure"}
+    out: dict = {"paper": _lite(st, idx, kb), "in_kb": in_kb, "similar": []}
+    if "paper_embeddings" not in st.tables:
+        out["reason"] = "no_embeddings"
+        return out
+    only = (
+        [st.ids[i] for i in range(len(st.ids)) if _kb_key(st, i, kb)] if in_kb else None
+    )
+    rows = await _ask(rag, "similar", [st.ids[idx], limit, only])
+    if not rows and not await _ask(rag, "has_embedding", [st.ids[idx]], False):
+        out["reason"] = "no_embedding"
+        return out
+    for r in rows or []:
+        j = st.index.get(r["paper_id"])
+        if j is not None:
+            out["similar"].append(
+                {
+                    **_lite(st, j, kb),
+                    "similarity": round(float(r["similarity"]), 4),
+                    "links": _links(st, idx, j),
+                }
+            )
+    out["ranking"] = (
+        "cosine similarity of the SPECTER2 embeddings (1 - cosine distance); "
+        "links name the citation, coupling or author link to the paper, empty "
+        "when there is none"
+    )
+    return out
+
+
+def _work_row(st: _Struct, kb: set[str], j: int, citers: list[int], skip: int = -1):
+    """An outside work as the routes list it, with up to ALSO_CITED_BY of
+    ``citers`` (other than paper ``skip``), the most cited by the library
+    first."""
+    others = sorted(
+        (i for i in citers if i != skip),
+        key=lambda i: (-len(st.cites_in[i]), st.ids[i]),
+    )
+    return {
+        **st.ext[j],
+        "also_cited_by": [_lite(st, i, kb) for i in others[:ALSO_CITED_BY]],
+    }
+
+
+def _work_rank(st: _Struct, j: int):
+    w = st.ext[j]
+    return (-(w["n_library_citers"] or 0), -(w["cited_by_count"] or 0), w["work_id"])
+
+
+def _outside(st: _Struct, kb: set[str], idx: int, limit: int) -> dict:
+    works = sorted(st.paper_ext[idx], key=lambda j: _work_rank(st, j))
+    return {
+        "paper": _lite(st, idx, kb),
+        "total": len(works),
+        "ranking": (
+            "works the paper cites that are not in the library, most cited by "
+            "library papers first, then most cited overall (OpenAlex)"
+        ),
+        "works": [_work_row(st, kb, j, st.ext_citers[j], idx) for j in works[:limit]],
+        "truncated": len(works) > limit,
+    }
+
+
+async def outside_works(rag, paper: str, limit: int = 20) -> dict:
+    """The works outside the library that one paper cites, ranked by how many
+    library papers cite them, then by their own citation count; each with
+    ``also_cited_by``, up to ALSO_CITED_BY other library papers citing it.
+    ``reason``: ``not_in_structure``, ``no_external_works`` (the schema lacks
+    the tables). Raises :class:`Unavailable`."""
+    st = await _structure(rag)
+    kb = await _kb_keys(rag)
+    idx = _resolve(st, paper)
+    if idx is None:
+        return {"paper": None, "asked": paper, "reason": "not_in_structure"}
+    if not st.paper_ext:
+        return {"paper": _lite(st, idx, kb), "works": [], "reason": "no_external_works"}
+    return await asyncio.to_thread(_outside, st, kb, idx, limit)
+
+
+def _missing(
+    st: _Struct, kb: set[str], topic: str, limit: int, min_citers: int
+) -> dict:
+    topic = (topic or "").strip()
+    tid, citers = None, st.ext_citers
+    out: dict = {"min_citers": min_citers}
+    if topic:
+        if topic in st.topics:
+            tid = topic
+        else:
+            tids = _find_topics(st, topic, None) if _words(topic) else []
+            if not tids:
+                return {
+                    **out,
+                    "topic": None,
+                    "reason": "no_topic",
+                    "works": [],
+                    "total": 0,
+                }
+            tid, out["alternatives"] = tids[0], [_topic_row(st, t) for t in tids[1:6]]
+        out["topic"] = _topic_row(st, tid)
+        citers = [[i for i in c if tid in st.under[i]] for c in st.ext_citers]
+    counted = [(j, len(citers[j])) for j in range(len(st.ext))]
+    found = [(j, n) for j, n in counted if n >= min_citers]
+    found.sort(key=lambda p: (-p[1], *_work_rank(st, p[0])))
+    works = []
+    for j, n in found[:limit]:
+        row = _work_row(st, kb, j, citers[j])
+        if tid:
+            row["n_citers_in_topic"] = n
+        works.append(row)
+    out.update(
+        total=len(found),
+        ranking=(
+            "outside works cited by at least min_citers "
+            + ("papers under the topic" if tid else "library papers")
+            + ", most citers first, then most cited by the whole library, then "
+            "most cited overall (OpenAlex)"
+        ),
+        works=works,
+        truncated=len(found) > limit,
+    )
+    return out
+
+
+async def missing_works(
+    rag, topic: str = "", limit: int = 50, min_citers: int = 2
+) -> dict:
+    """What the library cites but does not hold: the outside works cited by at
+    least ``min_citers`` library papers, ranked by that count. With ``topic`` (an
+    id at any level or words of its name, matched as :func:`papers_by_topic`
+    does) only the citers under the topic count, and each row carries
+    ``n_citers_in_topic``. ``reason``: ``no_topic``, ``no_external_works``.
+    Raises :class:`Unavailable`."""
+    st = await _structure(rag)
+    kb = await _kb_keys(rag)
+    if not st.paper_ext:
+        return {"works": [], "total": 0, "reason": "no_external_works"}
+    return await asyncio.to_thread(_missing, st, kb, topic, limit, min_citers)

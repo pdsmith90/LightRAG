@@ -3207,7 +3207,10 @@ def create_app(args):
                         "zotero_upload": zotero_add.upload_enabled(),
                         # only while ZOTERO_STRUCT_SCHEMA is set
                         **(
-                            {"zotero_struct": await zotero_struct.available(rag)}
+                            {
+                                "zotero_struct": await zotero_struct.available(rag),
+                                "zotero_struct_tables": zotero_struct.optional_tables(),
+                            }
                             if zotero_struct.schema_name()
                             else {}
                         ),
