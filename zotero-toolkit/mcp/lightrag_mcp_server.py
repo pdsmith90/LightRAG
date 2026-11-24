@@ -3,7 +3,7 @@
 lightrag_mcp_server.py — expose a Zotero-backed LightRAG knowledge base to any
 MCP client (Claude Code, Claude Desktop, other agents) over stdio.
 
-It's a thin, self-contained proxy over the LightRAG Server REST API. Ten tools:
+It's a thin, self-contained proxy over the LightRAG Server REST API. Fourteen tools:
 
     search_library(query, mode="naive", top_k, answer=False, include_graph=False,
                    passages=10)        -> compiled citations, then the retrieved
@@ -23,6 +23,13 @@ It's a thin, self-contained proxy over the LightRAG Server REST API. Ten tools:
                                           level (topics_only=True: the topics)
     connect_papers(a, b)               -> direct links and citation/coupling routes
                                           between two papers
+    citation_context(citing, cited)    -> how one library paper cites another: the
+                                          citing sentences, their intents, influential?
+    similar_papers(paper)              -> papers with the nearest SPECTER2 embeddings,
+                                          cited or not, with how each is linked
+    outside_references(paper)          -> works outside the library that one paper cites,
+                                          by how many library papers cite them
+    missing_works(topic)               -> what the library cites often but does not hold
     add_note(text, description)        -> insert a note/snippet into the KB under
                                           a unique document name
     health(verbose=False)              -> is the LightRAG server up, and is the API key
@@ -1264,7 +1271,14 @@ def _indexed_row(p: dict) -> str:
     return (
         f"- {', '.join(p.get('keys') or [])} · {p.get('citation') or p.get('title') or p.get('paper')}"
         + (f" · doi:{p['doi']}" if p.get("doi") else "")
+        + (f" · TLDR: {_short_text(p['tldr'], 200)}" if p.get("tldr") else "")
     )
+
+
+def _short_text(text, limit: int) -> str:
+    """One line of at most ``limit`` characters (a cut ends in an ellipsis)."""
+    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
 def _lookup_text(
@@ -2184,6 +2198,17 @@ def _relation_text(relation: list) -> str:
     return " and ".join(_RELATION_WORDS.get(r, str(r)) for r in relation or [])
 
 
+def _citation_note(citation: dict | None) -> str:
+    """' (influential: background, methodology)' for a citation's facts, or what
+    part of that there is; '' when there are none."""
+    if not isinstance(citation, dict):
+        return ""
+    intents = ", ".join(citation.get("intents") or [])
+    flag = "influential" if citation.get("is_influential") else ""
+    inner = ": ".join(x for x in (flag, intents) if x)
+    return f" ({inner})" if inner else ""
+
+
 @mcp.tool(structured_output=False)
 def related_papers(
     paper: str, relations: str = "all", limit: int = STRUCT_DEFAULT
@@ -2235,8 +2260,12 @@ def related_papers(
     ]
     for i, p in enumerate(data.get("related") or [], start=1):
         why = []
+        note = _citation_note(p.get("citation"))
         for r in p.get("reasons") or []:
-            if r == "coupled" and p.get("shared_refs") is not None:
+            if r in ("cites", "cited_by") and note:
+                why.append(_RELATION_WORDS[r] + note)
+                note = ""  # said once, whichever way the citation runs
+            elif r == "coupled" and p.get("shared_refs") is not None:
                 why.append(
                     f"coupled: {p['shared_refs']} shared refs, score {p.get('coupling_score')}"
                 )
@@ -2424,6 +2453,237 @@ def connect_papers(a: str, b: str, paths: int = 3) -> str:
             if data.get("reason") == "not_connected"
             else "No route."
         )
+    return "\n".join(out)
+
+
+def _label_list(papers: list, limit: int = 5) -> str:
+    return ", ".join(str(p.get("label") or p.get("paper_id")) for p in papers[:limit])
+
+
+def _work_line(w: dict) -> str:
+    """'First-author Year · Title · venue · doi · cited by N (some of them)' for one
+    work outside the library; N counts the citers under the topic when one was asked."""
+    who = " ".join(
+        x for x in (w.get("first_author"), str(w.get("year") or "")) if x
+    ).strip()
+    parts = [who, _short_text(w.get("title"), 90)]
+    if w.get("venue"):
+        parts.append(_short_text(w["venue"], 50))
+    if w.get("doi"):
+        parts.append(f"doi:{w['doi']}")
+    in_topic = w.get("n_citers_in_topic")
+    cited = (
+        f"cited by {in_topic if in_topic is not None else w.get('n_library_citers')}"
+    )
+    if in_topic is not None:
+        cited += " in the topic"
+    names = _label_list(w.get("also_cited_by") or [])
+    parts.append(f"{cited} ({names})" if names else cited)
+    return " · ".join(x for x in parts if x)
+
+
+@mcp.tool(structured_output=False)
+def citation_context(citing: str, cited: str) -> str:
+    """How one library paper cites another: the sentences of the citing paper that
+    cite it, what each is doing (background, methodology, result) and whether
+    Semantic Scholar counts the citation as influential.
+
+    citing, cited: each a Zotero key, a DOI, or words that all occur in the paper's
+    title, authors or year (as for paper_passages). Order matters: A cites B is
+    citation_context(A, B); when it runs the other way the answer says so.
+
+    Up to 20 sentences, each cut at 600 characters. Only citations between papers of
+    the library are covered, and only those Semantic Scholar has sentences for; an
+    edge it lacks still returns its source. Use it to check what a paper says about
+    another before you write "A builds on B". No retrieval, no LLM; under a second."""
+    ids = []
+    for which, text in (("citing", citing), ("cited", cited)):
+        pid, message = _struct_paper(text, f"citation_context ({which})")
+        if message:
+            return message
+        ids.append(pid)
+    data = _struct_get("/graph/papers/citation", {"citing": ids[0], "cited": ids[1]})
+    if isinstance(data, str):
+        return data
+    if data.get("reason") == "not_in_structure":
+        return (
+            "Not in the library's citation structure: "
+            + ", ".join(f'"{m}"' for m in data.get("missing") or [])
+            + ". Check with find_paper."
+        )
+    a, b = data.get("citing") or {}, data.get("cited") or {}
+    if data.get("reason") == "no_citation":
+        out = [
+            f"### A: {_struct_row(a)}",
+            f"### B: {_struct_row(b)}",
+            "The library's citation structure has no citation from A to B.",
+        ]
+        if data.get("cited_cites_citing"):
+            out.append("B cites A: call citation_context with the two papers swapped.")
+        return "\n".join(out)
+    edge = data.get("edge") or {}
+    facts = []
+    if edge.get("is_influential") is True:
+        facts.append("influential")
+    elif edge.get("is_influential") is False:
+        facts.append("not influential")
+    if edge.get("intents"):
+        facts.append("intents: " + ", ".join(edge["intents"]))
+    if edge.get("n_contexts") is not None:
+        facts.append(f"{edge['n_contexts']} citing sentence(s)")
+    if edge.get("source"):
+        facts.append(f"source: {edge['source']}")
+    out = [
+        f"### {a.get('label')} cites {b.get('label')}",
+        f"A: {_struct_row(a)}",
+        f"B: {_struct_row(b)}",
+        " · ".join(facts) or "No facts about this citation beyond that it exists.",
+    ]
+    contexts = data.get("contexts") or []
+    for c in contexts:
+        tag = f"[{', '.join(c['intents'])}] " if c.get("intents") else ""
+        out.append(f'{c.get("ordinal")}. {tag}"{_short_text(c.get("text"), 600)}"')
+    if data.get("reason") == "no_contexts_table":
+        out.append("This server's structure has no citation-sentence table.")
+    elif not contexts:
+        out.append("No citing sentence is stored for this citation.")
+    elif edge.get("n_contexts") and edge["n_contexts"] > len(contexts):
+        out.append(f"Showing {len(contexts)} of {edge['n_contexts']} sentences.")
+    return "\n".join(out)
+
+
+@mcp.tool(structured_output=False)
+def similar_papers(paper: str, limit: int = 10, indexed_only: bool = False) -> str:
+    """Library papers whose text is closest to ONE paper's, by SPECTER2 embeddings of
+    their titles and abstracts, whether or not they cite each other.
+
+    paper: a Zotero key, a DOI, or words that all occur in its title, authors or year
+    (as for paper_passages). limit: rows shown, default 10, at most 50. indexed_only:
+    keep papers whose text is in the knowledge base (paper_passages can read them).
+
+    Each row gives the cosine similarity and how the library already links the paper
+    to it (cites, cited by, coupled, co-author): "not linked" marks similar work the
+    paper does not cite, which is what this tool is for. Similarity is topical, not
+    evidence that one paper supports another. No retrieval, no LLM; under a second."""
+    pid, message = _struct_paper(paper, "similar_papers")
+    if message:
+        return message
+    data = _struct_get(
+        "/graph/papers/similar",
+        {
+            "paper": pid,
+            "limit": _struct_limit(limit),
+            "in_kb": str(bool(indexed_only)).lower(),
+        },
+    )
+    if isinstance(data, str):
+        return data
+    reason = data.get("reason")
+    if reason == "not_in_structure":
+        return (
+            f'"{paper}" is not in the library\'s citation structure. Check it with '
+            "find_paper."
+        )
+    me = data.get("paper") or {}
+    if reason == "no_embeddings":
+        return "This server's structure has no paper embeddings."
+    if reason == "no_embedding":
+        return f"No embedding for {_struct_row(me)} (Semantic Scholar has none)."
+    out = [f"### Similar to {_struct_row(me)}"]
+    rows = data.get("similar") or []
+    for i, p in enumerate(rows, start=1):
+        links = _relation_text(p.get("links")) or "not linked"
+        out.append(f"{i}. {p.get('similarity'):.3f} [{links}] {_struct_row(p)}")
+    if not rows:
+        out.append(
+            "No similar paper" + (" with indexed text." if indexed_only else ".")
+        )
+    return "\n".join(out)
+
+
+@mcp.tool(structured_output=False)
+def outside_references(paper: str, limit: int = 15) -> str:
+    """The works OUTSIDE the library that ONE library paper cites, most cited by the
+    library's papers first: the references the library lacks.
+
+    paper: a Zotero key, a DOI, or words that all occur in its title, authors or year
+    (as for paper_passages). limit: rows shown, default 15, at most 50.
+
+    Each row: first author and year, title, venue, DOI, how many library papers cite
+    it and up to 5 of them. The works come from OpenAlex reference lists, so a paper
+    without one has none, and a work may be in Zotero under a record the DOI or title
+    match missed: check with find_paper before you call it missing. No retrieval, no
+    LLM; under a second."""
+    pid, message = _struct_paper(paper, "outside_references")
+    if message:
+        return message
+    data = _struct_get(
+        "/graph/papers/outside", {"paper": pid, "limit": _struct_limit(limit)}
+    )
+    if isinstance(data, str):
+        return data
+    if data.get("reason") == "not_in_structure":
+        return (
+            f'"{paper}" is not in the library\'s citation structure. Check it with '
+            "find_paper."
+        )
+    if data.get("reason") == "no_external_works":
+        return "This server's structure has no outside-works tables."
+    works = data.get("works") or []
+    out = [
+        f"### Outside the library, cited by {_struct_row(data.get('paper') or {})}",
+        f"{data.get('total', len(works))} works; showing {len(works)}, most cited by "
+        "the library first.",
+    ]
+    for i, w in enumerate(works, start=1):
+        out.append(f"{i}. {_work_line(w)}")
+    if not works:
+        out.append("It cites no work outside the library.")
+    elif data.get("truncated"):
+        out.append(f"Raise limit (at most {STRUCT_MAX}) for more.")
+    return "\n".join(out)
+
+
+@mcp.tool(structured_output=False)
+def missing_works(topic: str = "", limit: int = 30) -> str:
+    """What the library cites often but does not hold: works outside it that at least
+    two of its papers cite, most cited first.
+
+    topic: optional; words of an OpenAlex topic's name or its id (as for
+    papers_by_topic). With it, only the library papers under that topic count as
+    citers, so the list is what that part of the library is missing. limit: rows
+    shown, default 30, at most 50.
+
+    Each row: first author and year, title, venue, DOI, how many library papers cite
+    it and some of them. A reading list for gaps, not a verdict: the citation counts
+    come from OpenAlex reference lists, and a work may be in Zotero under a record the
+    match missed (check with find_paper). No retrieval, no LLM; under a second."""
+    params = {"limit": _struct_limit(limit)}
+    if (topic or "").strip():
+        params["topic"] = topic.strip()
+    data = _struct_get("/graph/papers/missing", params)
+    if isinstance(data, str):
+        return data
+    if data.get("reason") == "no_topic":
+        return (
+            f'No topic name holds every word of "{topic}". List topics with '
+            "papers_by_topic(words, topics_only=True)."
+        )
+    if data.get("reason") == "no_external_works":
+        return "This server's structure has no outside-works tables."
+    works = data.get("works") or []
+    t = data.get("topic")
+    scope = f"under {t.get('name')} ({t.get('level')})" if t else "in the library"
+    out = [
+        f"### Cited by at least {data.get('min_citers', 2)} papers {scope}, not held",
+        f"{data.get('total', len(works))} works; showing {len(works)}.",
+    ]
+    for i, w in enumerate(works, start=1):
+        out.append(f"{i}. {_work_line(w)}")
+    if not works:
+        out.append("No such work.")
+    elif data.get("truncated"):
+        out.append(f"Raise limit (at most {STRUCT_MAX}) for more.")
     return "\n".join(out)
 
 

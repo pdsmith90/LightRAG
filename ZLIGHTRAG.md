@@ -885,8 +885,8 @@ on screen by a failed map fetch stays editable. A map label against a server wit
 map (501, or 404 from an older server) shows one message and falls back to the papers'
 own graph, without retrying.
 
-The MCP proxy's `related_papers`, `papers_by_topic` and `connect_papers` call these
-routes (see [zotero-toolkit/mcp/README.md](./zotero-toolkit/mcp/README.md#paper-structure)).
+The MCP proxy's `related_papers`, `papers_by_topic`, `connect_papers`, `citation_context`,
+`similar_papers`, `outside_references` and `missing_works` call these routes (see [zotero-toolkit/mcp/README.md](./zotero-toolkit/mcp/README.md#paper-structure)).
 Code: `lightrag/zotero_struct.py`, `lightrag_webui/src/lib/paperFilter.ts`,
 `lightrag_webui/src/components/graph/PaperFilter.tsx`. Tests:
 `tests/test_zotero_struct.py` (offline, the SQL answered by a stub) and

@@ -70,6 +70,10 @@ def test_stdio_lists_tools_and_compiles_citations(
         "related_papers",
         "papers_by_topic",
         "connect_papers",
+        "citation_context",
+        "similar_papers",
+        "outside_references",
+        "missing_works",
         "add_note",
         "health",
     }

@@ -19,6 +19,10 @@ into real bibliographic citations using Zotero metadata. The LLM never writes th
 | `related_papers(paper, relations="all", limit=15)` | The library papers linked to **one** paper by its citation structure: those it cites, those citing it, its bibliographic-coupling partners (shared references and a score) and papers sharing an author, ranked, each with why and whether it is indexed (`indexed as KEY`, for `paper_passages`). Needs the server's paper structure (see [Paper structure](#paper-structure)). |
 | `papers_by_topic(topic, limit=15, primary_only=False, topics_only=False)` | The library papers under an OpenAlex topic at any level (domain, field, subfield, topic), named by whole words of its name (a word of four letters or more may be the start of one) or by id, ranked; `topics_only=True` lists the matching topics with paper counts instead. |
 | `connect_papers(a, b, paths=3)` | What connects two papers: the direct links (citation, coupling, shared authors, same topic, papers citing both), then up to `paths` routes over citations and coupling, cheapest first, hub papers costing more, each step labelled. |
+| `citation_context(citing, cited)` | How one library paper cites another: the citing sentences (up to 20, each cut at 600 characters), what each does (background, methodology, result), whether Semantic Scholar counts the citation as influential, and where the edge comes from (OpenAlex, Semantic Scholar or both). When the library has no such citation it says so, and whether the other paper cites this one. Needs a v2 structure schema. |
+| `similar_papers(paper, limit=10, indexed_only=False)` | The papers with the nearest SPECTER2 embeddings (cosine similarity), each with how the library already links it to the paper (cites, cited by, coupled, co-author) or "not linked": similar work the paper does not cite. `indexed_only=True` keeps papers whose text is in the knowledge base. |
+| `outside_references(paper, limit=15)` | The works outside the library that **one** paper cites, most cited by library papers first, each with first author, year, venue, DOI and up to five of its library citers. |
+| `missing_works(topic="", limit=30)` | What the library cites often but does not hold: outside works cited by at least two library papers, most cited first; with `topic`, only the citers under that topic count. A reading list for gaps, not a verdict. |
 | `add_note(text, description="")` | Inserts a text note into the knowledge base (`POST /documents/text`) under a unique document name (see below). |
 | `health(verbose=False)` | A few lines from the server's `/health` report: status, an `API key:` line (whether the key is accepted), versions, pipeline state, the queues (queued/running) and the models, or `unreachable at <url>: <error>`. A status other than 200, or a body that is not a JSON object, is shown as it came (the first 300 characters). `verbose=True` returns the whole report as `<status code>: <body>`. |
 
@@ -269,7 +273,12 @@ LIGHTRAG_MCP_ENV_FILE ...)`, `REJECTED (HTTP 403: ...)` or `not checked (...)`.
 
 `related_papers`, `papers_by_topic` and `connect_papers` call the zlightrag fork's
 `GET /graph/papers/related`, `/graph/papers/topics`, `/graph/papers/by_topic` and
-`/graph/papers/connect`. The server answers them only with `ZOTERO_STRUCT_SCHEMA` set
+`/graph/papers/connect`; `citation_context`, `similar_papers`, `outside_references` and
+`missing_works` call `/graph/papers/citation`, `/similar`, `/outside` and `/missing`, which
+read the tables only a v2 structure schema has (without them the server answers with a
+`reason` and the tool says what is missing). A row of `related_papers` that cites or is
+cited shows "influential" and the citation's intents when the server has them, and
+`find_paper` shows a paper's TLDR when the server returns one. The server answers them only with `ZOTERO_STRUCT_SCHEMA` set
 to a loaded structure schema (see the fork's `ZLIGHTRAG.md`); otherwise it answers 501,
 and a stock or older server 404, and the tools say so in a sentence instead of failing.
 The proxy never reads the structure itself. `paper` takes a Zotero key, a DOI, a
