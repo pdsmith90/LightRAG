@@ -798,7 +798,7 @@ tables the last check found (empty while the structure cannot be read).
 | `GET /graph/papers/connect` | `a`, `b`, `paths` 1..5 (3), `max_hops` 1..8 (6) | `a`, `b`, `links` (`relation`, `shared_refs` / `coupling_score`, `shared_authors`, `same_topic` / `same_subfield` / `same_field`, `cited_by_both`, `cite_both`), `paths` (each with `hops`, `cost`, `papers` passed through and labelled `steps`), `max_hops`; `reason`: `not_in_structure` (with `missing`), `same_paper`, `not_connected` (with a `message` naming the step limit and the links) |
 | `GET /graph/papers/citation` | `citing`, `cited` (each an attachment key, DOI or schema id) | `citing`, `cited` (summaries), `edge` (`source`, `is_influential`, `intents`, `n_contexts`; each null on a schema without the columns) and `contexts` (at most 20, in `ordinal` order: `ordinal`, `text`, `intents`); `reason`: `no_citation` (the library has no such edge; `cited_cites_citing` says whether it runs the other way), `not_in_structure` (with `missing`), `no_contexts_table` (the edge facts are still returned) |
 | `GET /graph/papers/similar` | `paper`; `limit` 1..50 (10); `in_kb` (default false: only papers with text in the knowledge base) | `paper`, `similar` (nearest first: the paper summary plus `similarity`, the cosine, to four decimals, and `links`: how the library relates it to `paper`, from `cites`, `cited_by`, `coupled`, `coauthor`; empty for similar work that is not linked at all), `ranking`; `reason`: `not_in_structure`, `no_embeddings` (no table), `no_embedding` (this paper has none) |
-| `GET /graph/papers/outside` | `paper`; `limit` 1..200 (20) | `paper`, `total`, `ranking`, `works` (each with `work_id`, `doi`, `title`, `year`, `first_author`, `venue`, `cited_by_count`, `n_library_citers` and `also_cited_by`: up to 5 other library papers that cite it, most cited by the library first), `truncated`; `reason`: `not_in_structure`, `no_external_works` |
+| `GET /graph/papers/outside` | `paper`; `limit` 1..200 (20) | `paper`, `total` (outside works cited by 2 or more library papers only), `ranking`, `works` (each with `work_id`, `doi`, `title`, `year`, `first_author`, `venue`, `cited_by_count`, `n_library_citers` and `also_cited_by`: up to 5 other library papers that cite it, most cited by the library first), `truncated`; `reason`: `not_in_structure`, `no_external_works` |
 | `GET /graph/papers/missing` | `limit` 1..200 (50); `topic` (id at any level or words of its name, matched as for `by_topic`); `min_citers` (2) | `total`, `ranking`, `works` as for `outside` (`also_cited_by` names the citers, under the topic when one is given), `truncated`, `min_citers`; with `topic` also `topic`, `alternatives` and `n_citers_in_topic` per work; `reason`: `no_topic`, `no_external_works` |
 | `GET /graphs/paper/map` | `paper` (repeat, at most 10), `hops` 1..2 (1), `max_nodes` (default 150; capped by `MAX_GRAPH_NODES`) | the `/graphs` structure plus `paper` (the papers' summaries, `n_papers` found and `shown_papers` shown, `max_nodes` the limit applied and `max_nodes_cap` the server's, `n_hop1` / `n_hop2` found, `shown_hop1` / `shown_hop2`, `n_links` found among the shown papers, `shown_links` drawn and `links_thinned`, `ranking`); `is_truncated` only when papers were left out; `paper.reason`: `too_many_papers`, `not_in_structure`, `no_links` |
 
@@ -823,14 +823,22 @@ null where Semantic Scholar has none, and only when the schema has the columns. 
 `related` row with a `cites` or `cited_by` reason gains `citation` (`source`,
 `is_influential`, `intents`, `n_contexts`); `connect`'s `links` gains the same
 `citation` when one paper cites the other. Where two papers cite each other, or both
-reasons are asked for, the object merges the two edges: the source they share (else
-`both`), influential when either is, the intents united, the contexts added up. The
+reasons are asked for, the object merges the two edges: `source` is that of the edge in the row's direction
+(`related`: the paper's own citation, i.e. `cites`; `connect` and the map: from the
+first paper, or the oriented edge) and `source_reverse` that of the opposite edge
+(`both` would say one edge is in both providers, so it is never made up here);
+influential when either is, the intents united, the contexts added up. The
 map's edges gain `is_influential`, `intents` (a comma-joined string, as `keywords` is)
 and `n_contexts`, and its nodes the TLDR and the counts, each only where it is not
 null. `similar` ranks by cosine similarity of the SPECTER2 embeddings alone (one
-SQL query, `ORDER BY embedding <=> (the paper's embedding) LIMIT n`); `links` is read
+SQL query driven from the paper's own non-null embedding, `ORDER BY embedding <=> it
+LIMIT n`, so a paper without an embedding returns no row and `no_embedding`); `links` is read
 from the loaded structure, so similar work the paper never cites shows up with an empty
-list. `outside` and `missing` rank outside works by how many library papers cite them
+list. Only outside works cited by at least 2 library papers are stored (the builder's
+threshold), so `outside` omits what only one paper cites and an empty `outside` does not
+mean the paper cites nothing outside the library, and `min_citers` 1 behaves as 2
+library-wide (under a `topic` it counts the citers under the topic).
+`outside` and `missing` rank outside works by how many library papers cite them
 (`n_library_citers`), then by their own citation count (OpenAlex), then by id; with a
 `topic`, `missing` counts only citers whose topics include the topic or a topic under it
 (any level, as `by_topic` counts) and keeps works with at least `min_citers` of them,

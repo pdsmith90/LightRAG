@@ -157,8 +157,18 @@ class _V2DB(_DB):
         if name == "similar":
             self.calls.append((name, params))
             pid, limit, only = params
+            if pid not in EMBEDDINGS and not (
+                "WITH q AS" in sql and "embedding IS NOT NULL" in sql
+            ):
+                # the SQL of the first draft: the scalar subquery is NULL, pgvector's
+                # <=> is strict, so every neighbour comes back with similarity NULL
+                return [
+                    {"paper_id": p, "similarity": None}
+                    for p in EMBEDDINGS
+                    if p != pid and (only is None or p in only)
+                ][:limit]
             if pid not in EMBEDDINGS:
-                return []
+                return []  # driven from the paper's own non-null embedding: no row
             rows = [
                 {"paper_id": p, "similarity": _cos(EMBEDDINGS[pid], v)}
                 for p, v in EMBEDDINGS.items()
@@ -328,8 +338,10 @@ async def test_a_relations_filter_picks_the_direction_of_the_citation():
     only = await zs.related_papers(rag, "10.1/p", ["cited_by"])
     assert only["related"][0]["citation"]["source"] == "openalex"
     both = await zs.related_papers(rag, "10.1/p", ["cites", "cited_by"])
+    # p -> q came from s2, q -> p from openalex: neither is "both" providers
     assert both["related"][0]["citation"] == {
-        "source": "both",
+        "source": "s2",
+        "source_reverse": "openalex",
         "is_influential": True,
         "intents": ["result"],
         "n_contexts": 1,
@@ -487,6 +499,38 @@ async def test_similar_reasons():
     out = await zs.similar_papers(rag2, "10.1/a")
     assert out["reason"] == "no_embeddings" and out["similar"] == []
     assert "similar" not in db2.names()
+
+
+def test_the_similar_sql_is_driven_from_the_papers_own_non_null_embedding():
+    sql = zs._SQL["similar"]
+    assert sql.split("\n", 1)[1].lstrip().startswith("WITH q AS")
+    assert "embedding IS NOT NULL" in sql and 'FROM "{s}".paper_embeddings e, q' in sql
+
+
+async def test_a_paper_without_an_embedding_is_no_embedding_not_an_error():
+    # against the first draft's SQL the stub returns NULL-similarity rows for it, as
+    # PostgreSQL does, and float(None) raised: a 500 on the route
+    _, rag = _v2()
+    out = await zs.similar_papers(rag, "KKKK0001", limit=5)
+    assert out["reason"] == "no_embedding" and out["similar"] == []
+    client, headers = _client(rag)
+    r = client.get("/graph/papers/similar?paper=KKKK0001", headers=headers)
+    assert r.status_code == 200 and r.json()["reason"] == "no_embedding"
+
+
+async def test_null_or_nan_similarities_are_skipped_not_fatal(monkeypatch):
+    class Odd(_V2DB):
+        async def query(self, sql, params=None, multirows=False):
+            if sql.startswith("-- zotero_struct:similar"):
+                return [
+                    {"paper_id": B, "similarity": None},
+                    {"paper_id": H, "similarity": float("nan")},
+                    {"paper_id": E, "similarity": 0.5},
+                ]
+            return await super().query(sql, params, multirows)
+
+    out = await zs.similar_papers(_rag(Odd()), "10.1/a")
+    assert _ids(out["similar"]) == [E]
 
 
 async def test_a_paper_whose_neighbours_are_all_filtered_out_is_not_missing_an_embedding():

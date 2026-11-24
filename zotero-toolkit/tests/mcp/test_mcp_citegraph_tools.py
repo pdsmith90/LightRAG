@@ -274,7 +274,8 @@ def test_outside_references_reasons(load_server, fake_lightrag):
         lambda p: (200, {"paper": ME, "total": 0, "works": []}),
     )
     assert srv.outside_references("AAAA0001").splitlines()[-1] == (
-        "It cites no work outside the library."
+        "It cites no outside work that two or more library papers cite "
+        "(works only it cites are not stored)."
     )
 
 

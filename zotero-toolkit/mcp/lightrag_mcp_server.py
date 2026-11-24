@@ -27,8 +27,8 @@ It's a thin, self-contained proxy over the LightRAG Server REST API. Fourteen to
                                           citing sentences, their intents, influential?
     similar_papers(paper)              -> papers with the nearest SPECTER2 embeddings,
                                           cited or not, with how each is linked
-    outside_references(paper)          -> works outside the library that one paper cites,
-                                          by how many library papers cite them
+    outside_references(paper)          -> outside works that one paper cites and at least
+                                          two library papers cite, by citer count
     missing_works(topic)               -> what the library cites often but does not hold
     add_note(text, description)        -> insert a note/snippet into the KB under
                                           a unique document name
@@ -2603,8 +2603,10 @@ def similar_papers(paper: str, limit: int = 10, indexed_only: bool = False) -> s
 
 @mcp.tool(structured_output=False)
 def outside_references(paper: str, limit: int = 15) -> str:
-    """The works OUTSIDE the library that ONE library paper cites, most cited by the
-    library's papers first: the references the library lacks.
+    """The works OUTSIDE the library that ONE library paper cites and that at least TWO
+    library papers cite, most cited by the library's papers first: the shared
+    references the library lacks. A work only this paper cites is not stored, so the
+    list is not all of the paper's missing references.
 
     paper: a Zotero key, a DOI, or words that all occur in its title, authors or year
     (as for paper_passages). limit: rows shown, default 15, at most 50.
@@ -2638,7 +2640,10 @@ def outside_references(paper: str, limit: int = 15) -> str:
     for i, w in enumerate(works, start=1):
         out.append(f"{i}. {_work_line(w)}")
     if not works:
-        out.append("It cites no work outside the library.")
+        out.append(
+            "It cites no outside work that two or more library papers cite "
+            "(works only it cites are not stored)."
+        )
     elif data.get("truncated"):
         out.append(f"Raise limit (at most {STRUCT_MAX}) for more.")
     return "\n".join(out)

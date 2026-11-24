@@ -653,9 +653,10 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
         paper: str = Query(..., min_length=1, max_length=300),
         limit: int = Query(20, ge=1, le=zotero_struct.MAX_LIMIT),
     ):
-        """The works outside the library that one paper cites, ranked by how many library papers cite them (fork).
+        """The outside works that one paper cites and at least 2 library papers cite, ranked by how many cite them (fork).
 
-        Returns ``paper``, ``total``, ``ranking`` and ``works`` (each with
+        Only works cited by 2 or more library papers are stored, so a work that
+        only this paper cites is not listed. Returns ``paper``, ``total``, ``ranking`` and ``works`` (each with
         ``doi``, ``title``, ``year``, ``first_author``, ``venue``,
         ``n_library_citers`` and ``also_cited_by``: up to 5 other library
         papers citing it). ``reason``: ``not_in_structure``,
@@ -674,7 +675,11 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             max_length=200,
             description="Count only citers under this topic (id at any level or words of its name)",
         ),
-        min_citers: int = Query(2, ge=1),
+        min_citers: int = Query(
+            2,
+            ge=1,
+            description="At least this many citers (library-wide, or under the topic); only works with 2 or more library citers are stored",
+        ),
     ):
         """What the library cites but does not hold: outside works cited by many library papers (fork).
 

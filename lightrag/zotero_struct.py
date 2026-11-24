@@ -166,13 +166,13 @@ SELECT ordinal, context, intents FROM "{s}".cite_contexts
 WHERE citing_paper_id = $1 AND cited_paper_id = $2
 ORDER BY ordinal LIMIT $3""",
     "similar": """-- zotero_struct:similar
-SELECT paper_id,
-       1 - (embedding <=> (SELECT embedding FROM "{s}".paper_embeddings
-                           WHERE paper_id = $1)) AS similarity
-FROM "{s}".paper_embeddings
-WHERE paper_id <> $1 AND ($3::text[] IS NULL OR paper_id = ANY($3::text[]))
-ORDER BY embedding <=> (SELECT embedding FROM "{s}".paper_embeddings
-                        WHERE paper_id = $1)
+WITH q AS (SELECT embedding FROM "{s}".paper_embeddings
+           WHERE paper_id = $1 AND embedding IS NOT NULL)
+SELECT e.paper_id, 1 - (e.embedding <=> q.embedding) AS similarity
+FROM "{s}".paper_embeddings e, q
+WHERE e.paper_id <> $1 AND e.embedding IS NOT NULL
+  AND ($3::text[] IS NULL OR e.paper_id = ANY($3::text[]))
+ORDER BY e.embedding <=> q.embedding
 LIMIT $2""",
     "has_embedding": """-- zotero_struct:has_embedding
 SELECT 1 AS found FROM "{s}".paper_embeddings WHERE paper_id = $1""",
@@ -734,19 +734,21 @@ _NO_CITATION_FACTS = {
 def _citation_facts(st: _Struct, edges: list[tuple[int, int]]) -> dict | None:
     """The facts of the citations among ``edges`` (pairs, citing first), as one
     object: source, is_influential, intents, n_contexts. None when the schema
-    has no such columns or none of the pairs is a citation. Two directions
-    merge: the source is the one both share, else 'both'; influential when
+    has no such columns or none of the pairs is a citation. Where two
+    directions exist they merge: ``source`` is that of the first edge named in
+    ``edges`` (the row's direction) and ``source_reverse`` that of the other,
+    since 'both' would say that both providers have one edge; influential when
     either is; the intents are united and the contexts added up."""
     found = [st.cite_meta[e] for e in edges if e in st.cite_meta]
     if not found:
         return None
     if len(found) == 1:
         return dict(found[0])
-    sources = {m["source"] for m in found}
     flags = [m["is_influential"] for m in found if m["is_influential"] is not None]
     counts = [m["n_contexts"] for m in found if m["n_contexts"] is not None]
     return {
-        "source": sources.pop() if len(sources) == 1 else "both",
+        "source": found[0]["source"],
+        "source_reverse": found[1]["source"],
         "is_influential": any(flags) if flags else None,
         "intents": sorted({i for m in found for i in m["intents"]}),
         "n_contexts": sum(counts) if counts else None,
@@ -1543,7 +1545,8 @@ async def similar_papers(rag, paper: str, limit: int = 10, in_kb: bool = False) 
     unlinked, which is similar work the paper does not cite). ``in_kb`` keeps
     papers with text in the knowledge base. ``reason``: ``not_in_structure``,
     ``no_embeddings`` (the schema has no such table), ``no_embedding`` (this
-    paper has none). Raises :class:`Unavailable`."""
+    paper has none; the query itself returns no row then). Raises
+    :class:`Unavailable`."""
     st = await _structure(rag)
     kb = await _kb_keys(rag)
     idx = _resolve(st, paper)
@@ -1562,11 +1565,12 @@ async def similar_papers(rag, paper: str, limit: int = 10, in_kb: bool = False) 
         return out
     for r in rows or []:
         j = st.index.get(r["paper_id"])
-        if j is not None:
+        sim = r["similarity"]
+        if j is not None and sim is not None and not math.isnan(sim):
             out["similar"].append(
                 {
                     **_lite(st, j, kb),
-                    "similarity": round(float(r["similarity"]), 4),
+                    "similarity": round(float(sim), 4),
                     "links": _links(st, idx, j),
                 }
             )
@@ -1603,8 +1607,9 @@ def _outside(st: _Struct, kb: set[str], idx: int, limit: int) -> dict:
         "paper": _lite(st, idx, kb),
         "total": len(works),
         "ranking": (
-            "works the paper cites that are not in the library, most cited by "
-            "library papers first, then most cited overall (OpenAlex)"
+            "outside works the paper cites that at least 2 library papers cite "
+            "(a work only this paper cites is not kept), most cited by library "
+            "papers first, then most cited overall (OpenAlex)"
         ),
         "works": [_work_row(st, kb, j, st.ext_citers[j], idx) for j in works[:limit]],
         "truncated": len(works) > limit,
@@ -1612,8 +1617,10 @@ def _outside(st: _Struct, kb: set[str], idx: int, limit: int) -> dict:
 
 
 async def outside_works(rag, paper: str, limit: int = 20) -> dict:
-    """The works outside the library that one paper cites, ranked by how many
-    library papers cite them, then by their own citation count; each with
+    """The works outside the library that one paper cites and that at least 2
+    library papers cite (the builder keeps no other outside work, so a work only
+    this paper cites is not listed), ranked by how many library papers cite
+    them, then by their own citation count; each with
     ``also_cited_by``, up to ALSO_CITED_BY other library papers citing it.
     ``reason``: ``not_in_structure``, ``no_external_works`` (the schema lacks
     the tables). Raises :class:`Unavailable`."""
