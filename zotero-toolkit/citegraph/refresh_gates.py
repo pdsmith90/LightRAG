@@ -8,11 +8,12 @@ a table name that is not a plain identifier).
   qa-gate QA              the hard checks AND the reference check (oracle) passed
   hard-checks QA          the hard checks passed (the load script's own check; no reference check needed)
   row-counts QA           print "<table><TAB><rows>" per table, sorted: what the loaded tables must hold
-  count-sql QA [--schema S]
-                          print one "SELECT '<table>', count(*) FROM <S>.<table>;" per table, for psql
-  shrink QA LIVE          LIVE = lines "<table> <rows>" counted in the live schema (a file, or - for stdin).
+  shrink QA LIVE          LIVE = lines "<table> <rows>" counted in the live schema (a file, or - for stdin), as
+                          `load_zstruct.sh --count-live` prints them: only the tables the live schema has, so a
+                          table new to the build is absent from LIVE (and a first load has an empty LIVE).
                           Print the tables whose new row count is under 98% of the live one, comma separated;
-                          exit 1 if there are any. A table new to the build (not in LIVE) cannot shrink.
+                          exit 1 if there are any. A table new to the build cannot shrink; a malformed count in
+                          QA or LIVE is bad input (exit 2).
   summary QA              print "papers=N cites=N cite_contexts=N external_works=N paper_embeddings=N"
 """
 
@@ -31,8 +32,7 @@ SUMMARY_TABLES = (
     "external_works",
     "paper_embeddings",
 )
-TABLE_RE = re.compile(r"[a-z_]+")
-SCHEMA_RE = re.compile(r"[a-z_][a-z0-9_]*")
+TABLE_RE = re.compile(r"[a-z_][a-z0-9_]*")
 
 
 class BadInput(Exception):
@@ -108,21 +108,17 @@ def run(args: argparse.Namespace) -> int:
         for t, n in sorted(row_counts(qa).items()):
             print(f"{t}\t{n}")
         return 0
-    if args.cmd == "count-sql":
-        if not SCHEMA_RE.fullmatch(args.schema):
-            raise BadInput(f"bad schema name {args.schema!r}")
-        for t in sorted(row_counts(qa)):
-            print(f'SELECT {t!r}, count(*) FROM {args.schema}."{t}";')
-        return 0
     if args.cmd == "shrink":
         text = (
             sys.stdin.read()
             if args.live == "-"
             else open(args.live, encoding="utf-8").read()
         )
-        shrunk = shrunk_tables(
-            {t: int(n) for t, n in row_counts(qa).items()}, parse_live(text)
-        )
+        try:
+            new = {t: int(n) for t, n in row_counts(qa).items()}
+        except (ValueError, TypeError) as e:
+            raise BadInput(f"cannot read a row count in {args.qa}: {e}") from e
+        shrunk = shrunk_tables(new, parse_live(text))
         if shrunk:
             print(", ".join(shrunk))
             return 1
@@ -141,9 +137,6 @@ def main(argv: list[str] | None = None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     for name in ("qa-gate", "hard-checks", "row-counts", "summary"):
         sub.add_parser(name).add_argument("qa")
-    p = sub.add_parser("count-sql")
-    p.add_argument("qa")
-    p.add_argument("--schema", default="zstruct")
     p = sub.add_parser("shrink")
     p.add_argument("qa")
     p.add_argument("live")

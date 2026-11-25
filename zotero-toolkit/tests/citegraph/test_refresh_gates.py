@@ -145,51 +145,6 @@ class TestRowCounts:
         )
 
 
-class TestCountSql:
-    def test_one_select_per_table_in_the_schema(self, tmp_path, capsys, monkeypatch):
-        rc, out, _ = run(
-            capsys,
-            monkeypatch,
-            "count-sql",
-            qa_file(tmp_path, counts={"papers": 1, "cites": 2}),
-        )
-        assert rc == 0
-        assert out.splitlines() == [
-            "SELECT 'cites', count(*) FROM zstruct.\"cites\";",
-            "SELECT 'papers', count(*) FROM zstruct.\"papers\";",
-        ]
-
-    def test_schema_option(self, tmp_path, capsys, monkeypatch):
-        rc, out, _ = run(
-            capsys,
-            monkeypatch,
-            "count-sql",
-            qa_file(tmp_path, counts={"papers": 1}),
-            "--schema",
-            "cg_2",
-        )
-        assert (
-            rc == 0 and out.strip() == "SELECT 'papers', count(*) FROM cg_2.\"papers\";"
-        )
-
-    @pytest.mark.parametrize("schema", ["Zstruct", "z struct", "z;drop", "1abc", ""])
-    def test_refuses_a_bad_schema_name(self, tmp_path, capsys, monkeypatch, schema):
-        rc, _, err = run(
-            capsys, monkeypatch, "count-sql", qa_file(tmp_path), "--schema", schema
-        )
-        assert rc == 2 and "bad schema" in err
-
-    def test_refuses_a_table_name_that_is_not_an_identifier(
-        self, tmp_path, capsys, monkeypatch
-    ):
-        assert (
-            run(capsys, monkeypatch, "count-sql", qa_file(tmp_path, counts={"a-b": 1}))[
-                0
-            ]
-            == 2
-        )
-
-
 class TestShrink:
     def shrink(self, tmp_path, capsys, monkeypatch, new, live):
         return run(

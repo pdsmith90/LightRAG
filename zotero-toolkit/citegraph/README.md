@@ -9,8 +9,8 @@ with a DOI, and writes CSV tables plus the SQL that loads them into a PostgreSQL
 LightRAG database. A daily timer can rebuild and reload it without a server restart.
 
 Everything here is standard-library Python and bash; the only external programs are `psql`,
-`rsync`, `ssh` and `flock`. Nothing in this directory connects to a database except
-`load_zstruct.sh`.
+`rsync`, `ssh` and `flock`. Only `load_zstruct.sh` connects to a database (it also counts the live
+tables for `refresh.sh`, over its own connection); `refresh.sh` holds no database setting.
 
 ## What it builds
 
@@ -61,9 +61,12 @@ build_struct_layer.py ... --s2-store s2store/api_citations.sqlite --offline     
     │   no request: joins the store's rows into cites and cite_contexts
     ▼
 refresh_gates.py: hard checks + reference check pass; no table below 98% of the live rows    (step 5)
+    │   live rows: `load_zstruct.sh --count-live` on the database host (a catalog query)
     │   build identical to out.loaded/ → stop, nothing to load
     ▼
-rsync → <database host>:<data dir>/out.daily/ ; load_zstruct.sh out.daily                     (step 6)
+rsync → <database host>:<data dir>/out.daily/ ;
+load_zstruct.sh --expect-qa <sha256 of the qa.json checked> out.daily                          (step 6)
+        refuses a different qa.json, a table below 98% of the live rows, a load outside its window;
         builds <schema>_next in one transaction, checks every row count against qa.json,
         runs the server's pgvector `similar` query once, swaps: <schema> → <schema>_prev
 ```
@@ -90,7 +93,22 @@ python3 s2_citation_sweep.py --store s2store/api_citations.sqlite --report     #
 
 # the load, on the database host
 bash load_zstruct.sh --config citegraph.env out.daily
+bash load_zstruct.sh --config citegraph.env --count-live      # "table rows" of the live schema; changes nothing
 ```
+
+`load_zstruct.sh` options:
+
+- `--count-live` prints `table rows` for every ordinary table of the live schema, counted exactly with one
+  catalog query, and changes nothing. It prints nothing and exits 0 when the schema does not exist yet, and it
+  needs no build folder and no load window. `refresh.sh` uses it for its shrink gate, so a table that is new to
+  the build is simply absent from the live list.
+- `--expect-qa SHA256` aborts, before anything changes, unless `sha256sum DIR/qa.json` is SHA256.
+  `refresh.sh` always passes the hash of the `qa.json` its gates checked, so the build that is loaded is the build
+  that passed.
+- `--allow-shrink` loads a build in which some table has fewer than 98% of the live schema's rows. Without it
+  the load runs the same check as the refresh gate over its own connection, before the apply, and refuses. Use
+  the flag for a deliberately smaller build (a shrunk library, a changed filter) when you run the load by hand;
+  `refresh.sh` never passes it.
 
 `build_struct_layer.py --help` and `s2_citation_sweep.py --help` list every option. The builder's
 exit status is 1 when a request failed after its retries, a hard check failed or the reference
@@ -109,26 +127,29 @@ every setting:
 
 | variable | meaning |
 | --- | --- |
-| `CITEGRAPH_DATA` | required: the data directory (`input/ cache/ s2store/ logs/ out.*`) |
-| `CITEGRAPH_CODE` | the directory of the Python modules; default: the scripts' own directory |
+| `CITEGRAPH_DATA` | required, absolute: the data directory (`input/ cache/ s2store/ logs/ out.*`) |
+| `CITEGRAPH_CODE` | absolute: the directory of the Python modules; default: the scripts' own directory |
 | `CITEGRAPH_METADATA_SRC`, `CITEGRAPH_REFERENCES_SRC` | required: rsync sources of the two input files |
 | `CITEGRAPH_REMOTE` | ssh host of the database; empty: the database is local |
-| `CITEGRAPH_REMOTE_CODE`, `_CONFIG`, `_DATA` | where `load_zstruct.sh`, its config and `out.daily/` are on that host |
-| `CITEGRAPH_SCHEMA` | schema name, default `zstruct` |
-| `PGHOST PGPORT PGUSER PGDATABASE` | the usual libpq settings |
-| `CITEGRAPH_PGPASSWORD_FILE` | a file that holds only the password |
-| `CITEGRAPH_LOAD_WINDOW` | `HHMM-HHMM`: the hours in which a load may run; empty: any time |
+| `CITEGRAPH_REMOTE_CODE`, `_CONFIG`, `_DATA` | required with `CITEGRAPH_REMOTE`, absolute: where `load_zstruct.sh` (with `refresh_gates.py`), its config and `out.daily/` are on that host |
+| `CITEGRAPH_SCHEMA` | schema name, default `zstruct` (both copies) |
+| `PGHOST PGPORT PGUSER PGDATABASE` | the usual libpq settings (database host's copy) |
+| `CITEGRAPH_PGPASSWORD_FILE` | a file that holds only the password; `load_zstruct.sh` refuses to run if it cannot read it (database host's copy) |
+| `CITEGRAPH_LOAD_WINDOW` | required for a load, in the database host's copy: `HHMM-HHMM`, the hours in which a load may run, or `none` to load at any time |
 | `CITEGRAPH_SWEEP_MAX_HOURS` | the daily sweep's time limit, default 3 |
-| `CITEGRAPH_SWEEP_PROCESS_PATTERN` | `pgrep -f` pattern of a sweep running elsewhere, which makes `refresh.sh` skip the day |
+| `CITEGRAPH_SWEEP_PROCESS_PATTERN` | the process pattern (for `pgrep -f`) of a sweep running elsewhere, which makes `refresh.sh` skip the day; default `[s]2_citation_sweep.py --out` |
+| `CITEGRAPH_STALE_DAYS` | default 3: a skip or a failure calls `citegraph_notify`, once per run, when `out.loaded` is older than this |
 | `citegraph_with_key CMD...` | function: run CMD with `OPENALEX_API_KEY` in its environment |
-| `citegraph_notify MESSAGE` | function: called when a real run fails |
+| `citegraph_notify MESSAGE` | function: called when a real run fails, a sweep exits badly, or the live build is stale |
 
-When the database is on another host, the load script runs there over ssh (`CITEGRAPH_REMOTE_CODE`)
-and reads its own copy of the config (`CITEGRAPH_REMOTE_CONFIG`) for the PG settings and the
-password file. `refresh.sh` counts the live rows by running `psql` on that host with its own copy of
-`PGHOST PGPORT PGUSER PGDATABASE` and the password file named by `CITEGRAPH_PGPASSWORD_FILE`, read
-there: the password never travels, only the file's name does. Write the path as `'~/.pgpw'`, in
-single quotes, so that the `~` is the database host's home.
+There are two halves. `refresh.sh` reads the first set of settings (data, sources, remote, sweep, hooks) and
+holds no database setting. `load_zstruct.sh`, which `refresh.sh` calls for the live row count and for the
+load, reads the database settings (`PG*`, the password file, the window, the schema) from its own config. When
+the database is local that is the same file. When it is on another host, `CITEGRAPH_REMOTE_CONFIG` names a
+second, shorter copy there: the password file is read on that host, and the password never travels.
+`~/` at the start of `CITEGRAPH_PGPASSWORD_FILE` means that host's home: write it in single quotes.
+`refresh.sh` quotes the command it sends over ssh with `printf %q`, so the database host's login shell must
+be bash. Paths must be absolute: a relative path or a quoted `~` is refused at start.
 
 ## Scheduling
 
@@ -169,8 +190,6 @@ that firing skip.
   dataset and keep the rows that touch the library) needs a key, downloads hundreds of gigabytes
   for a full pass, and is dormant: `refresh.sh` does not use it. The sweep writes a store of the
   same schema, so the builder reads either.
-- `refresh.sh` counts the live tables before it loads, so the first load into a database that has
-  no such schema yet is a manual `load_zstruct.sh --config FILE DIR`.
 - Papers without a DOI are matched by title through S2 and accepted only when the title, the year (within one) and the first author's family name agree (`QA.md` lists the matches and the conflicts).
 
 ## Dry run
@@ -183,12 +202,16 @@ builds into `out.daily.dryrun/` (it makes the online requests, so it spends the 
 like a real run), runs the gates against the live row counts, and copies and loads nothing; the
 sweep and the sweep-running skip are off. The result is one line in the log:
 `gates passed; would copy out.daily.dryrun to the database host as out.daily and load it: ...` or
-`FAILED: ... -- not loaded`. A dry run notifies nobody. Delete `out.daily.dryrun/` afterwards.
+`FAILED: ... -- not loaded`. A dry run notifies nobody. It counts the live tables by calling
+`load_zstruct.sh --count-live` on the database host, so the install there must exist first. Delete
+`out.daily.dryrun/` afterwards.
 
 ## Tests
 
 From `zotero-toolkit/`: `scripts/test.sh tests/citegraph`. They are offline. The shell scripts run
-from a temp directory against stub `ssh`, `rsync`, `psql` and `pgrep` and a directory of stub
-builder and sweep modules (`test_citegraph_scripts.py`); `test_refresh_gates.py` covers the gates
+from a temp directory against stub `ssh`, `rsync`, `psql`, `pgrep` and `tee` and a directory of stub
+builder and sweep modules (`test_citegraph_scripts.py`). They cover `refresh.sh` with a canned `ssh`,
+`refresh.sh` against the real `load_zstruct.sh` (a local database, and an `ssh` stub that runs the command
+with `bash -c`), and the load script alone. `test_refresh_gates.py` covers the gates
 including the 98% boundary. `tests/citegraph/input/citations-sample.jsonl.gz` is a 72-line sample
 of the public S2 citation dataset used by the dataset-mode tests.
