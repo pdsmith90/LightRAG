@@ -206,6 +206,10 @@ sweep and the sweep-running skip are off. The result is one line in the log:
 `load_zstruct.sh --count-live` on the database host, so the install there must exist first. Delete
 `out.daily.dryrun/` afterwards.
 
+`--no-sweep` makes a real run (gates, copy, load) without the sweep step and without the
+sweep-running skip. It loads what a sweep that is still running has stored so far, for instance
+during a first full sweep, which can take days; the builder only reads the store.
+
 ## Tests
 
 From `zotero-toolkit/`: `scripts/test.sh tests/citegraph`. They are offline. The shell scripts run

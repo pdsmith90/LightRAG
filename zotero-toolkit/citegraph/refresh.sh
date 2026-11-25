@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Daily citation-graph refresh. Run it from a timer (systemd/citegraph-refresh.timer.example):
 #
-#   refresh.sh --config FILE [--dry-run]        (or CITEGRAPH_CONFIG=FILE refresh.sh)
+#   refresh.sh --config FILE [--dry-run] [--no-sweep]        (or CITEGRAPH_CONFIG=FILE refresh.sh)
 #
 # FILE is a bash file with the site's settings; see citegraph.env.example. Steps:
 #   1. copy zotero_metadata.json and zotero_references.json from their sources into $CITEGRAPH_DATA/input/
@@ -21,15 +21,19 @@
 # citegraph_notify (when the config defines it) and leaves the live tables as they were. When out.loaded is older
 # than CITEGRAPH_STALE_DAYS, a skip or a failure also calls citegraph_notify, once per run, naming the age.
 #   --dry-run: no sweep-running skip, no sweep, no copy, no load; builds into out.daily.dryrun/ and runs the gates.
+#   --no-sweep: a real run without step 3 and without the sweep-running skip: it loads what a sweep that is still
+#     running has stored so far (the builder reads the store read-only), for instance during a first full sweep.
 set -uo pipefail
 
-usage() { echo "usage: $0 --config FILE [--dry-run]   (FILE may also come from CITEGRAPH_CONFIG)" >&2; }
+usage() { echo "usage: $0 --config FILE [--dry-run] [--no-sweep]   (FILE may also come from CITEGRAPH_CONFIG)" >&2; }
 DRY=0
+NOSWEEP=0
 CONF=${CITEGRAPH_CONFIG:-}
 while [ $# -gt 0 ]; do
   case $1 in
     --config) [ $# -ge 2 ] || { usage; exit 2; }; CONF=$2; shift 2 ;;
     --dry-run) DRY=1; shift ;;
+    --no-sweep) NOSWEEP=1; shift ;;
     -h | --help) usage; exit 0 ;;
     *) usage; exit 2 ;;
   esac
@@ -82,7 +86,7 @@ GATES=(python3 "$HERE/refresh_gates.py")
 mkdir -p "$CITEGRAPH_DATA/logs" "$CITEGRAPH_DATA/input" "$CITEGRAPH_DATA/cache" || exit 1
 cd "$CITEGRAPH_DATA" || exit 1
 L=logs/refresh_$(date +%Y%m).log
-say() { echo "$(date '+%F %T')$([ $DRY = 1 ] && echo ' [dry-run]') $*" >> "$L"; }
+say() { echo "$(date '+%F %T')$([ $DRY = 1 ] && echo ' [dry-run]')$([ $NOSWEEP = 1 ] && echo ' [no-sweep]') $*" >> "$L"; }
 notify() { citegraph_notify "${1:0:250} -- log $CITEGRAPH_DATA/$L" 9>&- || say "citegraph_notify failed"; }
 # a real run that cannot refresh says so when the live build is old (out.loaded: the last build that was loaded)
 STALE_SENT=
@@ -105,7 +109,7 @@ db_load() { db_host "bash $(printf %q "$DB_CODE/load_zstruct.sh") --config $(pri
 
 exec 9> logs/.refresh.lock
 flock -n 9 || { say "skip: another refresh is running"; stale_notify; exit 0; }
-if [ $DRY = 0 ] && pgrep -f "$SWEEP_RUNNING" > /dev/null; then
+if [ $DRY = 0 ] && [ $NOSWEEP = 0 ] && pgrep -f "$SWEEP_RUNNING" > /dev/null; then
   say "skip: a citation sweep is running"; stale_notify; exit 0
 fi
 say "start"
@@ -126,7 +130,7 @@ say "online build rc=$?: $(tail -n 1 logs/refresh_build_online.log | cut -c1-220
 [ -s "$N/papers.csv" ] || fail "the online build wrote no papers.csv (logs/refresh_build_online.log)"
 
 # 3. sweep (0 = done or out of time, 3 = throttled: both leave a consistent store)
-if [ $DRY = 0 ]; then
+if [ $DRY = 0 ] && [ $NOSWEEP = 0 ]; then
   nice -n 19 python3 "$CODE/s2_citation_sweep.py" --out "$N" --store s2store/api_citations.sqlite \
     --max-hours "$SWEEP_HOURS" > logs/refresh_sweep.log 2>&1 9>&-
   rc=$?

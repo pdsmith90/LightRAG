@@ -843,6 +843,19 @@ class TestRefreshRealRun:
         assert (old / "cites.csv").read_text() == "cites.csv,NEW\n"
         assert not (site.data / "out.daily.new").exists() and not site.notified.exists()
 
+    def test_no_sweep_loads_while_a_sweep_runs_and_runs_no_sweep(self, site):
+        site.make_loaded()
+        proc = site.refresh("--no-sweep", STUB_SWEEP_RUNNING="1", STUB_CSV_TAG="NEW")
+        assert proc.returncode == 0, proc.stderr
+        lines = [strip_stamp(ln) for ln in site.log_lines()]
+        assert all(ln.startswith("[no-sweep] ") for ln in lines), lines
+        assert lines[0] == "[no-sweep] start"
+        assert not any("sweep rc=" in ln or "skip:" in ln for ln in lines)
+        assert lines[-1].startswith("[no-sweep] done: ")
+        assert site.stub_log("sweep_calls.log") == ""
+        assert f"PUSH dbhost:{site.data}/out.daily/" in site.stub_log("rsync.log")
+        assert (site.data / "out.loaded.prev").is_dir()
+
     def test_first_load_with_no_loaded_build(self, site):
         assert site.refresh().returncode == 0
         assert (site.data / "out.loaded" / "papers.csv").exists()
