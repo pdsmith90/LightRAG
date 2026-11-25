@@ -1,0 +1,13 @@
+# Install as ~/.config/systemd/user/citegraph-refresh.service (or /etc/systemd/system/ with User=), replace the two
+# paths, then `systemctl --user daemon-reload`. The timer starts it; `systemctl --user start citegraph-refresh` runs
+# it once now.
+[Unit]
+Description=Citation graph: daily OpenAlex and Semantic Scholar refresh, loaded into the LightRAG database
+
+[Service]
+Type=oneshot
+# <install dir>: the directory that holds refresh.sh; <file>: the site config (citegraph.env.example)
+ExecStart=/usr/bin/bash <install dir>/refresh.sh --config <file>
+Nice=19
+IOSchedulingClass=idle
+TimeoutStartSec=6h

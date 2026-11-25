@@ -1,0 +1,11 @@
+# Install beside citegraph-refresh.service as citegraph-refresh.timer, then
+# `systemctl --user enable --now citegraph-refresh.timer`.
+[Unit]
+Description=Daily citation-graph refresh at 14:00 (after the metadata export, outside any night ingest lane)
+
+[Timer]
+OnCalendar=*-*-* 14:00:00
+Persistent=false
+
+[Install]
+WantedBy=timers.target
