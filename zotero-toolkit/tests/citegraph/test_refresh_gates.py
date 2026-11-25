@@ -7,7 +7,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pytest
 
 CITEGRAPH = Path(__file__).resolve().parents[2] / "citegraph"
 spec = importlib.util.spec_from_file_location(
