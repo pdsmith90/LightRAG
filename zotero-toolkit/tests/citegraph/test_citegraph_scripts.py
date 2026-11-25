@@ -875,6 +875,23 @@ class TestRefreshRealRun:
         assert time.time() - d.stat().st_mtime < 3600  # checked today: not stale
         assert site.refresh().returncode == 0 and not site.notified.exists()
 
+    def test_a_dry_run_with_an_identical_build_leaves_the_age_alone(self, site):
+        d = site.make_loaded(age_days=10)
+        (d / "papers.csv").write_text(
+            "papers.csv,A\n"
+        )  # the stub builder's default bytes
+        (d / "cites.csv").write_text("cites.csv,A\n")
+        t = time.time() - 10 * 86400
+        os.utime(d, (t, t))
+        proc = site.refresh("--dry-run")
+        assert proc.returncode == 0
+        assert strip_stamp(site.log_lines()[-1]).endswith(
+            "no change against the last loaded build (out.loaded): not loaded"
+        )
+        assert (
+            abs(d.stat().st_mtime - t) < 5
+        )  # a dry run must not hide a stale live build
+
     def test_a_failed_load_notifies_and_keeps_out_loaded(self, site):
         old = site.make_loaded()
         proc = site.refresh(STUB_LOAD_FAIL="1")

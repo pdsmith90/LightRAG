@@ -160,7 +160,8 @@ changed=0
 for f in "$N"/*.csv; do cmp -s "$f" "out.loaded/${f##*/}" || changed=1; done
 if [ $changed = 0 ]; then
   say "no change against the last loaded build (out.loaded): not loaded"
-  touch out.loaded   # the live tables are still current: out.loaded's age counts from this check
+  # the live tables are still current: out.loaded's age counts from this check (a dry run checks nothing for real)
+  [ $DRY = 1 ] || touch out.loaded
   rm -rf "$N"; exit 0
 fi
 counts=$("${GATES[@]}" summary "$N/qa.json")
