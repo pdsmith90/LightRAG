@@ -181,6 +181,14 @@ that firing skip.
 
 - Only outside works that at least two library papers cite are stored and looked up. A work cited
   once is not in `external_works`, and `/graph/papers/outside` says so ("2 or more").
+- OpenAlex reference lists name works by OpenAlex id, and a library paper has one only when
+  OpenAlex returns a record for its DOI. A cited work that is a library paper under another id (a
+  duplicate record, or a report, thesis or book OpenAlex has no record of under the paper's DOI, or
+  that has none) counts as a citation of that paper, not as an outside work, when its DOI is the
+  paper's, or its title is and an author is shared with the years at most one apart (the same year
+  when one side has no author names; when a year is missing on either side, an author in common
+  alone decides). A title that fits several library papers stays outside.
+  `QA.md` counts these matches. Coupling still compares the ids as they are.
 - Some publishers withhold reference lists from S2, so a paper's own reference list is incomplete
   there. The sweep therefore also asks for each cited library paper's citers
   (`/paper/{id}/citations`), which are listed regardless; that is the cited-side sweep.
