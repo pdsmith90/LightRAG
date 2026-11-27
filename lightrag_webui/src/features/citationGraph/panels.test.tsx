@@ -45,8 +45,11 @@ beforeEach(() => {
   answers = {}
   __setAxiosAdapterForTests(async (config: any) => {
     requests.push(config.url)
-    const path = new URL(config.url, 'http://x').pathname
-    return { data: answers[path], status: 200, statusText: 'OK', headers: {}, config }
+    const url = new URL(config.url, 'http://x')
+    // A function answers by the request (the paper asked about), and may throw.
+    const answer = answers[url.pathname]
+    const data = typeof answer === 'function' ? (answer as (url: URL) => unknown)(url) : answer
+    return { data, status: 200, statusText: 'OK', headers: {}, config }
   })
 })
 
@@ -66,7 +69,7 @@ describe('RelatedPanel', () => {
   test('lists the references first and opens a paper by its structure id', async () => {
     answers['/graph/papers/related'] = { paper: struct('10.1/p', 'P'), totals: { cites: 5 }, related: [related('cites')] }
     const onOpen = mock(() => {})
-    renderWithProviders(<RelatedPanel paper="10.1/p" onOpen={onOpen} onPickCitation={() => {}} />)
+    renderWithProviders(<RelatedPanel papers={['10.1/p']} onOpen={onOpen} onPickCitation={() => {}} />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'A reference' }))
     expect(onOpen).toHaveBeenCalledWith('doi:10.1/ref')
@@ -78,7 +81,7 @@ describe('RelatedPanel', () => {
   test('a reference with stored sentences opens them as the paper citing the reference', async () => {
     answers['/graph/papers/related'] = { paper: struct('10.1/p', 'P'), related: [related('cites')] }
     const onPickCitation = mock(() => {})
-    renderWithProviders(<RelatedPanel paper="10.1/p" onOpen={() => {}} onPickCitation={onPickCitation} />)
+    renderWithProviders(<RelatedPanel papers={['10.1/p']} onOpen={() => {}} onPickCitation={onPickCitation} />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Read citing sentences (2)' }))
     expect(onPickCitation).toHaveBeenCalledWith({ citing: '10.1/p', cited: 'doi:10.1/ref' })
@@ -87,7 +90,7 @@ describe('RelatedPanel', () => {
 
   test('another relation asks again for that relation', async () => {
     answers['/graph/papers/related'] = { paper: struct('10.1/p', 'P'), related: [related('coupled', { shared_refs: 8 })] }
-    renderWithProviders(<RelatedPanel paper="10.1/p" onOpen={() => {}} onPickCitation={() => {}} />)
+    renderWithProviders(<RelatedPanel papers={['10.1/p']} onOpen={() => {}} onPickCitation={() => {}} />)
     await screen.findByText('A reference')
 
     fireEvent.click(screen.getByRole('button', { name: strings.relation.coupled }))
@@ -97,7 +100,7 @@ describe('RelatedPanel', () => {
 
   test('says why when the paper is not in the structure', async () => {
     answers['/graph/papers/related'] = { paper: null, asked: 'x', reason: 'not_in_structure' }
-    renderWithProviders(<RelatedPanel paper="x" onOpen={() => {}} onPickCitation={() => {}} />)
+    renderWithProviders(<RelatedPanel papers={['x']} onOpen={() => {}} onPickCitation={() => {}} />)
     expect(await screen.findByText(strings.reason.not_in_structure)).toBeTruthy()
   })
 })
@@ -112,7 +115,7 @@ describe('SimilarPanel', () => {
       ]
     }
     const onOpen = mock(() => {})
-    renderWithProviders(<SimilarPanel paper="10.1/p" onOpen={onOpen} />)
+    renderWithProviders(<SimilarPanel papers={['10.1/p']} onOpen={onOpen} />)
 
     expect(await screen.findByText('Similarity 96%')).toBeTruthy()
     expect(screen.getByText(strings.relation.cites)).toBeTruthy()
@@ -123,7 +126,7 @@ describe('SimilarPanel', () => {
 
   test('a paper without an embedding gets the reason, not a crash', async () => {
     answers['/graph/papers/similar'] = { paper: struct('10.1/p', 'P'), in_kb: false, similar: [], reason: 'no_embedding' }
-    renderWithProviders(<SimilarPanel paper="10.1/p" onOpen={() => {}} />)
+    renderWithProviders(<SimilarPanel papers={['10.1/p']} onOpen={() => {}} />)
     expect(await screen.findByText(strings.reason.no_embedding)).toBeTruthy()
   })
 })
@@ -215,7 +218,7 @@ describe('OutsidePanel', () => {
   test('lists the works with a DOI link and the library papers that also cite them', async () => {
     answers['/graph/papers/outside'] = { paper: struct('10.1/p', 'P'), total: 13, works: [work], truncated: true }
     const onOpen = mock(() => {})
-    renderWithProviders(<OutsidePanel paper="10.1/p" onOpen={onOpen} />)
+    renderWithProviders(<OutsidePanel papers={['10.1/p']} onOpen={onOpen} />)
 
     const link = await screen.findByRole('link', { name: 'An outside work' })
     expect(link.getAttribute('href')).toBe('https://doi.org/10.9/outside')
@@ -226,7 +229,7 @@ describe('OutsidePanel', () => {
 
   test('no outside works gives the reason', async () => {
     answers['/graph/papers/outside'] = { paper: struct('10.1/p', 'P'), total: 0, works: [], reason: 'no_external_works' }
-    renderWithProviders(<OutsidePanel paper="10.1/p" onOpen={() => {}} />)
+    renderWithProviders(<OutsidePanel papers={['10.1/p']} onOpen={() => {}} />)
     expect(await screen.findByText(strings.reason.no_external_works)).toBeTruthy()
   })
 })
@@ -282,5 +285,133 @@ describe('TopicsPanel', () => {
     answers['/graph/papers/by_topic'] = { topic: null, reason: 'no_topic', papers: [], total: 0 }
     fireEvent.click(screen.getByRole('button', { name: /^Earth/ }))
     expect(await screen.findByText(strings.reason.no_topic)).toBeTruthy()
+  })
+})
+
+// The routes take one paper: with several chosen, each panel asks once per paper (never a
+// repeated `paper=`, of which a route would read only the last) and merges the answers.
+describe('several chosen papers', () => {
+  const PAPERS = ['10.1/p', '10.1/q']
+  const asked = (url: string) => new URL(url, 'http://x').searchParams.getAll('paper')
+  const byPaper = (answer: Record<string, unknown>) => (url: URL) => {
+    const body = answer[url.searchParams.get('paper') ?? '']
+    if (body instanceof Error) throw body
+    return body
+  }
+  const related = (id: string, title: string, n_contexts: number, extra: Record<string, unknown> = {}) => ({
+    ...struct(id, title),
+    score: 1,
+    reasons: ['cites'],
+    citation: { source: 'both', is_influential: false, intents: [], n_contexts },
+    ...extra
+  })
+
+  test('the related panel asks once per paper and lists a shared paper once', async () => {
+    answers['/graph/papers/related'] = byPaper({
+      '10.1/p': {
+        paper: struct('10.1/p', 'P'),
+        totals: { cites: 5 },
+        related: [related('10.1/ref', 'A reference', 0), related('10.1/only', 'Only P', 0, { score: 0.5 })]
+      },
+      '10.1/q': { paper: struct('10.1/q', 'Q'), totals: { cites: 4 }, related: [related('10.1/ref', 'A reference', 3)] }
+    })
+    const onPickCitation = mock(() => {})
+    renderWithProviders(<RelatedPanel papers={PAPERS} onOpen={() => {}} onPickCitation={onPickCitation} />)
+
+    await screen.findByText('Only P')
+    expect(requests.map(asked).sort()).toEqual([['10.1/p'], ['10.1/q']])
+    expect(requests.every((url) => url.includes('relations=cites'))).toBe(true)
+    expect(screen.getAllByRole('button', { name: 'A reference' })).toHaveLength(1)
+    expect(screen.getByText('Showing 2 of 9')).toBeTruthy()
+    // The copy of the shared reference that has sentences is the one from Q.
+    fireEvent.click(screen.getByRole('button', { name: 'Read citing sentences (3)' }))
+    expect(onPickCitation).toHaveBeenCalledWith({ citing: '10.1/q', cited: 'doi:10.1/ref' })
+  })
+
+  test('a paper that fails leaves the others\' papers and a note', async () => {
+    answers['/graph/papers/related'] = byPaper({
+      '10.1/p': { paper: struct('10.1/p', 'P'), related: [related('10.1/ref', 'A reference', 0)] },
+      '10.1/q': new Error('boom')
+    })
+    renderWithProviders(<RelatedPanel papers={PAPERS} onOpen={() => {}} onPickCitation={() => {}} />)
+
+    expect(await screen.findByRole('button', { name: 'A reference' })).toBeTruthy()
+    expect(screen.getByText('No answer for 1 of the 2 chosen papers')).toBeTruthy()
+  })
+
+  test('every paper failing is an error, not an empty list', async () => {
+    answers['/graph/papers/related'] = byPaper({ '10.1/p': new Error('boom'), '10.1/q': new Error('boom') })
+    renderWithProviders(<RelatedPanel papers={PAPERS} onOpen={() => {}} onPickCitation={() => {}} />)
+
+    expect(await screen.findByText('Could not load this data: boom')).toBeTruthy()
+    expect(screen.queryByText(strings.related.empty)).toBeNull()
+  })
+
+  test('a reason from one paper does not hide what the other found', async () => {
+    answers['/graph/papers/related'] = byPaper({
+      '10.1/p': { paper: null, reason: 'not_in_structure' },
+      '10.1/q': { paper: struct('10.1/q', 'Q'), related: [related('10.1/ref', 'A reference', 0)] }
+    })
+    renderWithProviders(<RelatedPanel papers={PAPERS} onOpen={() => {}} onPickCitation={() => {}} />)
+
+    expect(await screen.findByRole('button', { name: 'A reference' })).toBeTruthy()
+    expect(screen.getByText('No answer for 1 of the 2 chosen papers')).toBeTruthy()
+    expect(screen.queryByText(strings.reason.not_in_structure)).toBeNull()
+  })
+
+  test('the same reason from every paper is the panel\'s message', async () => {
+    answers['/graph/papers/related'] = byPaper({
+      '10.1/p': { paper: null, reason: 'not_in_structure' },
+      '10.1/q': { paper: null, reason: 'not_in_structure' }
+    })
+    renderWithProviders(<RelatedPanel papers={PAPERS} onOpen={() => {}} onPickCitation={() => {}} />)
+    expect(await screen.findByText(strings.reason.not_in_structure)).toBeTruthy()
+  })
+
+  test('the similar panel asks once per paper and keeps the best similarity of a shared paper', async () => {
+    const similar = (id: string, title: string, similarity: number, links: string[]) => ({
+      ...struct(id, title),
+      similarity,
+      links
+    })
+    answers['/graph/papers/similar'] = byPaper({
+      '10.1/p': { paper: struct('10.1/p', 'P'), similar: [similar('10.1/a', 'Shared', 0.9, ['cites']), similar('10.1/b', 'Only P', 0.8, [])] },
+      '10.1/q': { paper: struct('10.1/q', 'Q'), similar: [similar('10.1/a', 'Shared', 0.95, ['coupled'])] }
+    })
+    renderWithProviders(<SimilarPanel papers={PAPERS} onOpen={() => {}} />)
+
+    expect(await screen.findByText('Similarity 95%')).toBeTruthy()
+    expect(requests.map(asked).sort()).toEqual([['10.1/p'], ['10.1/q']])
+    expect(screen.queryByText('Similarity 90%')).toBeNull()
+    expect(screen.getAllByRole('button', { name: 'Shared' })).toHaveLength(1)
+    expect(screen.getByText(strings.relation.cites)).toBeTruthy()
+    expect(screen.getByText(strings.relation.coupled)).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Only P' })).toBeTruthy()
+  })
+
+  test('the outside panel asks once per paper and joins the citers of a shared work', async () => {
+    const work = (id: string, title: string, citers: string[]) => ({
+      work_id: `oa:${id}`,
+      doi: `10.9/${id}`,
+      title,
+      year: 1995,
+      first_author: 'Alan Burns',
+      venue: 'JGR',
+      cited_by_count: 220,
+      n_library_citers: 21,
+      also_cited_by: citers.map((c) => struct(`10.1/${c}`, `Citer ${c}`))
+    })
+    answers['/graph/papers/outside'] = byPaper({
+      '10.1/p': { paper: struct('10.1/p', 'P'), total: 13, works: [work('w1', 'Shared work', ['c'])] },
+      '10.1/q': { paper: struct('10.1/q', 'Q'), total: 2, works: [work('w1', 'Shared work', ['c', 'd']), work('w2', 'Other work', [])] }
+    })
+    renderWithProviders(<OutsidePanel papers={PAPERS} onOpen={() => {}} />)
+
+    await screen.findByRole('link', { name: 'Other work' })
+    expect(requests.map(asked).sort()).toEqual([['10.1/p'], ['10.1/q']])
+    expect(screen.getAllByRole('link', { name: 'Shared work' })).toHaveLength(1)
+    expect(screen.getAllByRole('button', { name: 'Author c' })).toHaveLength(1)
+    expect(screen.getByRole('button', { name: 'Author d' })).toBeTruthy()
+    expect(screen.getByText('Showing 2 of 15 works cited by this paper and by other library papers')).toBeTruthy()
   })
 })

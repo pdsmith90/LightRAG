@@ -4,7 +4,7 @@ import { SigmaContainer, useRegisterEvents, useSetSettings, useSigma } from '@re
 import { EdgeRectangleProgram, NodeCircleProgram } from 'sigma/rendering'
 import type { Settings as SigmaSettings } from 'sigma/settings'
 import type { AbstractGraph } from 'graphology-types'
-import { CircleDot, Orbit } from 'lucide-react'
+import { Check, CircleDot, Orbit, Plus } from 'lucide-react'
 
 import { queryPaperMap } from '@/api/lightrag'
 import Button from '@/components/ui/Button'
@@ -104,23 +104,23 @@ const MapController = ({
   return null
 }
 
-// The papers around one paper over citations and coupling (the server's paper map), on a canvas
-// of its own: a click on a paper or a link says what it is and offers to open that paper or
-// read the sentences of that citation.
+// The papers around the chosen papers over citations and coupling (the server's paper map), on a
+// canvas of its own: a click on a paper or a link says what it is and offers to add that paper to
+// the chosen ones (or take it out) or read the sentences of that citation.
 const PaperMap = ({
-  paper,
-  onOpenPaper,
+  papers,
+  onTogglePaper,
   onPickCitation
 }: {
-  paper: string
-  onOpenPaper: (id: string) => void
+  papers: string[]
+  onTogglePaper: (id: string, keys: string[]) => void
   onPickCitation: (pair: CitationPair) => void
 }) => {
   const { t } = useTranslation()
   const isDarkMode = useIsDarkMode()
   const [hops, setHops] = useState<MapHops>(readMapHops)
   const [limit, setLimit] = useState(MAP_DEFAULT_LIMIT)
-  const load = useCallback(() => queryPaperMap([paper], hops, limit), [paper, hops, limit])
+  const load = useCallback(() => queryPaperMap(papers, hops, limit), [papers, hops, limit])
   const { data, error, loading } = useFetched(load)
   const built = useMemo(() => (data?.nodes?.length ? buildPaperMapGraph(data) : null), [data])
   const [picked, setPicked] = useState<Selection | null>(null)
@@ -151,6 +151,12 @@ const PaperMap = ({
   const nodeName = (id: string) => data?.nodes.find((n) => n.id === id)?.labels?.[0] ?? id
   const structId = (id: string) =>
     (data?.nodes.find((n) => n.id === id)?.properties?.paper_id as string | undefined) ?? id
+  // A chosen paper may be named by its DOI or by a key: the node's other ids say which it is.
+  const togglePaper = (id: string) => {
+    const info = data?.nodes.find((n) => n.id === id)?.properties ?? {}
+    const keys = [id, info.doi, info.attachment_key, ...(info.attachment_keys ?? [])]
+    onTogglePaper(structId(id), keys.filter((key): key is string => typeof key === 'string' && !!key))
+  }
 
   const message = error
     ? t('citationGraph.error', { message: error instanceof Error ? error.message : String(error) })
@@ -167,7 +173,9 @@ const PaperMap = ({
       <div className="flex flex-wrap items-center gap-2 border-b px-3 py-2">
         <div className="min-w-0 flex-1">
           <div className="truncate text-sm font-medium" title={summary?.title}>
-            {summary?.citation || summary?.title || paper}
+            {summary?.papers && summary.papers.length > 1
+              ? summary.papers.map((p) => p.citation || p.paper).join(' · ')
+              : summary?.citation || summary?.title || papers[0]}
           </div>
           <div className="text-muted-foreground truncate text-xs" role="status">
             {loading ? t('citationGraph.loading') : message}
@@ -233,16 +241,16 @@ const PaperMap = ({
                 {node.properties?.tldr && (
                   <p className="text-muted-foreground text-xs">{node.properties.tldr}</p>
                 )}
-                {node.properties?.hop !== 0 && (
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="mt-1 w-fit"
-                    onClick={() => onOpenPaper(structId(node.id))}
-                  >
-                    {t('citationGraph.openPaper')}
-                  </Button>
-                )}
+                <Button
+                  variant={node.properties?.hop === 0 ? 'secondary' : 'outline'}
+                  size="sm"
+                  className="mt-1 h-6 w-fit gap-1 px-2 text-xs"
+                  aria-pressed={node.properties?.hop === 0}
+                  onClick={() => togglePaper(node.id)}
+                >
+                  {node.properties?.hop === 0 ? <Check className="size-3" /> : <Plus className="size-3" />}
+                  {t(node.properties?.hop === 0 ? 'citationGraph.chosen' : 'citationGraph.notChosen')}
+                </Button>
               </>
             )}
             {edge && link && names && (

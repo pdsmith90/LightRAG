@@ -1,10 +1,18 @@
 import { useCallback, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
-import { getRelatedPapers, type PaperRelation, type RelatedPaper } from '@/api/lightrag'
+import { getRelatedPapers, type PaperRelation } from '@/api/lightrag'
 import Badge from '@/components/ui/Badge'
 import Button from '@/components/ui/Button'
-import { RELATION_FILTERS, type CitationPair } from '@/lib/citationGraph'
+import {
+  fannedMissing,
+  fannedReason,
+  fanOut,
+  mergeRelated,
+  RELATION_FILTERS,
+  type CitationPair,
+  type RelatedFrom
+} from '@/lib/citationGraph'
 import PanelBody from './PanelBody'
 import PaperRow from './PaperRow'
 import { useFetched } from './useFetched'
@@ -12,28 +20,38 @@ import { useFetched } from './useFetched'
 const LIMIT = 30
 
 // The papers one paper cites or is cited by, shares references or authors with, one relation
-// at a time. A reference or a citing paper whose sentences are stored can open them.
+// at a time. A reference or a citing paper whose sentences are stored can open them. Several
+// papers: the papers related to any of them.
 const RelatedPanel = ({
-  paper,
+  papers,
   onOpen,
   onPickCitation
 }: {
-  paper: string
+  papers: string[]
   onOpen: (id: string) => void
   onPickCitation: (pair: CitationPair) => void
 }) => {
   const { t } = useTranslation()
   const [relation, setRelation] = useState<PaperRelation>('cites')
-  const load = useCallback(() => getRelatedPapers(paper, [relation], LIMIT), [paper, relation])
+  const load = useCallback(
+    () => fanOut(papers, (paper) => getRelatedPapers(paper, [relation], LIMIT)),
+    [papers, relation]
+  )
   const { data, error, loading } = useFetched(load)
+  const related = data ? mergeRelated(data) : []
+  const total =
+    data?.answers.reduce(
+      (sum, { answer }) => sum + (answer.totals?.[relation] ?? answer.related?.length ?? 0),
+      0
+    ) ?? 0
 
-  const detail = (item: RelatedPaper) => {
+  const detail = (item: RelatedFrom) => {
     const facts = item.citation
     const pair =
       relation === 'cites'
-        ? { citing: paper, cited: item.paper_id }
+        ? { citing: item.source, cited: item.paper_id }
         : relation === 'cited_by'
-          ? { citing: item.paper_id, cited: paper }
+          ? { citing: item.paper_id, cited: item.source }
           : null
     return (
       <div className="flex flex-wrap items-center gap-1 text-xs">
@@ -82,18 +100,23 @@ const RelatedPanel = ({
           </Button>
         ))}
       </div>
-      <PanelBody loading={loading} error={error} reason={data?.reason}>
+      <PanelBody
+        loading={loading}
+        error={error}
+        reason={fannedReason(data)}
+        missing={data ? { count: fannedMissing(data), total: data.total } : undefined}
+      >
         {data && (
           <>
             <p className="text-muted-foreground px-3 pb-1 text-xs">
               {t('citationGraph.related.count', {
-                shown: data.related?.length ?? 0,
-                total: data.totals?.[relation] ?? data.related?.length ?? 0
+                shown: related.length,
+                total: Math.max(total, related.length)
               })}
             </p>
-            {data.related?.length ? (
+            {related.length ? (
               <ul>
-                {data.related.map((item) => (
+                {related.map((item) => (
                   <PaperRow key={item.paper_id} paper={item} onOpen={onOpen}>
                     {detail(item)}
                   </PaperRow>

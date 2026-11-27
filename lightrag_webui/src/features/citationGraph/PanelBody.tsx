@@ -4,16 +4,19 @@ import { useTranslation } from 'react-i18next'
 import { isPaperMapUnavailable } from '@/lib/paperFilter'
 
 // What a panel shows instead of its list while the request runs, after it fails, or when the
-// server answers with a `reason` (an unknown paper, no embeddings, ...).
+// server answers with a `reason` (an unknown paper, no embeddings, ...). `missing` is how many
+// of the chosen papers gave nothing while the others did: a note above the list.
 const PanelBody = ({
   loading,
   error,
   reason,
+  missing,
   children
 }: {
   loading: boolean
   error: unknown
   reason?: string
+  missing?: { count: number; total: number }
   children: ReactNode
 }) => {
   const { t } = useTranslation()
@@ -34,7 +37,16 @@ const PanelBody = ({
       </p>
     )
   }
-  return <>{children}</>
+  return (
+    <>
+      {!!missing?.count && (
+        <p className="text-muted-foreground px-3 pt-2 text-xs" role="status">
+          {t('citationGraph.missing', missing)}
+        </p>
+      )}
+      {children}
+    </>
+  )
 }
 
 export default PanelBody

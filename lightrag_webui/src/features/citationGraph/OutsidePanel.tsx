@@ -2,28 +2,36 @@ import { useCallback } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { getOutsideWorks } from '@/api/lightrag'
-import { paperTitle } from '@/lib/citationGraph'
+import { fannedMissing, fannedReason, fanOut, mergeOutside, paperTitle } from '@/lib/citationGraph'
 import PanelBody from './PanelBody'
 import { useFetched } from './useFetched'
 
 const LIMIT = 30
 
 // The works one paper cites that the library does not hold and at least two library papers
-// cite, most cited by the library first, with some of the library papers that cite them.
-const OutsidePanel = ({ paper, onOpen }: { paper: string; onOpen: (id: string) => void }) => {
+// cite, most cited by the library first, with some of the library papers that cite them. Several
+// papers: the works any of them cites.
+const OutsidePanel = ({ papers, onOpen }: { papers: string[]; onOpen: (id: string) => void }) => {
   const { t } = useTranslation()
-  const load = useCallback(() => getOutsideWorks(paper, LIMIT), [paper])
+  const load = useCallback(() => fanOut(papers, (paper) => getOutsideWorks(paper, LIMIT)), [papers])
   const { data, error, loading } = useFetched(load)
+  const works = data ? mergeOutside(data) : []
+  const total = data?.answers.reduce((sum, { answer }) => sum + (answer.total ?? answer.works?.length ?? 0), 0) ?? 0
 
   return (
-    <PanelBody loading={loading} error={error} reason={data?.reason}>
-      {data?.works?.length ? (
+    <PanelBody
+      loading={loading}
+      error={error}
+      reason={fannedReason(data)}
+      missing={data ? { count: fannedMissing(data), total: data.total } : undefined}
+    >
+      {works.length ? (
         <>
           <p className="text-muted-foreground px-3 py-2 text-xs">
-            {t('citationGraph.outside.count', { shown: data.works.length, total: data.total ?? data.works.length })}
+            {t('citationGraph.outside.count', { shown: works.length, total: Math.max(total, works.length) })}
           </p>
           <ul>
-            {data.works.map((work) => (
+            {works.map((work) => (
               <li key={work.work_id} className="border-border/60 flex flex-col gap-1 border-b px-3 py-2">
                 {work.doi ? (
                   <a
