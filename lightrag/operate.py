@@ -108,6 +108,7 @@ from lightrag.kg_contract import (
 from lightrag.prompt import PROMPTS, resolve_entity_extraction_prompt_profile
 from lightrag.constants import (
     GRAPH_FIELD_SEP,
+    DEFAULT_KG_REBUILD_WINDOW_CHUNKS,
     DEFAULT_MAX_ENTITY_TOKENS,
     DEFAULT_MAX_EXTRACT_INPUT_TOKENS,
     DEFAULT_MAX_SECTION_CONTEXT_TOKENS,
@@ -1454,6 +1455,52 @@ async def _merge_extraction_pass(
         await _cooperative_yield(i, every=8)
 
 
+def _split_rebuild_windows(
+    entities_to_rebuild: dict[str, list[str]],
+    relationships_to_rebuild: dict[tuple[str, str], list[str]],
+    window_chunks: int,
+) -> list[tuple[dict[str, list[str]], dict[tuple[str, str], list[str]]]]:
+    """Fork: split the objects of a rebuild into windows of bounded referenced chunks.
+
+    Entities, then relationships, are taken in order into the current window until
+    adding the next one would take the union of the chunks the window references past
+    ``window_chunks``; that object starts the next window. An object is never split
+    (a rebuild reads all of its chunks), so one with more chunks than the bound is a
+    window of its own. A bound of 0 or less keeps everything in one window.
+    """
+    if window_chunks <= 0:
+        return [(entities_to_rebuild, relationships_to_rebuild)]
+    windows: list[tuple[dict, dict]] = []
+    win_entities: dict = {}
+    win_relationships: dict = {}
+    win_chunks: set[str] = set()
+
+    def _close() -> None:
+        nonlocal win_entities, win_relationships, win_chunks
+        windows.append((win_entities, win_relationships))
+        win_entities, win_relationships, win_chunks = {}, {}, set()
+
+    def _fits(chunk_ids: list[str]) -> bool:
+        return (
+            not (win_entities or win_relationships)
+            or len(win_chunks) + len({c for c in chunk_ids if c not in win_chunks})
+            <= window_chunks
+        )
+
+    for name, chunk_ids in entities_to_rebuild.items():
+        if not _fits(chunk_ids):
+            _close()
+        win_entities[name] = chunk_ids
+        win_chunks.update(chunk_ids)
+    for key, chunk_ids in relationships_to_rebuild.items():
+        if not _fits(chunk_ids):
+            _close()
+        win_relationships[key] = chunk_ids
+        win_chunks.update(chunk_ids)
+    _close()
+    return windows
+
+
 async def rebuild_knowledge_from_chunks(
     entities_to_rebuild: dict[str, list[str]],
     relationships_to_rebuild: dict[tuple[str, str], list[str]],
@@ -1514,163 +1561,29 @@ async def rebuild_knowledge_from_chunks(
     # success/completion detail goes to the backend log only (volume control).
     status_logger = PipelineStatusLogger(pipeline_status)
 
-    # Get all referenced chunk IDs
-    all_referenced_chunk_ids = set()
+    # Fork (windowed rebuild): the objects are rebuilt in windows of at most
+    # ``kg_rebuild_window_chunks`` referenced chunks (union over the window's
+    # objects), each window loading, rebuilding and releasing its own chunks, so a
+    # deletion that touches a large part of the corpus never holds it in memory at
+    # once. ``report.referenced_chunk_ids`` is the union over all windows.
+    windows = _split_rebuild_windows(
+        entities_to_rebuild,
+        relationships_to_rebuild,
+        int(
+            global_config.get(
+                "kg_rebuild_window_chunks", DEFAULT_KG_REBUILD_WINDOW_CHUNKS
+            )
+        ),
+    )
     for chunk_ids in entities_to_rebuild.values():
-        all_referenced_chunk_ids.update(chunk_ids)
+        report.referenced_chunk_ids.update(chunk_ids)
     for chunk_ids in relationships_to_rebuild.values():
-        all_referenced_chunk_ids.update(chunk_ids)
-    report.referenced_chunk_ids.update(all_referenced_chunk_ids)
+        report.referenced_chunk_ids.update(chunk_ids)
 
-    status_message = f"Rebuilding knowledge from {len(all_referenced_chunk_ids)} cached chunk extractions (parallel processing)"
-    logger.info(status_message)
-    if pipeline_status is not None and pipeline_status_lock is not None:
-        async with pipeline_status_lock:
-            pipeline_status["latest_message"] = status_message
-            append_pipeline_history(pipeline_status, status_message)
-
-    # Get cached extraction results for these chunks using storage
-    # cached_results： chunk_id -> [list of (extraction_result, create_time) from LLM cache sorted by create_time of the first extraction_result]
-    cached_results, chunk_data_by_id = await _get_cached_extraction_results(
-        llm_response_cache,
-        all_referenced_chunk_ids,
-        text_chunks_storage=text_chunks_storage,
-    )
-    # Fork (extraction contract): a chunk extracted with the contract or an
-    # extraction hook carries the records that extraction accepted
-    # (kg_contract.accepted_records). They are what its extraction handed the
-    # merge, so the rebuild reads them and re-runs none of the post-processing:
-    # whatever the configuration is now, such a chunk contributes what it
-    # contributed then. A chunk without them (extracted with neither) is
-    # re-parsed from its cached LLM output below, which is all its extraction
-    # did. Its cache is then not needed.
-    stored_records = await read_chunk_kg_records(
-        text_chunks_storage, all_referenced_chunk_ids, chunk_data_by_id
-    )
-
-    missing_chunk_ids = (
-        all_referenced_chunk_ids - set(cached_results.keys()) - set(stored_records)
-    )
-    report.missing_cache_chunk_ids.update(missing_chunk_ids)
-    if missing_chunk_ids:
-        status_message = (
-            f"Extraction cache missing for {len(missing_chunk_ids)} of "
-            f"{len(all_referenced_chunk_ids)} referenced chunk(s); "
-            "rebuild may use structural fallback"
-        )
-        logger.warning(status_message)
-        if pipeline_status is not None and pipeline_status_lock is not None:
-            async with pipeline_status_lock:
-                pipeline_status["latest_message"] = status_message
-                append_pipeline_history(pipeline_status, status_message)
-
-    if not cached_results and not stored_records:
-        status_message = "No cached extraction results found"
-        logger.warning(status_message)
-        if pipeline_status is not None and pipeline_status_lock is not None:
-            async with pipeline_status_lock:
-                pipeline_status["latest_message"] = status_message
-                append_pipeline_history(pipeline_status, status_message)
-        if rebuild_policy == "best_effort":
-            return report
-
-    # Process cached results to get entities and relationships for each chunk
-    chunk_entities = {}  # chunk_id -> {entity_name: [entity_data]}
-    chunk_relationships = {}  # chunk_id -> {(src, tgt): [relationship_data]}
-
-    for chunk_id, stored in stored_records.items():
-        try:
-            entities, relationships = chunk_result_from_records(stored)
-        except Exception as e:
-            report.unusable_cache_chunk_ids.add(chunk_id)
-            status_message = (
-                f"Failed to read the stored extraction records of chunk {chunk_id}: {e}"
-            )
-            logger.warning(status_message)
-            status_logger.log(status_message)
-            continue
-        # Fork (ENTITY_NAME_FOLD): stored under the names the merge used, after
-        # the fold, so they are filed as stored; the fold map in force now is
-        # not consulted for this chunk.
-        chunk_entities[chunk_id] = entities
-        chunk_relationships[chunk_id] = relationships
-
-    for chunk_id, results in cached_results.items():
-        if chunk_id in stored_records:
-            continue
-        try:
-            # Handle multiple extraction results per chunk
-            chunk_entities[chunk_id] = defaultdict(list)
-            chunk_relationships[chunk_id] = defaultdict(list)
-
-            # process multiple LLM extraction results for a single chunk_id
-            for result in results:
-                entities, relationships = await _rebuild_from_extraction_result(
-                    text_chunks_storage=text_chunks_storage,
-                    chunk_id=chunk_id,
-                    extraction_result=result[0],
-                    timestamp=result[1],
-                    chunk_data=chunk_data_by_id.get(chunk_id),
-                )
-                # Fork (ENTITY_NAME_FOLD): cached results carry the spelling the
-                # LLM wrote; file them under the canonical name as well.
-                entities, relationships = alias_chunk_result(entities, relationships)
-
-                # Merge entities and relationships from this extraction result
-                # Compare description lengths and keep the better version for the same chunk_id
-                for entity_name, entity_list in entities.items():
-                    if entity_name not in chunk_entities[chunk_id]:
-                        # New entity for this chunk_id
-                        chunk_entities[chunk_id][entity_name].extend(entity_list)
-                    elif len(chunk_entities[chunk_id][entity_name]) == 0:
-                        # Empty list, add the new entities
-                        chunk_entities[chunk_id][entity_name].extend(entity_list)
-                    else:
-                        # Compare description lengths and keep the better one
-                        existing_desc_len = len(
-                            chunk_entities[chunk_id][entity_name][0].get(
-                                "description", ""
-                            )
-                            or ""
-                        )
-                        new_desc_len = len(entity_list[0].get("description", "") or "")
-
-                        if new_desc_len > existing_desc_len:
-                            # Replace with the new entity that has longer description
-                            chunk_entities[chunk_id][entity_name] = list(entity_list)
-                        # Otherwise keep existing version
-
-                # Compare description lengths and keep the better version for the same chunk_id
-                for rel_key, rel_list in relationships.items():
-                    if rel_key not in chunk_relationships[chunk_id]:
-                        # New relationship for this chunk_id
-                        chunk_relationships[chunk_id][rel_key].extend(rel_list)
-                    elif len(chunk_relationships[chunk_id][rel_key]) == 0:
-                        # Empty list, add the new relationships
-                        chunk_relationships[chunk_id][rel_key].extend(rel_list)
-                    else:
-                        # Compare description lengths and keep the better one
-                        existing_desc_len = len(
-                            chunk_relationships[chunk_id][rel_key][0].get(
-                                "description", ""
-                            )
-                            or ""
-                        )
-                        new_desc_len = len(rel_list[0].get("description", "") or "")
-
-                        if new_desc_len > existing_desc_len:
-                            # Replace with the new relationship that has longer description
-                            chunk_relationships[chunk_id][rel_key] = list(rel_list)
-                        # Otherwise keep existing version
-
-        except Exception as e:
-            report.unusable_cache_chunk_ids.add(chunk_id)
-            status_message = (
-                f"Failed to parse cached extraction result for chunk {chunk_id}: {e}"
-            )
-            logger.warning(status_message)
-            status_logger.log(status_message)
-            continue
+    # What the rebuild of the current window reads (set per window below).
+    chunk_entities: dict = {}  # chunk_id -> {entity_name: [entity_data]}
+    chunk_relationships: dict = {}  # chunk_id -> {(src, tgt): [relationship_data]}
+    chunk_data_by_id: dict = {}
 
     # Get max async tasks limit from global_config for semaphore control
     graph_max_async = global_config.get("llm_model_max_async", 4) * 2
@@ -1762,31 +1675,222 @@ async def rebuild_knowledge_from_chunks(
                         # retain the custom-chunk journal.
                         raise
 
-    # Create tasks for parallel processing
-    tasks = []
+    async def _rebuild_window(win_entities, win_relationships, window_suffix):
+        # Create tasks for parallel processing
+        tasks = []
 
-    # Add entity rebuilding tasks
-    for entity_name, chunk_ids in entities_to_rebuild.items():
-        task = asyncio.create_task(_locked_rebuild_entity(entity_name, chunk_ids))
-        tasks.append(task)
+        # Add entity rebuilding tasks
+        for entity_name, chunk_ids in win_entities.items():
+            task = asyncio.create_task(_locked_rebuild_entity(entity_name, chunk_ids))
+            tasks.append(task)
 
-    # Add relationship rebuilding tasks
-    for (src, tgt), chunk_ids in relationships_to_rebuild.items():
-        task = asyncio.create_task(_locked_rebuild_relationship(src, tgt, chunk_ids))
-        tasks.append(task)
+        # Add relationship rebuilding tasks
+        for (src, tgt), chunk_ids in win_relationships.items():
+            task = asyncio.create_task(
+                _locked_rebuild_relationship(src, tgt, chunk_ids)
+            )
+            tasks.append(task)
 
-    # Log parallel processing start
-    status_message = f"Starting parallel rebuild of {len(entities_to_rebuild)} entities and {len(relationships_to_rebuild)} relationships (async: {graph_max_async})"
-    logger.info(status_message)
-    if pipeline_status is not None and pipeline_status_lock is not None:
-        async with pipeline_status_lock:
-            pipeline_status["latest_message"] = status_message
-            append_pipeline_history(pipeline_status, status_message)
+        # Log parallel processing start
+        status_message = f"Starting parallel rebuild of {len(win_entities)} entities and {len(win_relationships)} relationships (async: {graph_max_async}){window_suffix}"
+        logger.info(status_message)
+        if pipeline_status is not None and pipeline_status_lock is not None:
+            async with pipeline_status_lock:
+                pipeline_status["latest_message"] = status_message
+                append_pipeline_history(pipeline_status, status_message)
 
-    # Execute all tasks in parallel with semaphore control; on any failure
-    # every sibling is cancelled and drained before the first exception
-    # propagates (no background rebuild writes survive failure handling).
-    await wait_tasks_with_drain(tasks, context="KG rebuild")
+        # Execute all tasks in parallel with semaphore control; on any failure
+        # every sibling is cancelled and drained before the first exception
+        # propagates (no background rebuild writes survive failure handling).
+        await wait_tasks_with_drain(tasks, context="KG rebuild")
+
+    # Windows whose chunks have no cached extraction at all (best_effort): rebuilt
+    # only if another window had some, as one rebuild over the whole set was.
+    empty_windows: list = []
+    any_results = False
+    for window_index, (win_entities, win_relationships) in enumerate(windows, start=1):
+        window_suffix = (
+            f" (window {window_index} of {len(windows)})" if len(windows) > 1 else ""
+        )
+        # Fork (windowed rebuild): only this window's chunks are loaded.
+        all_referenced_chunk_ids = set()
+        for chunk_ids in win_entities.values():
+            all_referenced_chunk_ids.update(chunk_ids)
+        for chunk_ids in win_relationships.values():
+            all_referenced_chunk_ids.update(chunk_ids)
+
+        status_message = f"Rebuilding knowledge from {len(all_referenced_chunk_ids)} cached chunk extractions (parallel processing){window_suffix}"
+        logger.info(status_message)
+        if pipeline_status is not None and pipeline_status_lock is not None:
+            async with pipeline_status_lock:
+                pipeline_status["latest_message"] = status_message
+                append_pipeline_history(pipeline_status, status_message)
+
+        # Get cached extraction results for these chunks using storage
+        # cached_results： chunk_id -> [list of (extraction_result, create_time) from LLM cache sorted by create_time of the first extraction_result]
+        cached_results, chunk_data_by_id = await _get_cached_extraction_results(
+            llm_response_cache,
+            all_referenced_chunk_ids,
+            text_chunks_storage=text_chunks_storage,
+        )
+        # Fork (extraction contract): a chunk extracted with the contract or an
+        # extraction hook carries the records that extraction accepted
+        # (kg_contract.accepted_records). They are what its extraction handed the
+        # merge, so the rebuild reads them and re-runs none of the post-processing:
+        # whatever the configuration is now, such a chunk contributes what it
+        # contributed then. A chunk without them (extracted with neither) is
+        # re-parsed from its cached LLM output below, which is all its extraction
+        # did. Its cache is then not needed.
+        stored_records = await read_chunk_kg_records(
+            text_chunks_storage, all_referenced_chunk_ids, chunk_data_by_id
+        )
+
+        missing_chunk_ids = (
+            all_referenced_chunk_ids - set(cached_results.keys()) - set(stored_records)
+        )
+        report.missing_cache_chunk_ids.update(missing_chunk_ids)
+        if missing_chunk_ids:
+            status_message = (
+                f"Extraction cache missing for {len(missing_chunk_ids)} of "
+                f"{len(all_referenced_chunk_ids)} referenced chunk(s); "
+                "rebuild may use structural fallback"
+            )
+            logger.warning(status_message)
+            if pipeline_status is not None and pipeline_status_lock is not None:
+                async with pipeline_status_lock:
+                    pipeline_status["latest_message"] = status_message
+                    append_pipeline_history(pipeline_status, status_message)
+
+        if not cached_results and not stored_records:
+            status_message = "No cached extraction results found"
+            logger.warning(status_message)
+            if pipeline_status is not None and pipeline_status_lock is not None:
+                async with pipeline_status_lock:
+                    pipeline_status["latest_message"] = status_message
+                    append_pipeline_history(pipeline_status, status_message)
+            if rebuild_policy == "best_effort":
+                # Nothing to rebuild this window from; whether it is rebuilt at all
+                # depends on the other windows (see below).
+                empty_windows.append((win_entities, win_relationships))
+                continue
+
+        # Process cached results to get entities and relationships for each chunk
+        chunk_entities = {}  # chunk_id -> {entity_name: [entity_data]}
+        chunk_relationships = {}  # chunk_id -> {(src, tgt): [relationship_data]}
+
+        for chunk_id, stored in stored_records.items():
+            try:
+                entities, relationships = chunk_result_from_records(stored)
+            except Exception as e:
+                report.unusable_cache_chunk_ids.add(chunk_id)
+                status_message = f"Failed to read the stored extraction records of chunk {chunk_id}: {e}"
+                logger.warning(status_message)
+                status_logger.log(status_message)
+                continue
+            # Fork (ENTITY_NAME_FOLD): stored under the names the merge used, after
+            # the fold, so they are filed as stored; the fold map in force now is
+            # not consulted for this chunk.
+            chunk_entities[chunk_id] = entities
+            chunk_relationships[chunk_id] = relationships
+
+        for chunk_id, results in cached_results.items():
+            if chunk_id in stored_records:
+                continue
+            try:
+                # Handle multiple extraction results per chunk
+                chunk_entities[chunk_id] = defaultdict(list)
+                chunk_relationships[chunk_id] = defaultdict(list)
+
+                # process multiple LLM extraction results for a single chunk_id
+                for result in results:
+                    entities, relationships = await _rebuild_from_extraction_result(
+                        text_chunks_storage=text_chunks_storage,
+                        chunk_id=chunk_id,
+                        extraction_result=result[0],
+                        timestamp=result[1],
+                        chunk_data=chunk_data_by_id.get(chunk_id),
+                    )
+                    # Fork (ENTITY_NAME_FOLD): cached results carry the spelling the
+                    # LLM wrote; file them under the canonical name as well.
+                    entities, relationships = alias_chunk_result(
+                        entities, relationships
+                    )
+
+                    # Merge entities and relationships from this extraction result
+                    # Compare description lengths and keep the better version for the same chunk_id
+                    for entity_name, entity_list in entities.items():
+                        if entity_name not in chunk_entities[chunk_id]:
+                            # New entity for this chunk_id
+                            chunk_entities[chunk_id][entity_name].extend(entity_list)
+                        elif len(chunk_entities[chunk_id][entity_name]) == 0:
+                            # Empty list, add the new entities
+                            chunk_entities[chunk_id][entity_name].extend(entity_list)
+                        else:
+                            # Compare description lengths and keep the better one
+                            existing_desc_len = len(
+                                chunk_entities[chunk_id][entity_name][0].get(
+                                    "description", ""
+                                )
+                                or ""
+                            )
+                            new_desc_len = len(
+                                entity_list[0].get("description", "") or ""
+                            )
+
+                            if new_desc_len > existing_desc_len:
+                                # Replace with the new entity that has longer description
+                                chunk_entities[chunk_id][entity_name] = list(
+                                    entity_list
+                                )
+                            # Otherwise keep existing version
+
+                    # Compare description lengths and keep the better version for the same chunk_id
+                    for rel_key, rel_list in relationships.items():
+                        if rel_key not in chunk_relationships[chunk_id]:
+                            # New relationship for this chunk_id
+                            chunk_relationships[chunk_id][rel_key].extend(rel_list)
+                        elif len(chunk_relationships[chunk_id][rel_key]) == 0:
+                            # Empty list, add the new relationships
+                            chunk_relationships[chunk_id][rel_key].extend(rel_list)
+                        else:
+                            # Compare description lengths and keep the better one
+                            existing_desc_len = len(
+                                chunk_relationships[chunk_id][rel_key][0].get(
+                                    "description", ""
+                                )
+                                or ""
+                            )
+                            new_desc_len = len(rel_list[0].get("description", "") or "")
+
+                            if new_desc_len > existing_desc_len:
+                                # Replace with the new relationship that has longer description
+                                chunk_relationships[chunk_id][rel_key] = list(rel_list)
+                            # Otherwise keep existing version
+
+            except Exception as e:
+                report.unusable_cache_chunk_ids.add(chunk_id)
+                status_message = f"Failed to parse cached extraction result for chunk {chunk_id}: {e}"
+                logger.warning(status_message)
+                status_logger.log(status_message)
+                continue
+
+        any_results = True
+        await _rebuild_window(win_entities, win_relationships, window_suffix)
+        if len(windows) > 1:
+            # Bound what is buffered: the vector writes of this window go out now
+            # (a flush keeps its buffer if it fails; the caller's flush stays as the
+            # idempotent last one).
+            await entities_vdb.index_done_callback()
+            await relationships_vdb.index_done_callback()
+        chunk_entities, chunk_relationships, chunk_data_by_id = {}, {}, {}
+        cached_results = stored_records = None
+
+    if empty_windows:
+        if not any_results:
+            return report
+        for win_entities, win_relationships in empty_windows:
+            chunk_entities, chunk_relationships, chunk_data_by_id = {}, {}, {}
+            await _rebuild_window(win_entities, win_relationships, "")
 
     # Final status report
     status_message = f"KG rebuild completed: {rebuilt_entities_count} entities and {rebuilt_relationships_count} relationships rebuilt successfully."

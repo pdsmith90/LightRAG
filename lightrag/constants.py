@@ -41,6 +41,9 @@ DEFAULT_SUMMARY_MAX_TOKENS = 1200
 DEFAULT_SUMMARY_LENGTH_RECOMMENDED = 600
 # Maximum token size sent to LLM for summary
 DEFAULT_SUMMARY_CONTEXT_SIZE = 12000
+# Fork: most referenced chunks one window of a knowledge-graph rebuild holds in memory at
+# once (their texts and cached extractions are loaded, rebuilt and released window by window)
+DEFAULT_KG_REBUILD_WINDOW_CHUNKS = 25000
 # Maximum token size allowed for entity extraction input context
 DEFAULT_MAX_EXTRACT_INPUT_TOKENS = 20480
 # Maximum token size for the per-chunk `---Section Context---` heading

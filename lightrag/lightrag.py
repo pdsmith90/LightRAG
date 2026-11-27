@@ -78,6 +78,7 @@ from lightrag.constants import (
     DEFAULT_SUMMARY_MAX_TOKENS,
     DEFAULT_SUMMARY_CONTEXT_SIZE,
     DEFAULT_SUMMARY_LENGTH_RECOMMENDED,
+    DEFAULT_KG_REBUILD_WINDOW_CHUNKS,
     DEFAULT_MAX_ASYNC,
     DEFAULT_MAX_PARALLEL_INSERT,
     DEFAULT_MAX_GRAPH_NODES,
@@ -1707,6 +1708,14 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
     ``ENTITY_NAME_FOLD``; a deployment's exception lists and alias table are read
     from ``ENTITY_NAME_FOLD_LISTS`` and ``ENTITY_NAME_ALIASES`` when the map is built.
     """
+
+    kg_rebuild_window_chunks: int = field(
+        default=get_env_value(
+            "KG_REBUILD_WINDOW_CHUNKS", DEFAULT_KG_REBUILD_WINDOW_CHUNKS, int
+        )
+    )
+    """Fork: most referenced chunks a knowledge-graph rebuild (deletion, rollback) loads at
+    once; the entities and relations to rebuild are processed in windows of this many chunks."""
 
     def _mark_addon_params_dirty(self) -> None:
         self._addon_params_dirty = True
