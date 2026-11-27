@@ -5,7 +5,7 @@ These tests mock voyageai.AsyncClient so they run fully offline.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
 import pytest
@@ -60,6 +60,32 @@ async def test_voyageai_embed_passes_model(patched_async_client):
     assert out.shape[0] == 2
     assert len(captured) == 1
     assert captured[0]["model"] == "voyage-3-lite"
+
+
+@pytest.mark.parametrize(
+    ("base_url", "expected"),
+    [
+        (None, None),
+        ("  ", None),
+        ("DEFAULT_VOYAGEAI_ENDPOINT", None),
+        (" https://voyage-gw.example/v1 ", "https://voyage-gw.example/v1"),
+    ],
+    ids=["unset", "blank", "sentinel", "gateway"],
+)
+@pytest.mark.asyncio
+async def test_voyageai_embed_base_url_reaches_client(
+    patched_async_client, base_url, expected
+):
+    """An unset/sentinel endpoint must leave base_url to the SDK (it derives
+    the host from the key type); a real URL is passed through, stripped."""
+    _, client_cls = patched_async_client
+    from lightrag.llm.voyageai import voyageai_embed
+
+    await voyageai_embed.func(texts=["x"], api_key="fake", base_url=base_url)
+
+    client_kwargs = client_cls.call_args.kwargs
+    assert client_kwargs.get("base_url") == expected
+    assert ("base_url" in client_kwargs) == (expected is not None)
 
 
 @pytest.mark.asyncio
@@ -165,3 +191,23 @@ def test_anthropic_embed_deprecation_shim():
     assert any(issubclass(w.category, DeprecationWarning) for w in caught), (
         "anthropic_embed should warn DeprecationWarning"
     )
+
+
+@pytest.mark.asyncio
+async def test_voyageai_embed_reraises_original_error_after_retries(monkeypatch):
+    """Exhausted retries surface the provider's own error, not RetryError."""
+    from voyageai.error import RateLimitError
+
+    from lightrag.llm.voyageai import voyageai_embed
+
+    error = RateLimitError("rate limited, try again later")
+    fake_client = MagicMock()
+    fake_client.embed = AsyncMock(side_effect=error)
+    monkeypatch.setattr(voyageai_embed.func.retry, "sleep", AsyncMock())
+
+    with patch("lightrag.llm.voyageai.voyageai.AsyncClient", return_value=fake_client):
+        with pytest.raises(RateLimitError) as exc_info:
+            await voyageai_embed.func(["hello"], api_key="fake")
+
+    assert exc_info.value is error
+    assert fake_client.embed.await_count == 3

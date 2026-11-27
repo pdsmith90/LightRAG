@@ -181,6 +181,9 @@ async def test_decode_cursor_normalizes_timezone_aware_iso():
         '["not-a-date", "doc-1"]',
         '["2026-01-01T00:00:00", "a", "extra"]',
         "{}",
+        # A two-entry object unpacks to its two keys; an ISO-date first key
+        # would otherwise pass fromisoformat and mis-position the sweep.
+        '{"2026-01-01T00:00:00": "x", "doc-1": "y"}',
     ],
 )
 async def test_malformed_cursor_raises_control_plane_error(opaque):
@@ -300,6 +303,38 @@ async def test_deleting_public_pagination_keeps_parameterized_status_predicate()
     assert "status = ANY($2)" in sql
     assert params[1] == ["deleting"]
     assert "deleting" not in sql
+
+
+@pytest.mark.parametrize(
+    ("sort_field", "sort_direction", "inner", "outer"),
+    [
+        (
+            "updated_at",
+            "desc",
+            "ORDER BY updated_at DESC NULLS LAST, id DESC",
+            "ORDER BY p.updated_at DESC NULLS LAST, p.id DESC",
+        ),
+        (
+            "file_path",
+            "asc",
+            "ORDER BY file_path ASC NULLS LAST, id ASC",
+            "ORDER BY p.file_path ASC NULLS LAST, p.id ASC",
+        ),
+    ],
+)
+async def test_public_pagination_breaks_sort_ties_by_id(
+    sort_field, sort_direction, inner, outer
+):
+    """Rows tied on the sort field (one batch shares a timestamp) need a unique
+    key in both ORDER BYs, or LIMIT/OFFSET pages repeat and skip documents."""
+    db = _FakeDB(results=[[]])
+    storage = _storage(db)
+    await storage.get_docs_paginated(
+        sort_field=sort_field, sort_direction=sort_direction
+    )
+    sql = db.calls[0][0]
+    assert inner in sql
+    assert outer in sql
 
 
 async def test_page_sql_with_cursor():

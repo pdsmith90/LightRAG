@@ -45,6 +45,26 @@ def _load_jsonl(path: Path) -> tuple[dict, list[dict]]:
 
 
 @pytest.mark.offline
+@pytest.mark.parametrize("kind", ["TBL", "IMG", "EQ", "EQI"])
+def test_writer_preserves_undeclared_source_tokens(tmp_path: Path, kind: str) -> None:
+    content = f"Source example: {{{{{kind}:author_key}}}}"
+    ir = IRDoc(
+        document_name="literal.md",
+        document_format="md",
+        doc_title="literal",
+        split_option={},
+        blocks=[IRBlock(content_template=content)],
+    )
+    parsed = tmp_path / "literal.parsed"
+    write_sidecar(ir, parsed_dir=parsed, doc_id="doc-literal", engine="native")
+    _, rows = _load_jsonl(parsed / "literal.blocks.jsonl")
+    assert rows[0]["content"] == content
+    assert not any(parsed.glob("*.tables.json"))
+    assert not any(parsed.glob("*.drawings.json"))
+    assert not any(parsed.glob("*.equations.json"))
+
+
+@pytest.mark.offline
 def test_writer_empty_doc_emits_only_blocks_jsonl(tmp_path: Path) -> None:
     """Document with no blocks: only the meta line, no per-modality JSONs,
     no assets dir."""
@@ -449,27 +469,13 @@ def test_writer_positions_round_trip_bbox(tmp_path: Path) -> None:
 
 
 @pytest.mark.offline
-def test_position_origin_to_jsonable_omits_when_none() -> None:
-    """Spec §八 per-position origin: ``None`` ⇒ field absent (inherit from
-    meta ``bbox_attributes.origin``)."""
-    pos = IRPosition(type="bbox", anchor=1, range=[1.0, 2.0, 3.0, 4.0])
-    assert "origin" not in pos.to_jsonable()
-
-
-@pytest.mark.offline
-def test_position_origin_to_jsonable_emits_when_set() -> None:
-    """Spec §八 per-position origin: explicit value ⇒ override field in JSON."""
-    pos = IRPosition(
-        type="bbox", anchor=1, range=[1.0, 2.0, 3.0, 4.0], origin="LEFTTOP"
-    )
-    out = pos.to_jsonable()
-    assert out["origin"] == "LEFTTOP"
-
-
-@pytest.mark.offline
 def test_writer_position_origin_mixed_per_block(tmp_path: Path) -> None:
     """Docling mixed coord_origin scenario: doc-level origin in meta,
-    per-position override on the minority. Coordinates land verbatim."""
+    per-position override on the minority. Coordinates land verbatim.
+
+    Spec §八 per-position origin: ``None`` leaves the field absent (inherit
+    from meta ``bbox_attributes.origin``), an explicit value is written as
+    the override; both positions below pin one side each."""
     parsed = tmp_path / "mixed.parsed"
     ir = IRDoc(
         document_name="mixed.pdf",

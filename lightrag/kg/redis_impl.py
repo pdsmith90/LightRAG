@@ -25,6 +25,7 @@ from redis.exceptions import (  # type: ignore
 )
 from lightrag.utils import (
     logger,
+    get_env_value,
     get_pinyin_sort_key,
     _cooperative_yield,
     validate_workspace,
@@ -68,6 +69,26 @@ from tenacity import (
     retry_if_exception_type,
     before_sleep_log,
 )
+
+# SCAN/KEYS MATCH is a glob, and workspace names can contain * ? [ ]
+# (validate_workspace only checks path safety). Without escaping, workspace
+# "a*" would also match workspace "abc" and drop() would delete its keys.
+# A backslash cannot occur in a workspace name, so the escaping is unambiguous.
+#
+# Accepted residue: escaping does not make the prefixes disjoint. A workspace
+# literally named "<ws>_<namespace>:<rest>" has keys that start with
+# "<ws>_<namespace>:", so workspace <ws>'s patterns still reach them. Only
+# rejecting ":" in workspace names would close that, and it would strand the
+# data of existing workspaces that use one; such a name has to be built on
+# purpose, and the API server never produces one (it maps every character
+# outside [A-Za-z0-9_] to "_").
+_REDIS_GLOB_SPECIAL_RE = re.compile(r"([\\*?\[\]])")
+
+
+def _scan_match(prefix: str) -> str:
+    """Glob pattern matching every key that starts with ``prefix``."""
+    return _REDIS_GLOB_SPECIAL_RE.sub(r"\\\1", prefix) + "*"
+
 
 # Storage-managed ``create_time`` is serialized as the FIRST key of every KV
 # value so it can be recovered with a bounded prefix read instead of pulling
@@ -164,16 +185,23 @@ def _dumps_kv_payload(value: dict[str, Any]) -> str:
 config = configparser.ConfigParser()
 config.read("config.ini", "utf-8")
 
-# Constants for Redis connection pool with environment variable support
-MAX_CONNECTIONS = int(os.getenv("REDIS_MAX_CONNECTIONS", "200"))
-SOCKET_TIMEOUT = float(os.getenv("REDIS_SOCKET_TIMEOUT", "30.0"))
-SOCKET_CONNECT_TIMEOUT = float(os.getenv("REDIS_CONNECT_TIMEOUT", "10.0"))
-RETRY_ATTEMPTS = int(os.getenv("REDIS_RETRY_ATTEMPTS", "3"))
+# Constants for Redis connection pool with environment variable support.
+# Read through get_env_value like the LightRAG field defaults: these run at
+# import time, so a documented knob left present but empty in .env/Compose
+# would otherwise raise ValueError out of the storage module import.
+MAX_CONNECTIONS = get_env_value("REDIS_MAX_CONNECTIONS", 200, int)
+SOCKET_TIMEOUT = get_env_value("REDIS_SOCKET_TIMEOUT", 30.0, float)
+SOCKET_CONNECT_TIMEOUT = get_env_value("REDIS_CONNECT_TIMEOUT", 10.0, float)
+RETRY_ATTEMPTS = get_env_value("REDIS_RETRY_ATTEMPTS", 3, int)
 
 # Tenacity retry decorator for Redis operations
 redis_retry = retry(
     stop=stop_after_attempt(RETRY_ATTEMPTS),
     wait=wait_exponential(multiplier=1, min=1, max=8),
+    # Surface the last attempt's own exception rather than tenacity.RetryError,
+    # so callers can still catch redis.exceptions.RedisError / ConnectionError
+    # and error messages carry Redis's text.
+    reraise=True,
     retry=(
         retry_if_exception_type(ConnectionError)
         | retry_if_exception_type(TimeoutError)
@@ -237,7 +265,7 @@ async def _ensure_no_eviction_policy(redis, redis_url: str, workspace: str) -> N
     if maxmemory <= 0 or not policy.startswith("allkeys"):
         _eviction_checked.add(redis_url)
         return
-    if os.getenv("REDIS_ALLOW_EVICTION_POLICY", "false").strip().lower() == "true":
+    if get_env_value("REDIS_ALLOW_EVICTION_POLICY", False, bool):
         _eviction_checked.add(redis_url)
         logger.warning(
             f"[{workspace}] Redis is configured to EVICT (maxmemory-policy="
@@ -766,7 +794,7 @@ class RedisKVStorage(BaseKVStorage):
         Returns:
             bool: True if storage is empty, False otherwise
         """
-        pattern = f"{self.final_namespace}:*"
+        pattern = _scan_match(f"{self.final_namespace}:")
         try:
             async with self._get_redis_connection() as redis:
                 # Use scan to check if any keys exist
@@ -786,7 +814,7 @@ class RedisKVStorage(BaseKVStorage):
         the best-effort snapshot the base contract allows, and a caller that
         needs uniqueness de-duplicates on ``_id``.
         """
-        pattern = f"{self.final_namespace}:*"
+        pattern = _scan_match(f"{self.final_namespace}:")
         prefix_len = len(self.final_namespace) + 1
         page_size = max(1, int(page_size))
         async with self._get_redis_connection() as redis:
@@ -831,7 +859,7 @@ class RedisKVStorage(BaseKVStorage):
         async with self._get_redis_connection() as redis:
             try:
                 # Use SCAN to find all keys with the namespace prefix
-                pattern = f"{self.final_namespace}:*"
+                pattern = _scan_match(f"{self.final_namespace}:")
                 cursor = 0
                 deleted_count = 0
 
@@ -874,7 +902,7 @@ class RedisKVStorage(BaseKVStorage):
 
         async with self._get_redis_connection() as redis:
             # Get all keys for this namespace
-            keys = await redis.keys(f"{self.final_namespace}:*")
+            keys = await redis.keys(_scan_match(f"{self.final_namespace}:"))
 
             if not keys:
                 return
@@ -885,7 +913,7 @@ class RedisKVStorage(BaseKVStorage):
 
             for key in keys:
                 # Extract the ID part (after namespace:)
-                key_id = key.split(":", 1)[1]
+                key_id = key[len(self.final_namespace) + 1 :]
 
                 # Check if already in flattened format (contains exactly 2 colons for mode:cache_type:hash)
                 if ":" in key_id and len(key_id.split(":")) == 3:
@@ -1295,7 +1323,9 @@ class RedisDocStatusStorage(DocStatusStorage):
                 cursor = 0
                 while True:
                     cursor, keys = await redis.scan(
-                        cursor, match=f"{self.final_namespace}:*", count=1000
+                        cursor,
+                        match=_scan_match(f"{self.final_namespace}:"),
+                        count=1000,
                     )
                     if keys:
                         pipe = redis.pipeline()
@@ -1310,7 +1340,7 @@ class RedisDocStatusStorage(DocStatusStorage):
                                 doc_data = json.loads(value)
                                 if doc_data.get("status") not in status_values:
                                     continue
-                                doc_id = key.split(":", 1)[1]
+                                doc_id = key[len(self.final_namespace) + 1 :]
                                 result[doc_id] = (
                                     self._redis_doc_processing_status_from_data(
                                         doc_data
@@ -1350,7 +1380,9 @@ class RedisDocStatusStorage(DocStatusStorage):
                 cursor = 0
                 while True:
                     cursor, keys = await redis.scan(
-                        cursor, match=f"{self.final_namespace}:*", count=1000
+                        cursor,
+                        match=_scan_match(f"{self.final_namespace}:"),
+                        count=1000,
                     )
                     if keys:
                         # Get all values in batch
@@ -1368,7 +1400,7 @@ class RedisDocStatusStorage(DocStatusStorage):
                                 if doc_data.get("track_id") != track_id:
                                     continue
                                 # Extract document ID from key
-                                doc_id = key.split(":", 1)[1]
+                                doc_id = key[len(self.final_namespace) + 1 :]
                                 result[doc_id] = (
                                     self._redis_doc_processing_status_from_data(
                                         doc_data
@@ -1409,7 +1441,7 @@ class RedisDocStatusStorage(DocStatusStorage):
         Returns:
             bool: True if storage is empty, False otherwise
         """
-        pattern = f"{self.final_namespace}:*"
+        pattern = _scan_match(f"{self.final_namespace}:")
         try:
             async with self._get_redis_connection() as redis:
                 # Use scan to check if any keys exist
@@ -1726,7 +1758,9 @@ class RedisDocStatusStorage(DocStatusStorage):
                 cursor = 0
                 while True:
                     cursor, keys = await redis.scan(
-                        cursor, match=f"{self.final_namespace}:*", count=1000
+                        cursor,
+                        match=_scan_match(f"{self.final_namespace}:"),
+                        count=1000,
                     )
                     if keys:
                         # Get all values in batch
@@ -1750,7 +1784,7 @@ class RedisDocStatusStorage(DocStatusStorage):
                                         continue
 
                                     # Extract document ID from key
-                                    doc_id = key.split(":", 1)[1]
+                                    doc_id = key[len(self.final_namespace) + 1 :]
 
                                     # Prepare document data
                                     data = doc_data.copy()
@@ -1834,7 +1868,9 @@ class RedisDocStatusStorage(DocStatusStorage):
                 cursor = 0
                 while True:
                     cursor, keys = await redis.scan(
-                        cursor, match=f"{self.final_namespace}:*", count=1000
+                        cursor,
+                        match=_scan_match(f"{self.final_namespace}:"),
+                        count=1000,
                     )
                     if keys:
                         # Get all values in batch
@@ -2005,7 +2041,7 @@ class RedisDocStatusStorage(DocStatusStorage):
             cursor = 0
             while True:
                 cursor, keys = await redis.scan(
-                    cursor, match=f"{self.final_namespace}:*", count=1000
+                    cursor, match=_scan_match(f"{self.final_namespace}:"), count=1000
                 )
                 if keys:
                     pipe = redis.pipeline()
@@ -2016,7 +2052,7 @@ class RedisDocStatusStorage(DocStatusStorage):
                     for key, value in zip(keys, values):
                         if not value:
                             continue
-                        doc_id = key.split(":", 1)[1]
+                        doc_id = key[len(self.final_namespace) + 1 :]
                         if doc_id == exclude_doc_id:
                             continue
                         try:
@@ -2403,7 +2439,7 @@ class RedisDocStatusStorage(DocStatusStorage):
             while True:
                 cursor, keys = await redis.scan(
                     cursor,
-                    match=f"{prefix}*",
+                    match=_scan_match(prefix),
                     count=self._CONFLICT_SCAN_BATCH,
                 )
                 if keys:
@@ -2586,8 +2622,8 @@ class RedisDocStatusStorage(DocStatusStorage):
         healthy. The temp keyspace is what distinguishes that: a completed
         rebuild leaves none, and with no concurrent rebuilder possible, any
         keyspace found here is leftover from a prior, interrupted attempt."""
-        status_pattern = f"{self._sched_prefix}:status:*"
-        primary_pattern = f"{self.final_namespace}:*"
+        status_pattern = _scan_match(f"{self._sched_prefix}:status:")
+        primary_pattern = _scan_match(f"{self.final_namespace}:")
         async with self._get_redis_connection() as redis:
             interrupted = await self._temp_keyspace_present(redis)
             if interrupted:
@@ -2605,7 +2641,10 @@ class RedisDocStatusStorage(DocStatusStorage):
     async def _temp_keyspace_present(self, redis) -> bool:
         """Does the rebuild temp keyspace hold any key? (bounded probe)"""
         temp_prefix = f"{self._sched_prefix}_rebuild"
-        for pattern in (f"{temp_prefix}:status:*", f"{temp_prefix}:basename:*"):
+        for pattern in (
+            _scan_match(f"{temp_prefix}:status:"),
+            _scan_match(f"{temp_prefix}:basename:"),
+        ):
             if await self._any_key(redis, pattern):
                 return True
         return False
@@ -2641,12 +2680,12 @@ class RedisDocStatusStorage(DocStatusStorage):
         """
         temp_prefix = f"{self._sched_prefix}_rebuild"
         stale_patterns = [
-            f"{temp_prefix}:status:*",
-            f"{temp_prefix}:basename:*",
-            f"{self._sched_prefix}:basename:*",
+            _scan_match(f"{temp_prefix}:status:"),
+            _scan_match(f"{temp_prefix}:basename:"),
+            _scan_match(f"{self._sched_prefix}:basename:"),
         ]
         if recover_stale_official:
-            stale_patterns.append(f"{self._sched_prefix}:status:*")
+            stale_patterns.append(_scan_match(f"{self._sched_prefix}:status:"))
         # Clear the leftover temp keyspace from a crashed prior attempt, plus the
         # stale official keys this rebuild is about to republish.
         await self._delete_by_patterns(redis, stale_patterns)
@@ -2656,7 +2695,7 @@ class RedisDocStatusStorage(DocStatusStorage):
         cursor = 0
         while True:
             cursor, keys = await redis.scan(
-                cursor, match=f"{self.final_namespace}:*", count=1000
+                cursor, match=_scan_match(f"{self.final_namespace}:"), count=1000
             )
             if keys:
                 pipe = redis.pipeline()
@@ -2677,7 +2716,7 @@ class RedisDocStatusStorage(DocStatusStorage):
                         continue
                     if not isinstance(row, dict):
                         continue
-                    doc_id = key.split(":", 1)[1]
+                    doc_id = key[len(self.final_namespace) + 1 :]
                     status = self._status_value(row.get("status"))
                     if status:
                         statuses_seen.add(status)
@@ -2756,7 +2795,7 @@ class RedisDocStatusStorage(DocStatusStorage):
         error is swallowed per-command rather than left to abort the whole
         batch — see ``_is_missing_source_rename_error``.
         """
-        status_pattern = f"{self._sched_prefix}:status:*"
+        status_pattern = _scan_match(f"{self._sched_prefix}:status:")
         if await self._any_key(redis, status_pattern):
             raise StorageControlPlaneError(
                 f"[{self.workspace}] another writer maintained the scheduling "
@@ -2766,7 +2805,10 @@ class RedisDocStatusStorage(DocStatusStorage):
             )
 
         published = 0
-        for pattern in (f"{temp_prefix}:status:*", f"{temp_prefix}:basename:*"):
+        for pattern in (
+            _scan_match(f"{temp_prefix}:status:"),
+            _scan_match(f"{temp_prefix}:basename:"),
+        ):
             # Each rename REMOVES a key from the pattern being scanned, and no
             # SCAN cursor survives that intact — a positional cursor skips the
             # entries that shifted under it, and a real hash cursor is only
@@ -2826,11 +2868,11 @@ class RedisDocStatusStorage(DocStatusStorage):
             async with self._get_redis_connection() as redis:
                 deleted_count = 0
                 for pattern in (
-                    f"{self.final_namespace}:*",
-                    f"{self._sched_prefix}:status:*",
-                    f"{self._sched_prefix}:basename:*",
-                    f"{self._sched_prefix}_rebuild:status:*",
-                    f"{self._sched_prefix}_rebuild:basename:*",
+                    _scan_match(f"{self.final_namespace}:"),
+                    _scan_match(f"{self._sched_prefix}:status:"),
+                    _scan_match(f"{self._sched_prefix}:basename:"),
+                    _scan_match(f"{self._sched_prefix}_rebuild:status:"),
+                    _scan_match(f"{self._sched_prefix}_rebuild:basename:"),
                 ):
                     cursor = 0
                     while True:

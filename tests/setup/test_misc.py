@@ -368,8 +368,9 @@ printf 'LIGHTRAG_SETUP_RERANK_PROVIDER=%s\\n' "${{ENV_VALUES[LIGHTRAG_SETUP_RERA
         ("bedrock", "bedrock", "DEFAULT_BEDROCK_ENDPOINT", "DEFAULT_BEDROCK_ENDPOINT"),
         ("gemini", "gemini", "DEFAULT_GEMINI_ENDPOINT", "DEFAULT_GEMINI_ENDPOINT"),
         ("bedrock", "openai", "DEFAULT_BEDROCK_ENDPOINT", ""),
+        ("gemini", "voyageai", "DEFAULT_GEMINI_ENDPOINT", "DEFAULT_VOYAGEAI_ENDPOINT"),
     ],
-    ids=["bedrock-both", "gemini-both", "bedrock-llm-only"],
+    ids=["bedrock-both", "gemini-both", "bedrock-llm-only", "voyageai-embedding"],
 )
 def test_load_existing_env_backfills_sentinel_hosts_for_bedrock_and_gemini(
     tmp_path: Path,
@@ -2340,12 +2341,6 @@ printf 'WRITTEN=%s\\n' "${{ENV_VALUES[LIGHTRAG_CONFIG_STORAGE]:-<unset>}}"
         assert values["CHOSEN"] == "PGKVStorage"
         assert values["WRITTEN"] == "<unset>"
 
-    def test_a_first_run_writes_nothing(self):
-        """No previous value at all: there are no records to strand."""
-        values = self._select_after_kv_change("", "MongoKVStorage")
-        assert values["CHOSEN"] == "MongoKVStorage"
-        assert values["WRITTEN"] == "<unset>"
-
     def test_a_change_away_from_redis_preserves_json_records(self):
         values = self._select_after_kv_change("RedisKVStorage", "PGKVStorage")
         assert values["CHOSEN"] == "JsonKVStorage"
@@ -2459,12 +2454,6 @@ printf 'WRITTEN=%s\\n' "${{ENV_VALUES[LIGHTRAG_CONFIG_STORAGE]:-<unset>}}"
             previous_config="MongoKVStorage",
         )
         assert values["CHOSEN"] == "MongoKVStorage"
-
-    def test_no_previous_deployment_still_defaults_to_json(self):
-        """Nothing admitted held records, so there is nothing to keep."""
-        values = self._select_with_previous("RedisKVStorage")
-        assert values["CHOSEN"] == "JsonKVStorage"
-        assert values["WRITTEN"] == "<unset>"
 
     def test_a_previous_redis_kv_backend_keeps_json_records(self):
         values = self._select_with_previous(

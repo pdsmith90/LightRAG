@@ -59,7 +59,10 @@ DRAWING_MARKER_RE = re.compile(r'<mddrawing ref="([^"]+)"/>')
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*$")
 # Trailing closing-hash run of an ATX heading (``## Foo ##`` → ``Foo``).
 _HEADING_TRAILING_HASHES_RE = re.compile(r"\s+#+\s*$")
-_FENCE_RE = re.compile(r"^(`{3,}|~{3,})(.*)$")
+# A fence opener or closer. As in CommonMark, the info string after a backtick
+# run may not contain a backtick: a line holding only an inline code span such
+# as ```pip install x``` is text, not a fence that swallows the rest of the file.
+_FENCE_RE = re.compile(r"^(`{3,}(?=[^`]*$)|~{3,})(.*)$")
 # A GFM delimiter row: one or more ``---`` cells with optional ``:`` alignment.
 _DELIMITER_ROW_RE = re.compile(r"^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$")
 # A single delimiter cell (after splitting on ``|``): ``---`` with optional
@@ -653,6 +656,13 @@ def extract_markdown(
 
     heading_stack: list[tuple[int, str]] = []  # (level, clean_text)
     counters = {"t": 0, "e": 0, "d": 0}
+    # Author-written marker examples must never alias generated side-table refs,
+    # including examples in later blocks or fenced code.
+    source_refs = {
+        match.group(1)
+        for pattern in (TABLE_MARKER_RE, EQUATION_MARKER_RE, DRAWING_MARKER_RE)
+        for match in pattern.finditer(text)
+    }
 
     cur_heading = PREFACE_HEADING
     cur_level = 0
@@ -686,8 +696,11 @@ def extract_markdown(
         cur_lines.append(render_heading_line(level, raw))
 
     def _next_ref(kind: str) -> str:
-        counters[kind] += 1
-        return f"{kind}{counters[kind]}"
+        while True:
+            counters[kind] += 1
+            ref = f"{kind}{counters[kind]}"
+            if ref not in source_refs:
+                return ref
 
     def _resolve_image(src: str) -> str:
         src = src.strip()
@@ -885,6 +898,8 @@ def _consume_block_equation(lines: list[str], start: int) -> tuple[int, str]:
         tail = _closing_tail(inner_first[close + 2 :])
         if tail is not None:
             return 1, "\n".join(p for p in (inner_first[:close].strip(), tail) if p)
+        # ``$$ … $$`` followed by prose closes on its own line: not a block.
+        return 0, ""
     # Multi-line: collect until a closing fence within the same paragraph.
     body: list[str] = []
     if inner_first.strip():
@@ -1013,7 +1028,9 @@ def _consume_pipe_table(
     starts an ATX heading recognized by ``extract_markdown``. An escaped pipe
     counts as cell content once the table is established. This subset still
     requires a pipe in each body row and does not detect all GFM block types.
-    A row may carry fewer cells than the header; the IR builder pads it."""
+    Rows keep the cell count they were written with, shorter or longer than
+    the header; the IR builder pads every row, header included, to the widest
+    one."""
     header = _split_pipe_row(lines[start])
     body: list[list[str]] = []
     j = start + 2  # skip header + delimiter

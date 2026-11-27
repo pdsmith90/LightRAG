@@ -410,6 +410,69 @@ def _declined_commit_error(context: str) -> RuntimeError:
     )
 
 
+async def _discard_buffered_tracking(tracking_storages, *, only_retained: bool) -> list:
+    """Drop uncommitted chunk-tracking writes; return the storages dropped from.
+
+    Only a storage declaring ``buffers_writes_per_process`` is touched. With
+    ``only_retained`` a storage is dropped from only when it still has buffered
+    operations; without it, unconditionally (after a raise, when what the
+    buffer holds is unknown). See ``_require_tracking_drained`` for why such a
+    write must not survive the operation that issued it.
+    """
+    dropped = []
+    for storage_inst in tracking_storages:
+        if storage_inst is None or not getattr(
+            type(storage_inst), "buffers_writes_per_process", False
+        ):
+            continue
+        if only_retained and not await storage_inst.has_pending_index_ops(
+            include_deletes=True
+        ):
+            continue
+        await storage_inst.drop_pending_index_ops()
+        dropped.append(storage_inst)
+    return dropped
+
+
+async def _require_tracking_drained(tracking_storages, context: str) -> None:
+    """Fail when a tracking flush returned normally but left rows buffered.
+
+    A per-item backend (``OpenSearchKVStorage``) keeps a retryable bulk
+    failure (408/429/5xx) in its per-process buffer and returns from
+    ``index_done_callback`` without raising. For most namespaces the next
+    flush heals that. A chunk-tracking row does not heal: it is a whole row
+    produced by read-modify-write, so a row retained here would be written
+    later OVER whatever another worker committed in between, erasing that
+    writer's attribution while both operations reported success.
+
+    So the retained operations are discarded and the caller is failed. Before
+    a graph mutation that leaves nothing published; after one it leaves a row
+    that is too broad or stale, the direction every staging in this module
+    already accepts. Discarding is safe because only a storage declaring
+    ``buffers_writes_per_process`` is asked, and that declaration puts every
+    admin writer under ``LightRAG._admin_write_gate``: no pipeline batch and no
+    other admin write has operations in this buffer.
+
+    A flush that RAISES keeps its buffer too (a transport error pops nothing),
+    so ``_persist_graph_updates`` discards on that exit as well, before
+    re-raising: the failed operation's rows must not be flushed by a later
+    commit of this process.
+    """
+    retained = await _discard_buffered_tracking(tracking_storages, only_retained=True)
+    if not retained:
+        return
+    names = ", ".join(
+        str(getattr(storage_inst, "namespace", storage_inst))
+        for storage_inst in retained
+    )
+    raise RuntimeError(
+        f"{context}: chunk tracking ({names}) was not made durable -- the "
+        "storage kept a transiently failed write buffered instead of "
+        "committing it. The buffered tracking writes were discarded so they "
+        "cannot overwrite a later commit; retry the operation."
+    )
+
+
 async def _persist_graph_updates(
     entities_vdb=None,
     relationships_vdb=None,
@@ -429,6 +492,9 @@ async def _persist_graph_updates(
     handling — reporting a completed deletion as ``fail``/500, and stranding the
     tracking rows the retry would then believe it still owed. Every other
     exception still propagates: those mean the flush did not happen.
+
+    A tracking flush that returns normally but leaves rows buffered is a
+    failure too: see ``_require_tracking_drained``.
 
     Commit order -- the tracking rows are committed BEFORE the
     graph, in two phases:
@@ -555,8 +621,12 @@ async def _persist_graph_updates(
             if isinstance(result, BaseException)
         ]
         if errors:
+            if phase is phases[0]:
+                await _discard_buffered_tracking(tracking_storages, only_retained=False)
             errors.sort(key=lambda item: not item[0])
             raise errors[0][1]
+        if phase is phases[0]:
+            await _require_tracking_drained(tracking_storages, context)
 
 
 async def _finish_deferring_cancellation(coro, description: str) -> None:
@@ -724,8 +794,8 @@ async def adelete_by_entity(
         entity_chunks_storage: Optional KV storage for tracking chunks that reference this entity
         relation_chunks_storage: Optional KV storage for tracking chunks that reference relations
 
-    Concurrency: on a graph storage that declares
-    ``requires_single_writer`` (``NetworkXStorage``), the public ``LightRAG``
+    Concurrency: where ``LightRAG._admin_write_gate_required()`` holds
+    (``NetworkXStorage``, or tracking on ``OpenSearchKVStorage``), the public ``LightRAG``
     method that calls this runs it inside ``LightRAG._admin_write_gate``, which
     serializes admin writes against each other (a workspace-wide admin lock the
     second caller WAITS on, refused with 409 only after
@@ -734,7 +804,7 @@ async def adelete_by_entity(
     commits, a running pipeline refuses this write with 409). The gate is taken
     BEFORE the per-entity keyed locks below and must not be re-acquired here.
     A hold longer than ``admin_write_max_hold_seconds`` fails the operation
-    (500) and releases both. Server-backed graph stores run this ungated. See
+    (500) and releases both. Other backend combinations run this ungated. See
     ``docs/ProgramingWithCore.md`` for the accepted residue.
     """
     requested_entity_name = entity_name
@@ -949,8 +1019,8 @@ async def adelete_by_relation(
         target_entity: Name of the target entity
         relation_chunks_storage: Optional KV storage for tracking chunks that reference this relation
 
-    Concurrency: on a graph storage that declares
-    ``requires_single_writer`` (``NetworkXStorage``), the public ``LightRAG``
+    Concurrency: where ``LightRAG._admin_write_gate_required()`` holds
+    (``NetworkXStorage``, or tracking on ``OpenSearchKVStorage``), the public ``LightRAG``
     method that calls this runs it inside ``LightRAG._admin_write_gate``, which
     serializes admin writes against each other (a workspace-wide admin lock the
     second caller WAITS on, refused with 409 only after
@@ -959,7 +1029,7 @@ async def adelete_by_relation(
     commits, a running pipeline refuses this write with 409). The gate is taken
     BEFORE the per-entity keyed locks below and must not be re-acquired here.
     A hold longer than ``admin_write_max_hold_seconds`` fails the operation
-    (500) and releases both. Server-backed graph stores run this ungated. See
+    (500) and releases both. Other backend combinations run this ungated. See
     ``docs/ProgramingWithCore.md`` for the accepted residue.
     """
     relation_str = f"{source_entity} -> {target_entity}"
@@ -1826,8 +1896,8 @@ async def aedit_entity(
             - "failed": Merge operation failed
             - "not_attempted": No merge was attempted (normal update/rename)
 
-    Concurrency: on a graph storage that declares
-    ``requires_single_writer`` (``NetworkXStorage``), the public ``LightRAG``
+    Concurrency: where ``LightRAG._admin_write_gate_required()`` holds
+    (``NetworkXStorage``, or tracking on ``OpenSearchKVStorage``), the public ``LightRAG``
     method that calls this runs it inside ``LightRAG._admin_write_gate``, which
     serializes admin writes against each other (a workspace-wide admin lock the
     second caller WAITS on, refused with 409 only after
@@ -1836,7 +1906,7 @@ async def aedit_entity(
     commits, a running pipeline refuses this write with 409). The gate is taken
     BEFORE the per-entity keyed locks below and must not be re-acquired here.
     A hold longer than ``admin_write_max_hold_seconds`` fails the operation
-    (500) and releases both. Server-backed graph stores run this ungated. See
+    (500) and releases both. Other backend combinations run this ungated. See
     ``docs/ProgramingWithCore.md`` for the accepted residue.
     """
     # Order matters: the empty-description check runs first so a `None`
@@ -2109,8 +2179,8 @@ async def aedit_relation(
     Returns:
         Dictionary containing updated relation information
 
-    Concurrency: on a graph storage that declares
-    ``requires_single_writer`` (``NetworkXStorage``), the public ``LightRAG``
+    Concurrency: where ``LightRAG._admin_write_gate_required()`` holds
+    (``NetworkXStorage``, or tracking on ``OpenSearchKVStorage``), the public ``LightRAG``
     method that calls this runs it inside ``LightRAG._admin_write_gate``, which
     serializes admin writes against each other (a workspace-wide admin lock the
     second caller WAITS on, refused with 409 only after
@@ -2119,7 +2189,7 @@ async def aedit_relation(
     commits, a running pipeline refuses this write with 409). The gate is taken
     BEFORE the per-entity keyed locks below and must not be re-acquired here.
     A hold longer than ``admin_write_max_hold_seconds`` fails the operation
-    (500) and releases both. Server-backed graph stores run this ungated. See
+    (500) and releases both. Other backend combinations run this ungated. See
     ``docs/ProgramingWithCore.md`` for the accepted residue.
     """
     # See `aedit_entity` for the ordering rationale.
@@ -2592,8 +2662,8 @@ async def acreate_entity(
     Returns:
         Dictionary containing created entity information
 
-    Concurrency: on a graph storage that declares
-    ``requires_single_writer`` (``NetworkXStorage``), the public ``LightRAG``
+    Concurrency: where ``LightRAG._admin_write_gate_required()`` holds
+    (``NetworkXStorage``, or tracking on ``OpenSearchKVStorage``), the public ``LightRAG``
     method that calls this runs it inside ``LightRAG._admin_write_gate``, which
     serializes admin writes against each other (a workspace-wide admin lock the
     second caller WAITS on, refused with 409 only after
@@ -2602,7 +2672,7 @@ async def acreate_entity(
     commits, a running pipeline refuses this write with 409). The gate is taken
     BEFORE the per-entity keyed locks below and must not be re-acquired here.
     A hold longer than ``admin_write_max_hold_seconds`` fails the operation
-    (500) and releases both. Server-backed graph stores run this ungated. See
+    (500) and releases both. Other backend combinations run this ungated. See
     ``docs/ProgramingWithCore.md`` for the accepted residue.
     """
     _require_non_empty_description(
@@ -2798,8 +2868,8 @@ async def acreate_relation(
     Returns:
         Dictionary containing created relation information
 
-    Concurrency: on a graph storage that declares
-    ``requires_single_writer`` (``NetworkXStorage``), the public ``LightRAG``
+    Concurrency: where ``LightRAG._admin_write_gate_required()`` holds
+    (``NetworkXStorage``, or tracking on ``OpenSearchKVStorage``), the public ``LightRAG``
     method that calls this runs it inside ``LightRAG._admin_write_gate``, which
     serializes admin writes against each other (a workspace-wide admin lock the
     second caller WAITS on, refused with 409 only after
@@ -2808,7 +2878,7 @@ async def acreate_relation(
     commits, a running pipeline refuses this write with 409). The gate is taken
     BEFORE the per-entity keyed locks below and must not be re-acquired here.
     A hold longer than ``admin_write_max_hold_seconds`` fails the operation
-    (500) and releases both. Server-backed graph stores run this ungated. See
+    (500) and releases both. Other backend combinations run this ungated. See
     ``docs/ProgramingWithCore.md`` for the accepted residue.
     """
     _require_non_empty_description(
@@ -3121,15 +3191,24 @@ async def _merge_entities_impl(
     if target_exists and target_entity not in source_entities:
         entities_to_collect.append(target_entity)
 
+    # get_node_edges does not say which endpoint comes first: some backends
+    # list the queried node first, others (MongoDB, Memgraph, OpenSearch) keep
+    # the stored direction. Relations are undirected, so take every incident
+    # edge whichever side the entity is on. An edge between two collected
+    # entities is listed by both; it always becomes a self-loop and is skipped
+    # below, so seen_edges only saves its second get_edge read.
+    seen_edges: set[tuple[str, str]] = set()
     for entity_name in entities_to_collect:
         # Get all relationships of the entities
         edges = await chunk_entity_relation_graph.get_node_edges(entity_name)
         if edges:
             for src, tgt in edges:
-                # Ensure src is the current entity
-                if src == entity_name:
-                    edge_data = await chunk_entity_relation_graph.get_edge(src, tgt)
-                    all_relations.append((src, tgt, edge_data))
+                edge_key = (src, tgt) if src <= tgt else (tgt, src)
+                if edge_key in seen_edges:
+                    continue
+                seen_edges.add(edge_key)
+                edge_data = await chunk_entity_relation_graph.get_edge(src, tgt)
+                all_relations.append((src, tgt, edge_data))
 
     # 5. Create or update the target entity. A missing target is intentional:
     # spelling-repair merges may consolidate sources into a new canonical name.
@@ -3813,8 +3892,8 @@ async def amerge_entities(
     Returns:
         Dictionary containing the merged entity information
 
-    Concurrency: on a graph storage that declares
-    ``requires_single_writer`` (``NetworkXStorage``), the public ``LightRAG``
+    Concurrency: where ``LightRAG._admin_write_gate_required()`` holds
+    (``NetworkXStorage``, or tracking on ``OpenSearchKVStorage``), the public ``LightRAG``
     method that calls this runs it inside ``LightRAG._admin_write_gate``, which
     serializes admin writes against each other (a workspace-wide admin lock the
     second caller WAITS on, refused with 409 only after
@@ -3823,7 +3902,7 @@ async def amerge_entities(
     commits, a running pipeline refuses this write with 409). The gate is taken
     BEFORE the per-entity keyed locks below and must not be re-acquired here.
     A hold longer than ``admin_write_max_hold_seconds`` fails the operation
-    (500) and releases both. Server-backed graph stores run this ungated. See
+    (500) and releases both. Other backend combinations run this ungated. See
     ``docs/ProgramingWithCore.md`` for the accepted residue.
     """
     if not source_entities:

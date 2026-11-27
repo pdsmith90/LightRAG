@@ -157,6 +157,42 @@ async def test_mix_search_runs_the_lexical_leg_with_or_without_chunk_vectors(
     assert [c["chunk_id"] for c in result["lexical_chunks"]] == ["l1"]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_chunk_vectors", [True, False])
+async def test_mix_search_runs_the_metadata_leg_with_or_without_chunk_vectors(
+    monkeypatch, with_chunk_vectors
+):
+    """The author-year / citation leg of a mix query, like the lexical one, does
+    not depend on the chunk vector store."""
+    seen = []
+
+    async def metadata_leg(query, text_chunks_db, hop_sources=()):
+        seen.append((query, [c["chunk_id"] for c in hop_sources]))
+        return [{"chunk_id": "m1", "content": "m1", "file_path": "m.md"}]
+
+    monkeypatch.setattr(operate, "_get_metadata_context", metadata_leg)
+    text_chunks = _TextChunks(
+        {"lexical_chunk_top_k": 2, "kg_chunk_pick_method": "WEIGHT"}, [_row("l1")]
+    )
+    text_chunks.embedding_func = None
+    result = await operate._perform_kg_search(
+        "probabilistic indexing",
+        "",
+        "",
+        None,
+        None,
+        None,
+        text_chunks,
+        QueryParam(mode="mix"),
+        _ChunksVDB() if with_chunk_vectors else None,
+    )
+    assert [c["chunk_id"] for c in result["metadata_chunks"]] == ["m1"]
+    assert result["chunk_tracking"]["m1"]["source"] == "M"
+    # the legs see the lexical hits, and the vector ones when there are any
+    expected = ["v1", "l1"] if with_chunk_vectors else ["l1"]
+    assert seen == [("probabilistic indexing", expected)]
+
+
 def _config(model, **extra) -> dict:
     return {
         "tokenizer": Tokenizer("fake", _FakeTokenizerImpl()),

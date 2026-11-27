@@ -22,7 +22,7 @@ from tenacity import (
     wait_exponential,
     retry_if_exception_type,
 )
-from lightrag.utils import wrap_embedding_func_with_attrs, logger
+from lightrag.utils import embedding_timeout, wrap_embedding_func_with_attrs, logger
 
 
 # Custom exceptions for VoyageAI errors
@@ -30,6 +30,16 @@ class VoyageAIError(Exception):
     """Generic VoyageAI API error"""
 
     pass
+
+
+def _normalize_voyageai_base_url(base_url: str | None) -> str | None:
+    """Map an unset, blank or sentinel endpoint to None (the SDK default)."""
+    if not base_url:
+        return None
+    normalized = base_url.strip()
+    if not normalized or normalized == "DEFAULT_VOYAGEAI_ENDPOINT":
+        return None
+    return normalized
 
 
 @wrap_embedding_func_with_attrs(
@@ -51,6 +61,10 @@ class VoyageAIError(Exception):
             TryAgain,
         )
     ),
+    # Surface the last attempt's own error, not a tenacity.RetryError, so
+    # callers can catch the real VoyageAI exception type and see its
+    # message (same convention as openai.py / ollama.py / gemini.py, etc.).
+    reraise=True,
 )
 async def voyageai_embed(
     texts: list[str],
@@ -60,6 +74,8 @@ async def voyageai_embed(
     input_type: str | None = None,
     truncation: bool | None = True,
     context: str | None = None,
+    timeout: float | None = None,
+    base_url: str | None = None,
 ) -> np.ndarray:
     """Generate embeddings for a list of texts using VoyageAI's API.
 
@@ -89,6 +105,14 @@ async def voyageai_embed(
         context: Optional LightRAG embedding context. When ``input_type`` is not
             set, "query" maps to ``input_type="query"`` and "document" maps to
             ``input_type="document"``.
+        timeout: Request timeout in seconds. None (the default) uses LightRAG's
+            ``default_embedding_timeout`` inside a LightRAG embedding call; 0 or
+            a negative value, or None outside one, keeps the SDK default.
+        base_url: Optional API endpoint, e.g. a gateway or proxy in front of
+            VoyageAI. None, blank, or the sentinel ``DEFAULT_VOYAGEAI_ENDPOINT``
+            keeps the SDK default, which the SDK picks from the API key (a
+            MongoDB Atlas ``al-`` key and a VoyageAI key use different hosts),
+            so do not pass VoyageAI's own URL to mean "the default".
 
     Returns:
         A numpy array of embeddings, one per input text.
@@ -113,7 +137,14 @@ async def voyageai_embed(
         input_type = context
 
     try:
-        client = voyageai.AsyncClient(api_key=api_key)
+        client_kwargs = {"api_key": api_key}
+        timeout = embedding_timeout(timeout)
+        if timeout is not None:
+            client_kwargs["timeout"] = timeout
+        base_url = _normalize_voyageai_base_url(base_url)
+        if base_url is not None:
+            client_kwargs["base_url"] = base_url
+        client = voyageai.AsyncClient(**client_kwargs)
 
         total_chars = sum(len(t) for t in texts)
         avg_chars = total_chars / len(texts) if texts else 0

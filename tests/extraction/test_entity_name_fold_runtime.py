@@ -527,12 +527,17 @@ async def _merged_graph():
 
 async def _rebuild_merged(monkeypatch):
     async def cached(llm_response_cache, chunk_ids, text_chunks_storage, **_kwargs):
-        return {c: [(c, 1)] for c in sorted(chunk_ids) if c in CACHED}, {}
+        ids = sorted(c for c in chunk_ids if c in CACHED)
+        rows = {
+            c: [(f"k-{c}", {"cache_type": "extract", "return": c, "create_time": 1})]
+            for c in ids
+        }
+        return rows, {c: {"content": c, "llm_cache_list": [f"k-{c}"]} for c in ids}
 
     async def parsed(*, chunk_id, **_kwargs):
         return copy.deepcopy(CACHED[chunk_id])
 
-    monkeypatch.setattr(operate_module, "_get_cached_extraction_results", cached)
+    monkeypatch.setattr(operate_module, "_load_chunk_extract_rows", cached)
     monkeypatch.setattr(operate_module, "_rebuild_from_extraction_result", parsed)
     graph = await _merged_graph()
     await rebuild_knowledge_from_chunks(

@@ -795,6 +795,8 @@ def create_query_routes(
             # Whether the answering LLM wrote it. A missing flag means a result
             # shape that predates it, which only the LLM paths produce.
             llm_generated = bool(llm_response.get("llm_generated", True))
+            # A failed query raises out of aquery_llm and becomes a sanitized
+            # 500 below; empty content here is an empty answer, not a failure.
             if not response_content:
                 response_content = "No relevant context found for the query."
                 # Substituted placeholder: nothing was generated.
@@ -990,6 +992,8 @@ def create_query_routes(
                 # Non-streaming: complete response in one message
                 response_content = llm_response.get("content", "")
                 llm_generated = bool(llm_response.get("llm_generated", True))
+                # A failed query never reaches this generator: aquery_llm
+                # raises, before the stream starts or inside the progress task.
                 if not response_content:
                     response_content = "No relevant context found for the query."
                     llm_generated = False

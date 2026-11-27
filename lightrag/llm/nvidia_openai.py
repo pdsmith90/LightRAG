@@ -17,15 +17,20 @@ from openai import (
     APIConnectionError,
     RateLimitError,
     APITimeoutError,
+    InternalServerError,
 )
 from tenacity import (
     retry,
     stop_after_attempt,
     wait_exponential,
+    retry_if_exception,
     retry_if_exception_type,
 )
 
+from lightrag.llm.openai import _is_transient_status_error
+
 from lightrag.utils import (
+    embedding_timeout,
     wrap_embedding_func_with_attrs,
 )
 
@@ -39,9 +44,13 @@ import numpy as np
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=4, max=60),
+    # The client runs with max_retries=0, so this predicate must cover
+    # everything the SDK's own loop retried: 429, >= 500, 408 and 409.
     retry=retry_if_exception_type(
-        (RateLimitError, APIConnectionError, APITimeoutError)
-    ),
+        (RateLimitError, APIConnectionError, APITimeoutError, InternalServerError)
+    )
+    | retry_if_exception(_is_transient_status_error),
+    reraise=True,
 )
 async def nvidia_openai_embed(
     texts: list[str],
@@ -53,6 +62,7 @@ async def nvidia_openai_embed(
     trunc: str = "NONE",  # NONE or START or END
     encode: str = "float",  # float or base64
     context: str | None = None,
+    timeout: float | None = None,
 ) -> np.ndarray:
     """Generate embeddings with an NVIDIA NIM embedding model.
 
@@ -62,15 +72,26 @@ async def nvidia_openai_embed(
     own `context` ("query" / "document") onto NVIDIA's "query" / "passage"
     values, so a query embedded via a LightRAG query path actually uses
     NVIDIA's query mode instead of always defaulting to "passage".
+
+    ``timeout`` (seconds) defaults to LightRAG's ``default_embedding_timeout``
+    inside a LightRAG embedding call; 0 or a negative value, or None outside
+    one, keeps the OpenAI SDK default.
     """
     if input_type is None:
         input_type = "query" if context == "query" else "passage"
 
-    client_kwargs = {}
+    # @retry above owns retries. The SDK defaults to max_retries=2, which
+    # would turn each of its attempts into up to three requests. This also
+    # drops the SDK's Retry-After handling, as in ``openai.py``.
+    client_kwargs = {"max_retries": 0}
     if base_url is not None:
         client_kwargs["base_url"] = base_url
     if api_key:
         client_kwargs["api_key"] = api_key
+    # Omitted rather than passed as None, which the SDK reads as "no timeout".
+    timeout = embedding_timeout(timeout)
+    if timeout is not None:
+        client_kwargs["timeout"] = timeout
 
     openai_async_client = AsyncOpenAI(**client_kwargs)
     # Hold the client in an async-with so its httpx connection pool is
@@ -83,6 +104,23 @@ async def nvidia_openai_embed(
             encoding_format=encode,
             extra_body={"input_type": input_type, "truncate": trunc},
         )
+        rows = response.data
+        # NIM labels every row with its input position; vector stores consume
+        # rows positionally. An endpoint that omits indices entirely keeps its
+        # response order, but a partially or inconsistently indexed batch is
+        # rejected. Mirrors ``openai_embed``.
+        indices = [getattr(row, "index", None) for row in rows]
+        if any(index is not None for index in indices):
+            if (
+                len(indices) != len(texts)
+                or any(type(index) is not int for index in indices)
+                or set(indices) != set(range(len(texts)))
+            ):
+                raise ValueError(
+                    f"NVIDIA API returned invalid embedding indices "
+                    f"for {len(texts)} texts (first 10: {indices[:10]})"
+                )
+            rows = sorted(rows, key=lambda row: row.index)
         # The SDK leaves explicitly requested base64 responses encoded.
         # Both encodings return float32, matching ``openai_embed``.
         return np.array(
@@ -90,6 +128,6 @@ async def nvidia_openai_embed(
                 np.frombuffer(base64.b64decode(dp.embedding), dtype=np.float32)
                 if isinstance(dp.embedding, str)
                 else np.asarray(dp.embedding, dtype=np.float32)
-                for dp in response.data
+                for dp in rows
             ]
         )

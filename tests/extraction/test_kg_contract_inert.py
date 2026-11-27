@@ -437,39 +437,43 @@ async def _run_case(work_dir: str, use_json: bool, profile, fold: bool) -> dict:
     }
 
 
-# Recorded from zlightrag a2bd9d148 (see the module docstring).
+# Recorded from zlightrag a2bd9d148 (see the module docstring); the graph digests
+# re-recorded 2026-11-27 after the merge of upstream 47038cf16, whose only effect
+# on this workload is that an edge's weight counts once per chunk (upstream's
+# rule on insert and in the rebuild): the prompts, writes and records of all eight
+# cases equal those of the pre-merge tree once the weights are masked.
 GOLDEN = {
     "json-default": {
         "extraction": "5044ed3760d32cd045b980574313583446bbf674922bf72ff05b99c6067f61a0",
-        "graph": "b3004deebfaa12c0faf7a5409e025cd9744979d0984db2fda9d11e7fabd9082a",
+        "graph": "795011a7e8d5e084328b3e729a6b4c43c56f3a1b78901a74a0395a56e676625b",
     },
     "json-default-fold": {
         "extraction": "fb26b0c232fce8c84a8798176f62e6d266a6ffb5808c8a9bcd3964a5a8fae986",
-        "graph": "65b0ed5e3d8b9dd841d9cf31f8f17b952d4e2fe7fb16e51c0ed5307ad5bd1b3d",
+        "graph": "2f32510fad86e63e4178e6b19a0d96db2ac59a2c9fb81132813df33d94321655",
     },
     "json-plain.yml": {
         "extraction": "00a5d6ddd90686debe0c5d5b641b07a636743f283f4556f076c6efc67fe9308d",
-        "graph": "4553edf0bf8a24b6d63a4eeb221f15edf054b5a9d3683f3d243c03825ef21f50",
+        "graph": "a5d22b2e8d95dacec8a07cd2c07dc233f8eb98d5f881d5e861f933acd86f4364",
     },
     "json-plain.yml-fold": {
         "extraction": "1e7676a678847dec244ae3b90c2c80e1ff1d049b9ae2eda8597afec26d3feda1",
-        "graph": "a9686bf3786a6f3df8b0829a5be19297f08a8f2a2596b90cb7a1e6d54afd45f2",
+        "graph": "2a4633090d8141536885eb939a5614bd15588774d1a6613fdf4fd45a11fac99e",
     },
     "text-default": {
         "extraction": "26ead7a411f34f5c7cd815a507c8436519f5e770b2445d5f0c4c253e417e204c",
-        "graph": "364dceed1cf7e136d937bcefd2d64cd77347d56c5165c4997786680e64558360",
+        "graph": "7be909ec93a171c15d88f45a2eb83c11cd7b97dc5e3ef70d2d6c496313206e88",
     },
     "text-default-fold": {
         "extraction": "5a5cf0bf19d22b995069bc8bba6942b81ea81ba530a8514ee29fa9fc32f5a89d",
-        "graph": "192479fa33f4a1ac4c9e78cc2631d43d8f49703200e594797be1e5a1feb2b5e8",
+        "graph": "9bf4f4f39388df8a7626e792745ee03cad49fa4a18082b5b9b2282b34cd6e390",
     },
     "text-plain.yml": {
         "extraction": "59ad105fa8307280463cebd4beed5b2982be056193bcb2c0a9314bcb42b4a6d3",
-        "graph": "39e9185d46cdbd90f2c31eac6c9b1420922cf5c4ef29ffb69bd9bdec5e4d96d4",
+        "graph": "cc92b07bb59706b7fd8ea181b3bd3923d5ff087aec0e4d3e9c7e47537b69fc76",
     },
     "text-plain.yml-fold": {
         "extraction": "14ce7869473a5c729608285ea0841d0f8b754527a9ed79b0c127244836fbb605",
-        "graph": "ade039a7ce215393b268c6c9dc410cf9bf0660ce30168c74f90386b3b7c11548",
+        "graph": "92dae5b63d954d7abbec52b12c559a4fa5706f2b4998b6ace18befbd19f67a70",
     },
 }
 

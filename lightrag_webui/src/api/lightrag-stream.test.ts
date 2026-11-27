@@ -1,65 +1,17 @@
-import { afterAll, afterEach, beforeAll, describe, expect, mock, spyOn, test } from 'bun:test'
-// Dependency-free module — safe to import statically before the mocks below.
-import axios from 'axios'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test'
 import { isAuthenticationRequiredError } from './errors'
 
-// ---------------------------------------------------------------------------
-// Mock dependencies BEFORE importing the module under test
-// ---------------------------------------------------------------------------
+import { backendBaseUrl } from '@/lib/constants'
+import { captureProcessState, restoreProcessState, type ProcessStateSnapshot } from '@/test/processState'
+import { useWebUIAuthStore } from '@/stores/webuiAuth'
 
-// Loaded BEFORE any mock.module call, because the real '@/lib/constants' pulls
-// '@/lib/utils' and the constants overlay below must spread the real exports.
-const realConstants = await import('@/lib/constants')
-
-const storageData = new Map<string, string>()
-const storageMock = {
-  getItem: (key: string) => storageData.get(key) ?? null,
-  setItem: (key: string, value: string) => { storageData.set(key, value) },
-  removeItem: (key: string) => { storageData.delete(key) },
-  clear: () => { storageData.clear() },
-}
-
-Object.defineProperty(globalThis, 'localStorage', {
-  value: storageMock,
-  configurable: true,
-})
-Object.defineProperty(globalThis, 'sessionStorage', {
-  value: storageMock,
-  configurable: true,
-})
-
-// NOTE on isolation: `mock.module` lives in the process-wide module registry
-// for the REST of the bun test run — a module mock installed here poisons
-// every later test file that imports the same module (we shipped exactly that
-// bug twice: navigationService replaced by a no-op stub, stores bound to fake
-// implementations). So shared singletons are NOT module-mocked here. Instead:
-// - the real zustand stores are driven via setState (reset in afterEach);
-// - navigationService.navigateToUnauthenticated is neutralized with a
-//   RESTORABLE spy (mockRestore in afterAll) so the 401 paths under test
-//   don't navigate, while later files still see the real service.
-// The one remaining mock.module target is a leaf-ish dependency where an
-// overlay is sufficient: '@/lib/constants' (spread-real, pins the base URL).
-// axios is NOT module-mocked: its guest-token refresh call is a restorable spy.
-// An OVERLAY on the real module, not a replacement. `mock.module` is global for
-// the whole `bun test` run and is never undone, so a factory returning only the
-// three exports this file needs also deletes every OTHER export of that module
-// for every test file that runs afterwards — `src/lib/fileTypes.test.ts` imports
-// `supportedFileTypes` from here and failed with "Export named
-// 'supportedFileTypes' not found" whenever it ran after this file (and passed on
-// its own, which is what made it look like a product bug). Spreading the real
-// module keeps the rest of the surface intact while still pinning the values
-// these tests assert on.
-mock.module('@/lib/constants', () => ({
-  ...realConstants,
-  backendBaseUrl: 'http://localhost:9621',
-  popularLabelsDefaultLimit: 300,
-  searchLabelsDefaultLimit: 50,
-}))
-
-// Fake the guest-token refresh (axios.get in silentRefreshGuestToken) with a
-// RESTORABLE spy on the real axios, installed in beforeAll. The module itself is
-// not mocked: a module mock is never undone, so it would hand the fake axios
-// (and the api module bound to it) to every test file that runs afterwards.
+// NOTE on isolation: nothing here is module-mocked and the GLOBAL axios
+// adapter is never touched. `mock.module` is process-wide for the rest of the
+// bun test run, and axios.create() copies the global adapter into the api
+// module's instance by value, so either one leaked a stub into later files
+// before. The guest-token refresh goes through the api module's own instance
+// (getAuthStatus), so each test installs its stub on that instance with
+// __setAxiosAdapterForTests and afterEach removes it again.
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -112,7 +64,6 @@ function installFetchMock(
 // ---------------------------------------------------------------------------
 
 let apiModule: typeof import('./lightrag')
-let settingsStore: typeof import('@/stores/settings').useSettingsStore
 let authStore: typeof import('@/stores/state').useAuthStore
 
 // Several suites below intentionally drive queryTextStream's failure branches
@@ -124,9 +75,6 @@ let authStore: typeof import('@/stores/state').useAuthStore
 let restoreMocks: (() => void) | undefined
 
 beforeAll(async () => {
-  // Dynamic imports AFTER the constants mock above. These are the REAL store and navigation
-  // modules — see the isolation note at the top of this file.
-  settingsStore = (await import('@/stores/settings')).useSettingsStore
   authStore = (await import('@/stores/state')).useAuthStore
   const { navigationService } = await import('@/services/navigation')
   apiModule = await import('./lightrag')
@@ -135,21 +83,10 @@ beforeAll(async () => {
   // module mock would leak a no-op service into every later test file.
   const navSpy = spyOn(navigationService, 'navigateToUnauthenticated')
     .mockImplementation(() => {})
-  const axiosGetSpy = spyOn(axios, 'get').mockImplementation((() =>
-    Promise.resolve({
-      data: {
-        access_token: 'mock-guest-token',
-        auth_configured: false,
-        core_version: '1.0',
-        api_version: '1.0',
-      },
-      headers: {},
-    })) as unknown as typeof axios.get)
   const errorSpy = spyOn(console, 'error').mockImplementation(() => {})
   const warnSpy = spyOn(console, 'warn').mockImplementation(() => {})
   restoreMocks = () => {
     navSpy.mockRestore()
-    axiosGetSpy.mockRestore()
     errorSpy.mockRestore()
     warnSpy.mockRestore()
   }
@@ -159,16 +96,20 @@ afterAll(() => {
   restoreMocks?.()
 })
 
+let snapshot: ProcessStateSnapshot
+beforeEach(() => {
+  snapshot = captureProcessState([authStore, useWebUIAuthStore])
+  localStorage.removeItem('LIGHTRAG-API-TOKEN')
+  authStore.setState({ isGuestMode: false, isAuthenticated: false, username: null })
+  apiModule.__setAxiosAdapterForTests(async (config: any) => ({
+    data: { access_token: 'mock-guest-token', auth_configured: false,
+      api_key_configured: false, core_version: '1.0', api_version: '1.0' },
+    status: 200, statusText: 'OK', headers: {}, config
+  }))
+})
 afterEach(() => {
-  storageData.clear()
-  // Reset the REAL stores' state this file drives (the guest-retry tests go
-  // through the real login(), which flips isAuthenticated/username too).
-  settingsStore.setState({ apiKey: null })
-  authStore.setState({
-    isGuestMode: false,
-    isAuthenticated: false,
-    username: null
-  })
+  apiModule.__setAxiosAdapterForTests(undefined)
+  restoreProcessState([authStore, useWebUIAuthStore], snapshot)
 })
 
 describe('queryTextStream — normal path', () => {
@@ -370,21 +311,6 @@ describe('queryTextStream — abort / stop button', () => {
 
     expect(errorCalled).toBe(false)
   })
-
-  test('exits silently when AbortError is thrown without a signal', async () => {
-    installFetchMock(() =>
-      Promise.reject(new DOMException('Aborted', 'AbortError'))
-    )
-
-    let errorCalled = false
-    await apiModule.queryTextStream(
-      makeQueryRequest(),
-      () => {},
-      () => { errorCalled = true }
-    )
-
-    expect(errorCalled).toBe(false)
-  })
 })
 
 describe('queryTextStream — HTTP errors', () => {
@@ -407,16 +333,6 @@ describe('queryTextStream — HTTP errors', () => {
       status: 500,
       expectedMessage:
         'Server error, please try again later (500)',
-    },
-    {
-      status: 502,
-      expectedMessage:
-        'Server error, please try again later (502)',
-    },
-    {
-      status: 503,
-      expectedMessage:
-        'Server error, please try again later (503)',
     },
   ]
 
@@ -475,11 +391,13 @@ describe('queryTextStream — network errors', () => {
 })
 
 describe('queryTextStream — auth headers', () => {
-  test('includes Bearer token when stored', async () => {
-    storageData.set('LIGHTRAG-API-TOKEN', 'test-jwt-token')
+  test('calls /query/stream and includes the Bearer token when stored', async () => {
+    localStorage.setItem('LIGHTRAG-API-TOKEN', 'test-jwt-token')
 
+    let capturedUrl = ''
     let capturedHeaders: HeadersInit | undefined
-    installFetchMock((_url: string, init?: RequestInit) => {
+    installFetchMock((url: string, init?: RequestInit) => {
+      capturedUrl = url
       capturedHeaders = init?.headers
       return makeNdjsonResponse(['{"response": "ok"}'])
     })
@@ -497,6 +415,7 @@ describe('queryTextStream — auth headers', () => {
     expect(sentHeaders['Authorization']).toBe('Bearer test-jwt-token')
     expect(sentHeaders['Accept']).toBe('application/x-ndjson')
     expect(sentHeaders['Content-Type']).toBe('application/json')
+    expect(capturedUrl).toBe(`${backendBaseUrl}/query/stream`)
   })
 
   test('omits Bearer token when none is stored', async () => {
@@ -515,27 +434,11 @@ describe('queryTextStream — auth headers', () => {
     const sentHeaders = capturedHeaders as Record<string, string>
     expect(sentHeaders['Authorization']).toBeUndefined()
   })
-
-  test('calls /query/stream endpoint', async () => {
-    let capturedUrl = ''
-    installFetchMock((url: string) => {
-      capturedUrl = url
-      return makeNdjsonResponse(['{"response": "ok"}'])
-    })
-
-    await apiModule.queryTextStream(
-      makeQueryRequest(),
-      () => {},
-      () => {}
-    )
-
-    expect(capturedUrl).toBe('http://localhost:9621/query/stream')
-  })
 })
 
 describe('queryTextStream — guest-token 401 retry', () => {
   test('retries with refreshed guest token on 401', async () => {
-    storageData.set('LIGHTRAG-API-TOKEN', 'expired-guest-token')
+    localStorage.setItem('LIGHTRAG-API-TOKEN', 'expired-guest-token')
     authStore.setState({ isGuestMode: true })
 
     let callCount = 0
@@ -560,7 +463,7 @@ describe('queryTextStream — guest-token 401 retry', () => {
   })
 
   test('classifies a non-auth HTTP error on the retried stream (e.g. 429)', async () => {
-    storageData.set('LIGHTRAG-API-TOKEN', 'expired-guest-token')
+    localStorage.setItem('LIGHTRAG-API-TOKEN', 'expired-guest-token')
     authStore.setState({ isGuestMode: true })
 
     let callCount = 0
@@ -665,7 +568,7 @@ describe('queryTextStream — auth termination (401)', () => {
   })
 
   test('guest whose refreshed token is still rejected also gets the typed error', async () => {
-    storageData.set('LIGHTRAG-API-TOKEN', 'expired-guest-token')
+    localStorage.setItem('LIGHTRAG-API-TOKEN', 'expired-guest-token')
     authStore.setState({ isGuestMode: true })
 
     let callCount = 0

@@ -22,7 +22,10 @@ from tenacity import (
     retry_if_exception,
 )
 
+from lightrag.llm_roles import apply_llm_timeout
 from lightrag.utils import (
+    embedding_timeout,
+    provider_timeout,
     TruncatedResponse,
     wrap_embedding_func_with_attrs,
     logger,
@@ -167,12 +170,28 @@ async def zhipu_complete_if_cache(
     if kwargs.get("response_format") is not None:
         enable_cot = False
 
+    # <= 0 or unset means the SDK default. zai-sdk reads an explicit
+    # timeout=None as "no timeout at all", so it is only passed when set.
+    if "timeout" in kwargs:
+        timeout = provider_timeout(kwargs.pop("timeout"))
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+
     # Remove unsupported kwargs
     kwargs = {
         k: v
         for k, v in kwargs.items()
         if k not in ["hashing_kv", "keyword_extraction", "entity_extraction"]
     }
+
+    # Streaming is not implemented here, but the query pipeline always passes
+    # `stream`; with stream=True zai-sdk returns a Stream that has no
+    # `.choices`. Drop it and complete without streaming.
+    if kwargs.pop("stream", None):
+        logger.warning(
+            "zhipu_complete_if_cache: streaming is not supported by this "
+            "binding; completing the request without streaming"
+        )
     # `thinking` is an official Zhipu request field. Example:
     # {"type": "enabled"} enables reasoning output on supported models.
     if thinking is not None:
@@ -252,6 +271,7 @@ async def zhipu_complete(
       compatibility shims; when no explicit ``response_format`` is supplied,
       they are mapped to ``{"type": "json_object"}``.
     """
+    apply_llm_timeout(kwargs)
     # Pop legacy extraction flags from kwargs to avoid passing them downstream.
     keyword_extraction = kwargs.pop("keyword_extraction", keyword_extraction)
     entity_extraction = kwargs.pop("entity_extraction", entity_extraction)
@@ -313,6 +333,13 @@ async def zhipu_embedding(
     # Convert single text to list if needed
     if isinstance(texts, str):
         texts = [texts]
+
+    # A ``timeout`` kwarg wins; otherwise LightRAG's embedding timeout applies
+    # inside a LightRAG call. zai-sdk reads an explicit timeout=None as "no
+    # timeout at all", so it is only passed when set.
+    timeout = embedding_timeout(kwargs.pop("timeout", None))
+    if timeout is not None:
+        kwargs["timeout"] = timeout
 
     cancelled = threading.Event()
 

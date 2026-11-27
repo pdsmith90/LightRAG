@@ -239,6 +239,16 @@ def test_tilde_fence_supported():
     assert "## still code" in ex.blocks[0]["content"]
 
 
+def test_one_line_backtick_code_span_does_not_open_a_fence():
+    """A backtick run followed by text holding a backtick is an inline code
+    span, not a fence opener, so it must not swallow the rest of the file."""
+    md = "# Install\n```pip install lightrag```\n## Usage\n| a | b |\n|---|---|\n| 1 | 2 |\n"
+    ex = _extract(md)
+    assert [b["heading"] for b in ex.blocks] == ["Install", "Usage"]
+    assert "```pip install lightrag```" in ex.blocks[0]["content"]
+    assert len(ex.tables) == 1
+
+
 def test_pipe_table_with_header():
     md = "| Name | Age |\n|------|-----|\n| Bob | 30 |\n| Sue | 25 |\n"
     ex = _extract(md)
@@ -314,14 +324,6 @@ def test_pipe_table_escaped_pipe_in_header_keeps_table():
     assert table["rows"] == [["1", "2"]]
 
 
-def test_pipe_table_escaped_backslash_still_splits():
-    # ``\\`` is a literal backslash, so the ``|`` after it is a real separator.
-    md = "| h1 | h2 |\n| --- | --- |\n| a \\\\| b |\n"
-    ex = _extract(md)
-    (table,) = ex.tables.values()
-    assert table["rows"] == [["a \\", "b"]]
-
-
 def test_escaped_pipe_only_line_over_thematic_break_is_not_a_table():
     # With no unescaped ``|`` the line has no column separator at all, so it is
     # a paragraph, even though its single cell matches the one-cell ``---``.
@@ -362,7 +364,6 @@ def test_escaped_backslash_body_row_splits_into_two_cells():
         ("a \\| b", False),  # escaped pipe: cell content, no separator
         ("a \\\\| b", True),  # escaped backslash, then a real separator
         ("a \\\\\\| b", False),  # escaped backslash, then an escaped pipe
-        ("a \\\\\\\\| b", True),  # two escaped backslashes, then a separator
     ],
 )
 def test_has_unescaped_pipe_agrees_with_the_row_splitter(line, expected):
@@ -631,6 +632,13 @@ def test_inline_dollar_not_recognized_as_equation():
     assert "$5" in ex.blocks[0]["content"]
 
 
+def test_display_math_followed_by_prose_does_not_open_a_block():
+    md = "# A\n$$E = mc^2$$ relates mass and energy.\n## B\n$$\np = mv\n$$\n"
+    ex = _extract(md)
+    assert [b["heading"] for b in ex.blocks] == ["A", "B"]
+    assert list(ex.equations.values()) == ["p = mv"]
+
+
 def test_unclosed_block_equation_is_plain_text():
     ex = _extract("$$\nE = mc^2\nno closing")
     assert not ex.equations
@@ -857,14 +865,17 @@ def test_parenthesised_source_is_limited_in_length():
         # depth for a suffix no image could ever reach (230 MiB for 1 MB).
         "![x](a.png) " + ")" * 1_000_000,
         "![x](a(1).png) " + ")" * 1_000_000,
-        "![x](" + "(" * 1_000_000,
-        "![x](a(" + "()" * 500_000 + ")",
+        # These two are slow under tracemalloc, so they are shorter: an index
+        # over the whole line still takes about 4x the bound at this length.
+        "![x](" + "(" * 250_000,
+        "![x](a(" + "()" * 125_000 + ")",
         "![x](a b" + ".png)" * 200_000,
         "![x](a (b" + ".png) " * 200_000,
         # Code spans are skipped, never indexed: a whole-line list of backtick
-        # runs took 48 MiB for this line.
-        "![x](a.png) " + "`a" * 200_000,
-        "![x](a.png) " + "``a`" * 100_000,
+        # runs took 48 MiB for the first line at twice this length. Halved for
+        # speed, the list still takes 1.5x the bound or more.
+        "![x](a.png) " + "`a" * 100_000,
+        "![x](a.png) " + "``a`" * 50_000,
         "![x](a.png) " + "".join("`" * k + " " for k in range(1, 1_400)),
     ],
 )

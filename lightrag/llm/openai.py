@@ -22,6 +22,8 @@ from openai import (
     InternalServerError,
     BadRequestError,
 )
+
+
 from tenacity import (
     retry,
     stop_after_attempt,
@@ -29,7 +31,11 @@ from tenacity import (
     retry_if_exception,
     retry_if_exception_type,
 )
+from lightrag.llm_roles import apply_llm_timeout
 from lightrag.utils import (
+    embedding_timeout,
+    get_env_value,
+    provider_timeout,
     wrap_embedding_func_with_attrs,
     safe_unicode_decode,
     empty_length_truncated_hint,
@@ -78,6 +84,19 @@ except ImportError:
 # allows to use different .env file for each lightrag instance
 # the OS environment variables take precedence over the .env file
 load_dotenv(dotenv_path=".env", override=False)
+
+
+def _chat_usage_counts(usage: Any) -> dict[str, int]:
+    counts = {
+        "prompt_tokens": getattr(usage, "prompt_tokens", 0),
+        "completion_tokens": getattr(usage, "completion_tokens", 0),
+        "total_tokens": getattr(usage, "total_tokens", 0),
+    }
+    details = getattr(usage, "prompt_tokens_details", None)
+    cached_tokens = getattr(details, "cached_tokens", None)
+    if cached_tokens is not None:
+        counts["cached_prompt_tokens"] = cached_tokens
+    return counts
 
 
 class InvalidResponseError(Exception):
@@ -172,11 +191,7 @@ _TIKTOKEN_ENCODING_CACHE: dict[str, Any] = {}
 # Whether to request base64-encoded embeddings from the API.
 # Base64 is more efficient over the wire; set EMBEDDING_USE_BASE64=false for
 # providers that don't support it (e.g. Yandex Cloud).
-EMBEDDING_USE_BASE64: bool = os.getenv("EMBEDDING_USE_BASE64", "true").lower() in (
-    "true",
-    "1",
-    "yes",
-)
+EMBEDDING_USE_BASE64: bool = get_env_value("EMBEDDING_USE_BASE64", True, bool)
 
 
 def _get_tiktoken_encoding_for_model(model: str) -> Any:
@@ -450,7 +465,11 @@ async def openai_complete_if_cache(
     3. If both `content` and `reasoning_content` are present simultaneously, reasoning is ignored.
     4. If both fields have content from the start, COT is never activated.
     5. For streaming: COT content is inserted into the content stream with <think> tags.
-    6. For non-streaming: COT content is prepended to regular content with <think> tags.
+    6. For non-streaming: reasoning is never returned. Rules 1 and 3 leave it
+       only one place, a response with no answer text, and that response is
+       empty whatever `enable_cot` says: it raises like any empty response
+       (retryable `InvalidResponseError`, or `EmptyTruncatedResponseError`
+       when the token limit stopped generation).
 
     Args:
         model: The OpenAI model to use. For Azure, this can be the deployment name.
@@ -512,6 +531,9 @@ async def openai_complete_if_cache(
 
     # Remove special kwargs that shouldn't be passed to OpenAI
     kwargs.pop("hashing_kv", None)
+
+    # <= 0 means the SDK default: None is not passed on below.
+    timeout = provider_timeout(timeout)
 
     # Extract client configuration options
     client_configs = kwargs.pop("openai_client_configs", {})
@@ -772,14 +794,7 @@ async def openai_complete_if_cache(
 
                 # After streaming is complete, track token usage
                 if token_tracker and final_chunk_usage:
-                    # Use actual usage from the API
-                    token_counts = {
-                        "prompt_tokens": getattr(final_chunk_usage, "prompt_tokens", 0),
-                        "completion_tokens": getattr(
-                            final_chunk_usage, "completion_tokens", 0
-                        ),
-                        "total_tokens": getattr(final_chunk_usage, "total_tokens", 0),
-                    }
+                    token_counts = _chat_usage_counts(final_chunk_usage)
                     token_tracker.add_usage(token_counts)
                     logger.debug(f"Streaming token usage (from API): {token_counts}")
                 elif token_tracker:
@@ -860,13 +875,7 @@ async def openai_complete_if_cache(
             # trace is exactly the case that raises, and omitting it would
             # under-report by a full-budget generation.
             if token_tracker and hasattr(response, "usage"):
-                token_counts = {
-                    "prompt_tokens": getattr(response.usage, "prompt_tokens", 0),
-                    "completion_tokens": getattr(
-                        response.usage, "completion_tokens", 0
-                    ),
-                    "total_tokens": getattr(response.usage, "total_tokens", 0),
-                }
+                token_counts = _chat_usage_counts(response.usage)
                 token_tracker.add_usage(token_counts)
 
             # Compatible gateways can return non-JSON bodies that the SDK
@@ -900,39 +909,14 @@ async def openai_complete_if_cache(
                 content = getattr(message, "content", None)
                 reasoning_content = getattr(message, "reasoning_content", "")
 
-                # Handle COT logic for non-streaming responses (only if enabled)
-                final_content = ""
-
-                if enable_cot:
-                    # Check if we should include reasoning content
-                    should_include_reasoning = False
-                    if reasoning_content and reasoning_content.strip():
-                        if not content or content.strip() == "":
-                            # Case 1: Only reasoning content, should include COT
-                            should_include_reasoning = True
-                            final_content = (
-                                content or ""
-                            )  # Use empty string if content is None
-                        else:
-                            # Case 3: Both content and reasoning_content present, ignore reasoning
-                            should_include_reasoning = False
-                            final_content = content
-                    else:
-                        # No reasoning content, use regular content
-                        final_content = content or ""
-
-                    # Apply COT wrapping if needed
-                    if should_include_reasoning:
-                        if r"\u" in reasoning_content:
-                            reasoning_content = safe_unicode_decode(
-                                reasoning_content.encode("utf-8")
-                            )
-                        final_content = (
-                            f"<think>{reasoning_content}</think>{final_content}"
-                        )
-                else:
-                    # COT disabled, only use regular content
-                    final_content = content or ""
+                # Non-streaming never returns reasoning, whatever enable_cot
+                # says: it is ignored once content exists, so the only place
+                # it could go is a response with NO answer, where a
+                # <think>...</think> wrapper would turn a failed generation
+                # into a non-empty "answer" and skip the retry below. A
+                # reasoning-only response is therefore validated as the empty
+                # response it is (see the docstring, rule 6).
+                final_content = content or ""
 
                 # Validate final content
                 if not final_content or final_content.strip() == "":
@@ -1024,6 +1008,7 @@ async def openai_complete(
     entity_extraction=False,
     **kwargs,
 ) -> Union[str, AsyncIterator[str]]:
+    apply_llm_timeout(kwargs, client_config_keys=("openai_client_configs",))
     if history_messages is None:
         history_messages = []
     # Pop entity_extraction from kwargs if also passed there (avoid duplication)
@@ -1049,6 +1034,7 @@ async def gpt_4o_complete(
     entity_extraction=False,
     **kwargs,
 ) -> str:
+    apply_llm_timeout(kwargs, client_config_keys=("openai_client_configs",))
     if history_messages is None:
         history_messages = []
     entity_extraction = kwargs.pop("entity_extraction", entity_extraction)
@@ -1073,6 +1059,7 @@ async def gpt_4o_mini_complete(
     entity_extraction=False,
     **kwargs,
 ) -> str:
+    apply_llm_timeout(kwargs, client_config_keys=("openai_client_configs",))
     if history_messages is None:
         history_messages = []
     entity_extraction = kwargs.pop("entity_extraction", entity_extraction)
@@ -1097,6 +1084,7 @@ async def nvidia_openai_complete(
     entity_extraction=False,
     **kwargs,
 ) -> str:
+    apply_llm_timeout(kwargs, client_config_keys=("openai_client_configs",))
     if history_messages is None:
         history_messages = []
     entity_extraction = kwargs.pop("entity_extraction", entity_extraction)
@@ -1151,6 +1139,7 @@ async def openai_embed(
     context: str = "document",
     query_prefix: str | None = None,
     document_prefix: str | None = None,
+    timeout: float | None = None,
 ) -> np.ndarray:
     """Generate embeddings for a list of texts using OpenAI's API with automatic text truncation.
 
@@ -1195,9 +1184,16 @@ async def openai_embed(
             when supports_asymmetric=True. Default is "document".
         query_prefix: Optional prefix to prepend to texts when context="query" (e.g., "search_query: ").
         document_prefix: Optional prefix to prepend to texts when context="document" (e.g., "search_document: ").
+        timeout: Request timeout in seconds. A positive value wins over a
+            ``"timeout"`` in ``client_configs``. None (the default) uses that
+            ``client_configs`` entry if set, else LightRAG's
+            ``default_embedding_timeout`` inside a LightRAG embedding call.
+            0 or a negative value means LightRAG sets no timeout: the
+            ``client_configs`` entry still applies if set, else the SDK
+            default (600 s), as in ``openai_complete_if_cache``.
 
     Returns:
-        A numpy array of embeddings, one per input text.
+        A numpy array of embeddings, one per input text in input order.
 
     Raises:
         APIConnectionError: If there is a connection error with the OpenAI API.
@@ -1250,6 +1246,12 @@ async def openai_embed(
 
         texts = truncated_texts
 
+    # A "timeout" in client_configs is the caller's explicit choice: only a
+    # positive argument outranks it, and LightRAG's own timeout never does.
+    # None reaches the builder as "omit", which leaves that entry in place.
+    if timeout is not None or not (client_configs and "timeout" in client_configs):
+        timeout = embedding_timeout(timeout)
+
     # Create the OpenAI client (supports both OpenAI and Azure)
     openai_async_client = create_openai_async_client(
         api_key=api_key,
@@ -1257,6 +1259,7 @@ async def openai_embed(
         use_azure=use_azure,
         azure_deployment=azure_deployment,
         api_version=api_version,
+        timeout=timeout,
         client_configs=client_configs,
     )
     caller_supplied_http_client = _caller_supplied_http_client(client_configs)
@@ -1290,12 +1293,28 @@ async def openai_embed(
             }
             token_tracker.add_usage(token_counts)
 
+        rows = response.data
+        # Some compatible endpoints omit indices entirely. Preserve their
+        # response order, but never accept an ambiguous partially indexed batch.
+        indices = [getattr(row, "index", None) for row in rows]
+        if any(index is not None for index in indices):
+            if (
+                len(indices) != len(texts)
+                or any(type(index) is not int for index in indices)
+                or set(indices) != set(range(len(texts)))
+            ):
+                raise ValueError(
+                    f"OpenAI-compatible API returned invalid embedding indices "
+                    f"for {len(texts)} texts (first 10: {indices[:10]})"
+                )
+            rows = sorted(rows, key=lambda row: row.index)
+
         return np.array(
             [
                 np.array(dp.embedding, dtype=np.float32)
                 if isinstance(dp.embedding, list)
                 else np.frombuffer(base64.b64decode(dp.embedding), dtype=np.float32)
-                for dp in response.data
+                for dp in rows
             ]
         )
     finally:
@@ -1375,6 +1394,7 @@ async def azure_openai_complete(
 
     Provides backward compatibility for azure_openai_complete calls.
     """
+    apply_llm_timeout(kwargs, client_config_keys=("openai_client_configs",))
     if history_messages is None:
         history_messages = []
     entity_extraction = kwargs.pop("entity_extraction", entity_extraction)
@@ -1409,6 +1429,7 @@ async def azure_openai_embed(
     query_prefix: str | None = None,
     document_prefix: str | None = None,
     max_token_size: int | None = None,
+    timeout: float | None = None,
 ) -> np.ndarray:
     """Azure OpenAI embedding wrapper function.
 
@@ -1494,4 +1515,5 @@ async def azure_openai_embed(
         context=context,
         query_prefix=query_prefix,
         document_prefix=document_prefix,
+        timeout=timeout,
     )

@@ -23,7 +23,10 @@ from tenacity import (
 from collections.abc import AsyncIterator
 from typing import Any, Union
 
+from lightrag.llm_roles import apply_llm_timeout
 from lightrag.utils import (
+    embedding_timeout,
+    provider_timeout,
     TruncatedResponse,
     empty_length_truncated_hint,
     format_response_diagnostics,
@@ -98,6 +101,8 @@ def _bedrock_client_kwargs(
         client_kwargs["aws_secret_access_key"] = aws_secret_access_key
     if aws_session_token:
         client_kwargs["aws_session_token"] = aws_session_token
+    # <= 0 or unset keeps botocore's defaults (60s each).
+    timeout = provider_timeout(timeout)
     if timeout is not None:
         client_kwargs["config"] = BotocoreConfig(
             connect_timeout=timeout,
@@ -190,6 +195,8 @@ def _handle_bedrock_exception(e: Exception, operation: str = "Bedrock API") -> N
         | retry_if_exception_type(BedrockConnectionError)
         | retry_if_exception_type(BedrockTimeoutError)
     ),
+    # Surface the last attempt's own exception rather than tenacity.RetryError.
+    reraise=True,
 )
 async def bedrock_complete_if_cache(
     model,
@@ -451,19 +458,20 @@ async def bedrock_complete_if_cache(
             ):
                 raise BedrockError("Invalid response structure from Bedrock API")
 
-            # When thinking/reasoning is enabled, the first content block is a
-            # `reasoningContent` block and the visible text follows in a later
-            # block. Pick the first block that carries a text payload.
-            content = next(
-                (
-                    block["text"]
-                    for block in response["output"]["message"]["content"]
-                    if isinstance(block, dict) and block.get("text")
-                ),
-                None,
-            )
+            # When thinking/reasoning is enabled, `reasoningContent` and
+            # `text` blocks can interleave as [reasoning, text, reasoning,
+            # text, ...], not just [reasoning, text], so every text block
+            # must be joined rather than returning only the first one found.
+            text_blocks = [
+                block["text"]
+                for block in response["output"]["message"]["content"]
+                if isinstance(block, dict) and block.get("text")
+            ]
+            content = "".join(text_blocks) if text_blocks else None
 
             stop_reason = response.get("stopReason")
+            hit_context_limit = stop_reason == "model_context_window_exceeded"
+            truncated = stop_reason == "max_tokens" or hit_context_limit
 
             usage = response.get("usage") or {}
             if token_tracker is not None and usage:
@@ -497,7 +505,11 @@ async def bedrock_complete_if_cache(
                     outputTokens=usage.get("outputTokens"),
                     reasoning_content_len=reasoning_len,
                 )
-                if stop_reason == "max_tokens":
+                if hit_context_limit:
+                    hint = (
+                        "shorten the input or use a model with a larger context window"
+                    )
+                elif stop_reason == "max_tokens":
                     hint = empty_length_truncated_hint(
                         "consider raising BEDROCK_LLM_MAX_TOKENS or disabling "
                         "thinking mode",
@@ -518,11 +530,12 @@ async def bedrock_complete_if_cache(
                 raise BedrockError(error_message)
 
             # Flag token-limit truncation (Converse API stopReason ==
-            # "max_tokens") so the cache layer skips persisting partial output.
-            if stop_reason == "max_tokens":
+            # "max_tokens" or "model_context_window_exceeded") so the cache
+            # layer skips persisting partial output.
+            if truncated:
                 logger.warning(
                     "Bedrock response truncated by token limit "
-                    f"(stopReason=max_tokens, content_len={len(content)}), returning partial content"
+                    f"(stopReason={stop_reason}, content_len={len(content)}), returning partial content"
                 )
                 content = TruncatedResponse(content)
 
@@ -542,6 +555,7 @@ async def bedrock_complete(
     entity_extraction=False,
     **kwargs,
 ) -> Union[str, AsyncIterator[str]]:
+    apply_llm_timeout(kwargs)
     # Bedrock Converse API has no JSON mode; the shim booleans are absorbed
     # and forwarded so bedrock_complete_if_cache can emit DeprecationWarnings
     # with accurate stack frames.
@@ -569,6 +583,8 @@ async def bedrock_complete(
         | retry_if_exception_type(BedrockConnectionError)
         | retry_if_exception_type(BedrockTimeoutError)
     ),
+    # Surface the last attempt's own exception rather than tenacity.RetryError.
+    reraise=True,
 )
 async def bedrock_embed(
     texts: list[str],
@@ -581,12 +597,18 @@ async def bedrock_embed(
     endpoint_url: str | None = None,
     *,
     embedding_dim: int | None = None,
+    timeout: float | None = None,
 ) -> np.ndarray:
     """Generate embeddings with Amazon Bedrock Runtime.
 
     ``embedding_dim`` requests an output dimension for Titan V2 only.
     Titan V1 and Cohere keep their model-defined dimensions. The API server
     forwards this option when ``EMBEDDING_SEND_DIM=true``.
+
+    ``timeout`` (seconds) maps to botocore ``connect_timeout`` and
+    ``read_timeout``. None (the default) uses LightRAG's
+    ``default_embedding_timeout`` inside a LightRAG embedding call; 0 or a
+    negative value, or None outside one, keeps botocore's defaults (60 s).
 
     Authentication note:
     - Bedrock does not use LightRAG's generic ``api_key`` fields.
@@ -619,6 +641,7 @@ async def bedrock_embed(
             aws_access_key_id=aws_access_key_id,
             aws_secret_access_key=aws_secret_access_key,
             aws_session_token=aws_session_token,
+            timeout=embedding_timeout(timeout),
         ),
     ) as bedrock_async_client:
         try:

@@ -2,8 +2,8 @@
 
 `zlightrag` is the default branch of this fork of
 [LightRAG](https://github.com/HKUDS/LightRAG). It is upstream LightRAG's `main` as of
-2026-11-17 (commit `31bff1f60`, which reports version **1.5.8**; upstream has tagged no
-1.5.8 release) plus the changes listed below, and a `zotero-toolkit/` directory. Together they run LightRAG
+2026-11-27 (commit `47038cf16`, which reports version **1.5.9**, past the v1.5.8 tag;
+upstream has tagged no 1.5.9 release) plus the changes listed below, and a `zotero-toolkit/` directory. Together they run LightRAG
 as a research knowledge base over a [Zotero](https://www.zotero.org) library: answers
 cite real bibliographic entries, reference-list text is kept out of the answer
 context, and retrieval budgets can be held to what a small LLM context window takes.
@@ -547,6 +547,14 @@ chunk id stays), as on the base branch, while a chunk with records still contrib
 The `lightrag-repair-chunk-tracking` tool attributes a chunk with stored records from
 them, names the fold changed included; a chunk without them from its cache, where a
 name the fold changed gets no attribution, as on the base branch.
+
+Failed re-extraction. A deletion's rebuild that re-extracts a surviving chunk (upstream's
+rule when its extraction cache is gone) runs the extraction, hook included. If that
+fails with a hook set, the extract rows the run cached are removed again
+(`_drop_unvetted_extract_rows`), because a cached row is never re-hooked and a retry
+would otherwise rebuild from records the hook may have rejected. When a rebuild
+needs several windows (`KG_REBUILD_WINDOW_CHUNKS`), every relation window runs before
+any entity window, each window holding one kind, so an entity still reads rebuilt edges.
 
 Chunks extracted before. Every chunk extracted before this rule, with or without the
 contract (production has none with it), carries no records and is rebuilt from its
@@ -1092,8 +1100,8 @@ Its offline tests run from
 ## How this branch follows upstream
 
 The changes above were rebuilt onto the v1.5.7 release tag on 2026-09-26, and the
-branch has since taken upstream `main` by merge, most recently `31bff1f60` (merged
-2026-11-17). Its history is no longer rewritten: a rebuild onto a new base is published
+branch has since taken upstream `main` by merge, most recently `47038cf16` (merged
+2026-11-27). Its history is no longer rewritten: a rebuild onto a new base is published
 as a merge commit whose tree is the rebuild's, so any commit you pin stays on the
 branch.
 

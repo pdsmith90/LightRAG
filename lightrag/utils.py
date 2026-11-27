@@ -50,6 +50,7 @@ from lightrag.exceptions import (
     ChunkBlockMatchError,
     CommitBookkeepingError,
     EmptyTruncatedResponseError,
+    ReasoningOnlyResponseError,
 )
 from lightrag.constants import (
     DEFAULT_LOG_MAX_BYTES,
@@ -323,6 +324,39 @@ def validate_file_path_security(file_path_str: str, base_dir: Path) -> Optional[
         return None
 
 
+# Spellings accepted for boolean env values. A blank value counts as false,
+# matching the historical "anything not true is false" reading of ``KEY=``.
+ENV_BOOL_TRUE_WORDS = ("true", "1", "yes", "t", "on")
+ENV_BOOL_FALSE_WORDS = ("false", "0", "no", "f", "off", "")
+
+
+def parse_bool_setting(
+    name: str, value: str, default: bool, source: str = "Environment variable"
+) -> bool:
+    """Parse a boolean setting with the ``get_env_value(..., bool)`` rules.
+
+    ``value`` is matched trimmed and case-insensitively against
+    ``ENV_BOOL_TRUE_WORDS`` / ``ENV_BOOL_FALSE_WORDS`` (blank reads as
+    ``False``). Anything else logs a warning naming ``source`` and ``name``
+    and returns ``default``. Use it for settings read from somewhere other
+    than the environment alone, such as an env-over-``config.ini`` lookup.
+    """
+    text = value.strip().lower()
+    if text in ENV_BOOL_TRUE_WORDS:
+        return True
+    if text in ENV_BOOL_FALSE_WORDS:
+        return False
+    logger.warning(
+        f"{source} %s=%r is not a recognized boolean "
+        "(expected one of %s), using default %r",
+        name,
+        value,
+        "/".join(w for w in ENV_BOOL_TRUE_WORDS + ENV_BOOL_FALSE_WORDS if w),
+        default,
+    )
+    return default
+
+
 def get_env_value(
     env_key: str, default: any, value_type: type = str, special_none: bool = False
 ) -> any:
@@ -336,7 +370,13 @@ def get_env_value(
         special_none (bool): If True, return None when value is "None"
 
     Returns:
-        any: Converted value from environment or default
+        any: Converted value from environment or default. A value that does
+        not convert falls back to ``default``; a non-blank one also logs a
+        warning, a blank one (``KEY=`` in .env/Compose) does not.
+
+    For ``bool`` the accepted spellings are ``ENV_BOOL_TRUE_WORDS`` and
+    ``ENV_BOOL_FALSE_WORDS`` (blank reads as ``False``); anything else, such
+    as the typo ``ture``, warns and returns ``default``.
     """
     value = os.getenv(env_key)
     if value is None:
@@ -347,7 +387,7 @@ def get_env_value(
         return None
 
     if value_type is bool:
-        return value.strip().lower() in ("true", "1", "yes", "t", "on")
+        return parse_bool_setting(env_key, value, default)
 
     # Handle list type with JSON parsing
     if value_type is list:
@@ -372,6 +412,16 @@ def get_env_value(
     try:
         converted = value_type(value)
     except (ValueError, TypeError):
+        # A blank value is the usual "unset" idiom in .env/Compose and falls
+        # back quietly; anything else is a typo the operator should hear about.
+        if value.strip():
+            logger.warning(
+                "Environment variable %s=%r is not a valid %s, using default %r",
+                env_key,
+                value,
+                getattr(value_type, "__name__", value_type),
+                default,
+            )
         return default
 
     # Reject non-finite floats so env-backed thresholds cannot become NaN/Inf.
@@ -439,10 +489,8 @@ if TYPE_CHECKING:
 # the OS environment variables take precedence over the .env file
 load_dotenv(dotenv_path=".env", override=False)
 
-VERBOSE_DEBUG = os.getenv("VERBOSE", "false").lower() == "true"
-PERFORMANCE_TIMING_LOGS = (
-    os.getenv("LIGHTRAG_PERFORMANCE_TIMING_LOGS", "false").lower() == "true"
-)
+VERBOSE_DEBUG = get_env_value("VERBOSE", False, bool)
+PERFORMANCE_TIMING_LOGS = get_env_value("LIGHTRAG_PERFORMANCE_TIMING_LOGS", False, bool)
 
 
 def verbose_debug(msg: str, *args, **kwargs):
@@ -1031,7 +1079,12 @@ def get_unique_filename_in_parsed(target_dir: Path, original_name: str) -> str:
     """Generate a unique filename in target_dir, adding numeric suffixes on conflict.
 
     Tries the original name first, then `{stem}_001{ext}` ... `{stem}_999{ext}`,
-    falling back to a timestamp-suffixed name if all numeric slots are taken.
+    falling back to `{stem}_{unix_seconds}{ext}` if all numeric slots are taken;
+    an occupied timestamp name advances the suffix by one until a free name is
+    found, so the suffix may run ahead of the clock.
+
+    The name is only free when checked: the caller renames separately, so two
+    concurrent callers can still pick the same name.
     """
     original_path = Path(original_name)
     base_name = original_path.stem
@@ -1045,7 +1098,12 @@ def get_unique_filename_in_parsed(target_dir: Path, original_name: str) -> str:
         if not (target_dir / new_name).exists():
             return new_name
 
-    return f"{base_name}_{int(time.time())}{extension}"
+    # Probe existing timestamp names too. The caller still chooses and renames
+    # separately, so this only avoids overwriting a file already on disk.
+    suffix = int(time.time())
+    while (target_dir / f"{base_name}_{suffix}{extension}").exists():
+        suffix += 1
+    return f"{base_name}_{suffix}{extension}"
 
 
 async def move_file_to_parsed_dir(
@@ -1196,6 +1254,103 @@ class TokenBudgetError(Exception):
         )
 
 
+def provider_timeout(timeout: Any) -> Any:
+    """The timeout to hand a provider client, or None to keep the SDK default.
+
+    ``LLM_TIMEOUT`` / ``{ROLE}_LLM_TIMEOUT`` / ``default_llm_timeout`` of 0 (or
+    a negative value) mean "LightRAG sets no timeout; the provider SDK's own
+    default applies" -- never "wait forever". So a number <= 0 maps to None,
+    like an unset value; anything else (a positive number, an
+    ``httpx.Timeout``) is returned unchanged.
+
+    A provider must then OMIT the timeout when this returns None rather than
+    pass ``timeout=None`` on: OpenAI-style SDKs read an explicit None as "no
+    timeout at all", and httpx-based ones time out at once on 0.
+    """
+    if (
+        isinstance(timeout, (int, float))
+        and not isinstance(timeout, bool)
+        and timeout <= 0
+    ):
+        return None
+    return timeout
+
+
+# The effective embedding / rerank timeout of the LightRAG call running in this
+# context (``default_embedding_timeout`` / ``default_rerank_timeout``): the
+# value that call's queue is sized from. ``bind_embedding_timeout`` /
+# ``bind_rerank_timeout`` set it inside the queue worker around each call;
+# ``embedding_timeout`` / ``rerank_timeout`` read it so a bundled binding sizes
+# its client the same way, even when it is reached through a ``partial`` or a
+# custom function.
+_EMBEDDING_TIMEOUT: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "lightrag_embedding_timeout"
+)
+_RERANK_TIMEOUT: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "lightrag_rerank_timeout"
+)
+
+
+def _bind_call_timeout(
+    func: Callable[..., Any], timeout_var: contextvars.ContextVar, timeout: Any
+) -> Callable[..., Any]:
+    @wraps(func)
+    async def call_with_timeout(*args: Any, **kwargs: Any) -> Any:
+        token = timeout_var.set(timeout)
+        try:
+            return await func(*args, **kwargs)
+        finally:
+            timeout_var.reset(token)
+
+    return call_with_timeout
+
+
+def bind_embedding_timeout(
+    func: Callable[..., Any], timeout: Any
+) -> Callable[..., Any]:
+    """Wrap async ``func`` so :func:`embedding_timeout` sees ``timeout`` inside it.
+
+    Apply it BEFORE ``priority_limit_async_func_call``, so the value is set
+    inside the worker task that executes the call. ``timeout`` is never
+    passed to ``func`` as an argument, and ``func``'s signature stays
+    inspectable through ``__wrapped__`` (``EmbeddingFunc`` reads it).
+    """
+    return _bind_call_timeout(func, _EMBEDDING_TIMEOUT, timeout)
+
+
+def bind_rerank_timeout(func: Callable[..., Any], timeout: Any) -> Callable[..., Any]:
+    """Wrap async ``func`` so :func:`rerank_timeout` sees ``timeout`` inside it.
+
+    Same rules as :func:`bind_embedding_timeout`.
+    """
+    return _bind_call_timeout(func, _RERANK_TIMEOUT, timeout)
+
+
+def embedding_timeout(timeout: Any = None) -> Any:
+    """The timeout an embedding binding hands its client, or None for the SDK default.
+
+    ``timeout`` is the binding's own explicit argument and wins when given.
+    When it is None, the effective ``default_embedding_timeout`` of the
+    LightRAG embedding call in progress applies, and nothing outside one. The
+    result goes through :func:`provider_timeout`, so a number <= 0 also
+    returns None: the binding must then OMIT the timeout, not pass None on.
+    """
+    if timeout is None:
+        timeout = _EMBEDDING_TIMEOUT.get(None)
+    return provider_timeout(timeout)
+
+
+def rerank_timeout(timeout: Any = None) -> Any:
+    """The timeout a rerank binding hands its client, or None for the SDK default.
+
+    Same rules as :func:`embedding_timeout`, with ``default_rerank_timeout``
+    as the fallback inside a LightRAG rerank call.
+    """
+    if timeout is None:
+        timeout = _RERANK_TIMEOUT.get(None)
+    return provider_timeout(timeout)
+
+
 def priority_limit_async_func_call(
     max_size: int,
     llm_timeout: float = None,
@@ -1219,7 +1374,10 @@ def priority_limit_async_func_call(
     Args:
         max_size: Maximum number of concurrent calls
         max_queue_size: Maximum queue capacity to prevent memory overflow
-        llm_timeout: LLM provider timeout (from global config), used to calculate other timeouts
+        llm_timeout: LLM provider timeout (from global config), used to calculate other timeouts.
+            A value <= 0 means the provider SDK's default timeout applies (see
+            ``provider_timeout``): no execution or health-check cap is derived
+            from it, since the client's own timeout bounds the call.
         max_execution_timeout: Maximum time for worker to execute function (defaults to llm_timeout + 30s)
         max_task_duration: Maximum time before health check intervenes (defaults to llm_timeout + 60s)
         cleanup_timeout: Maximum time to wait for cleanup operations (defaults to 2.0s)
@@ -1258,6 +1416,15 @@ def priority_limit_async_func_call(
         # Ensure func is callable
         if not callable(func):
             raise TypeError(f"Expected a callable object, got {type(func)}")
+
+        # A non-positive ``llm_timeout`` means "LightRAG sets no timeout; the
+        # provider SDK's default bounds the call" (see ``provider_timeout``).
+        # Normalize it to the unset state here, otherwise the derivation below
+        # produces a 0s worker budget and ``asyncio.wait_for`` fails every call
+        # before the wrapped function starts.
+        nonlocal llm_timeout
+        if provider_timeout(llm_timeout) is None:
+            llm_timeout = None
 
         # Calculate timeout hierarchy if llm_timeout is provided (Dynamic Timeout Calculation)
         if llm_timeout is not None:
@@ -3088,6 +3255,23 @@ def mark_cancellation_deferred(exc: BaseException) -> None:
         setattr(exc, _DEFERRED_PAST_CANCEL_ATTR, True)
 
 
+def retract_cancellation_deferred(exc: BaseException) -> None:
+    """Withdraw the stamp after the caller ROLLED BACK what the region wrote.
+
+    ``_wait_deferring_cancellation`` judges only the future it was given: a
+    write that finished after the cancel was requested is stamped as durable.
+    A caller that then undoes that write on its way out -- the upload route
+    unlinking the file it was copying -- must call this once the undo has
+    SUCCEEDED, or the cancellation it re-raises claims a write that no longer
+    exists. Do not call it when the undo failed: what was written is still
+    there, and the stamp is then the truthful report.
+
+    A no-op for anything that is not a stamped cancellation.
+    """
+    if isinstance(exc, asyncio.CancelledError) and cancellation_was_deferred(exc):
+        setattr(exc, _DEFERRED_PAST_CANCEL_ATTR, False)
+
+
 async def _wait_deferring_cancellation(
     future: "asyncio.Future",
     pending_cancel: Optional[asyncio.CancelledError],
@@ -4392,14 +4576,6 @@ def _map_child_span(
     return {"start": abs_start, "end": abs_end}
 
 
-# U+FFFD. A token window whose boundary splits a multi-byte UTF-8 character
-# (any non-ASCII char: 2-byte Latin/Greek, 3-byte CJK and symbols, 4-byte emoji)
-# decodes the partial bytes to this character. Shared by the fixed-token chunker,
-# this function and sidecar backfill so the three agree on what a boundary
-# artifact is.
-_REPLACEMENT_CHAR = "\ufffd"
-
-
 def enforce_chunk_token_limit_before_embedding(
     chunking_result: list[dict[str, Any]] | tuple[dict[str, Any], ...],
     tokenizer: Tokenizer,
@@ -4430,14 +4606,9 @@ def enforce_chunk_token_limit_before_embedding(
     cannot be trusted at all, and this raises ``ChunkBlockMatchError`` rather
     than silently emitting a wrong span — the same failure sidecar backfill
     itself would eventually surface, just earlier and with better context.
-    A span recovered by stripping boundary U+FFFD, or a parent with no span
-    whose content still contains U+FFFD, is not that divergence: the children
-    are marked ``_source_span_unavailable`` (popped before the chunk dict is
-    stored) so backfill degrades them instead of failing the document. The
-    recovered case is recognized by the content minus its leading/trailing
-    U+FFFD matching the source slice; interior U+FFFD that the source itself
-    contains does not disqualify it. Content that does not reconcile with the
-    source slice still raises.
+    A parent without a usable span gives its children none either, whatever
+    its content holds; for a chunk eligible for backfill that fails the
+    document there.
 
     Known limitation -- ``sidecar`` is not re-scoped for pre-sidecar chunks:
     this function runs BEFORE :func:`lightrag.sidecar.backfill.backfill_chunk_sidecars`
@@ -4511,7 +4682,6 @@ def enforce_chunk_token_limit_before_embedding(
         # O(parent length)).
         projection: list[int] | None = None
         parent_start = parent_end = None
-        span_unavailable = False
         if isinstance(parent_span, dict):
             try:
                 parent_start = int(parent_span["start"])
@@ -4524,32 +4694,7 @@ def enforce_chunk_token_limit_before_embedding(
                 parent_start = parent_end = None
 
             if parent_start is not None and parent_end - parent_start != len(content):
-                # A span recovered by stripping boundary U+FFFD is not a
-                # verbatim slice of the chunk beside it. Child offsets cannot
-                # be projected (a ZWJ sequence makes the width gap unequal to
-                # the replacement count). Mark the children unavailable
-                # instead of raising. Interior U+FFFD is allowed: the source
-                # comparison below proves it is the source's own character.
-                # Content that does not reconcile with the source slice is
-                # still a real divergence.
-                boundary_artifact = False
-                if source_content and (
-                    content.startswith(_REPLACEMENT_CHAR)
-                    or content.endswith(_REPLACEMENT_CHAR)
-                ):
-                    stripped = content.strip(_REPLACEMENT_CHAR)
-                    if stripped:
-                        source_slice = source_content[parent_start:parent_end]
-                        stripped_compact = "".join(stripped.split())
-                        if source_slice == stripped or (
-                            stripped_compact
-                            and stripped_compact == "".join(source_slice.split())
-                        ):
-                            boundary_artifact = True
-                if boundary_artifact:
-                    span_unavailable = True
-                    parent_start = parent_end = None
-                elif source_content:
+                if source_content:
                     projection = _parent_to_source_projection(
                         source_content, parent_start, parent_end, content
                     )
@@ -4566,13 +4711,6 @@ def enforce_chunk_token_limit_before_embedding(
                     # _map_child_span is never reached with an untrustworthy
                     # direct-arithmetic assumption).
                     parent_start = parent_end = None
-        if parent_start is None and _REPLACEMENT_CHAR in content:
-            # No usable parent span (probe failed, or a boundary-recovered
-            # span we refused to project). Children that no longer contain
-            # U+FFFD must degrade instead of failing backfill. A literal
-            # U+FFFD is not itself the marker.
-            span_unavailable = True
-
         total_parts = len(spans)
         for i, span in enumerate(spans, 1):
             piece = content[span.start : span.end]
@@ -4590,19 +4728,15 @@ def enforce_chunk_token_limit_before_embedding(
             if isinstance(base_chunk_id, str) and base_chunk_id.strip():
                 new_dp["chunk_id"] = f"{base_chunk_id}-s{i:02d}"
 
-            if span_unavailable:
-                new_dp.pop("_source_span", None)
-                new_dp["_source_span_unavailable"] = True
+            child_span = None
+            if parent_start is not None:
+                child_span = _map_child_span(
+                    span.start, span.end, parent_start, parent_end, projection
+                )
+            if child_span is not None:
+                new_dp["_source_span"] = child_span
             else:
-                child_span = None
-                if parent_start is not None:
-                    child_span = _map_child_span(
-                        span.start, span.end, parent_start, parent_end, projection
-                    )
-                if child_span is not None:
-                    new_dp["_source_span"] = child_span
-                elif "_source_span" in new_dp:
-                    new_dp.pop("_source_span", None)
+                new_dp.pop("_source_span", None)
 
             new_dp["split_type"] = "hard_fallback"
             new_dp["split_part"] = i
@@ -4915,6 +5049,20 @@ def always_get_an_event_loop() -> asyncio.AbstractEventLoop:
     return new_loop
 
 
+def _markdown_table_cell(value: Any) -> str:
+    """Render ``value`` as one cell of a Markdown table row.
+
+    A literal ``|`` ends a cell, so a value holding one (common in text
+    extracted from tables) would spill into the next column, and a line break
+    would end the row. Escape the pipe, doubling any backslashes right before
+    it so a stored ``\\|`` cannot cancel the escape, and turn line breaks into
+    ``<br>``. A value with neither is written unchanged, so any other Markdown
+    it holds renders as it always did.
+    """
+    text = re.sub(r"(\\*)\|", lambda m: m.group(1) * 2 + "\\|", str(value))
+    return re.sub(r"\r\n|\r|\n", "<br>", text)
+
+
 async def aexport_data(
     chunk_entity_relation_graph,
     entities_vdb,
@@ -4973,11 +5121,11 @@ async def aexport_data(
         entities_data.append(entity_row)
 
     # --- Relations ---
-    for src_entity in all_entities:
-        for tgt_entity in all_entities:
-            if src_entity == tgt_entity:
-                continue
-
+    # Relations are undirected: has_edge(a, b) and has_edge(b, a) answer for
+    # the same edge, so probe each unordered pair once. Probing ordered pairs
+    # exported every relation twice, once per orientation.
+    for src_index, src_entity in enumerate(all_entities):
+        for tgt_entity in all_entities[src_index + 1 :]:
             edge_exists = await chunk_entity_relation_graph.has_edge(
                 src_entity, tgt_entity
             )
@@ -5153,7 +5301,9 @@ async def aexport_data(
                 # Write rows
                 for entity in entities_data:
                     mdfile.write(
-                        "| " + " | ".join(str(v) for v in entity.values()) + " |\n"
+                        "| "
+                        + " | ".join(_markdown_table_cell(v) for v in entity.values())
+                        + " |\n"
                     )
                 mdfile.write("\n\n")
             else:
@@ -5171,7 +5321,9 @@ async def aexport_data(
                 # Write rows
                 for relation in relations_data:
                     mdfile.write(
-                        "| " + " | ".join(str(v) for v in relation.values()) + " |\n"
+                        "| "
+                        + " | ".join(_markdown_table_cell(v) for v in relation.values())
+                        + " |\n"
                     )
                 mdfile.write("\n\n")
             else:
@@ -5192,7 +5344,9 @@ async def aexport_data(
                 for relationship in relationships_data:
                     mdfile.write(
                         "| "
-                        + " | ".join(str(v) for v in relationship.values())
+                        + " | ".join(
+                            _markdown_table_cell(v) for v in relationship.values()
+                        )
                         + " |\n"
                     )
             else:
@@ -5755,6 +5909,67 @@ def _reject_empty_truncated_response(
     )
     logger.error(message)
     raise EmptyTruncatedResponseError(message)
+
+
+def is_reasoning_only_answer(response: Any) -> bool:
+    """Return True for a non-streaming answer that is a reasoning trace only.
+
+    True when nothing is left after ``remove_think_tags``, or when what is
+    left is an unclosed ``<think>`` block (inline reasoning cut off
+    mid-trace). False for streaming iterators, empty strings and any answer
+    that carries text outside the think block. Never raises.
+    """
+    if not isinstance(response, str) or not response.strip():
+        return False
+    cleaned = remove_think_tags(response)
+    unclosed_think = cleaned.startswith("<think>") and "</think>" not in cleaned
+    return not cleaned or unclosed_think
+
+
+def reject_reasoning_only_answer(response: Any) -> None:
+    """Fail a non-streaming query answer that is reasoning and nothing else.
+
+    Call it on the answering LLM's result BEFORE the query-cache write
+    (``kg_query``, ``naive_query``, bypass mode). The query paths pass
+    ``enable_cot=True``, and a ``<think>...</think>`` wrapper with no answer
+    after it is a NON-empty string, so without this check it is returned and
+    cached as the answer. The bindings with a retry policy (OpenAI, OpenAI
+    Responses, Gemini) already raise on that shape in their non-streaming
+    path; this is the safety net for every other source of it: Zhipu, models
+    that put the trace inline in ``content``, and custom LLM functions.
+
+    Raises :class:`EmptyTruncatedResponseError` for a ``TruncatedResponse``
+    and :class:`ReasoningOnlyResponseError` otherwise. Streaming responses and
+    answers with text outside the think block pass through. Only lengths are
+    logged, never content.
+    """
+    if not is_reasoning_only_answer(response):
+        return
+    truncated = is_truncated_response(response)
+    diagnostics = format_response_diagnostics(
+        truncated=truncated,
+        response_len=len(response),
+        answer_len=0,
+    )
+    if truncated:
+        hint = empty_length_truncated_hint(
+            "consider raising the LLM's output token limit or disabling "
+            "thinking mode for the query role",
+            reasoning_consumed_budget=True,
+        )
+    else:
+        hint = (
+            "model returned reasoning-only output; consider disabling thinking "
+            "mode or lowering the reasoning effort for the query role"
+        )
+    message = (
+        "Query answer carried no text outside the reasoning trace "
+        f"({diagnostics}): {hint}"
+    )
+    logger.error(message)
+    if truncated:
+        raise EmptyTruncatedResponseError(message)
+    raise ReasoningOnlyResponseError(message)
 
 
 def get_extract_cache_fence(text_chunks_storage) -> asyncio.Lock:
@@ -6839,23 +7054,44 @@ def repair_vlm_json_escape_damage_nested(obj: Any, *, context: str = "") -> Any:
     return obj
 
 
-_CODE_FENCE_PATTERN = re.compile(
-    r"^\s*```(?:json|JSON)?\s*\n?(.*?)\n?\s*```\s*$", re.DOTALL
+# Opening fence only: CommonMark backtick or tilde fence (3+), optional json
+# tag. Possessive quantifiers keep the match linear; the closing fence is found
+# with rstrip in strip_markdown_code_fence, never by a backtracking body group.
+_CODE_FENCE_OPEN_PATTERN = re.compile(
+    r"\s*+(?P<fence>`{3,}+|~{3,}+)(?:[jJ][sS][oO][nN](?![A-Za-z0-9_]))?[ \t]*+(?:\r?\n)?"
 )
 
 
 def strip_markdown_code_fence(text: str) -> str:
-    """Strip a surrounding markdown code fence (```json ... ``` or ``` ... ```).
+    """Strip a surrounding markdown code fence (``` / ```` / ~~~, optional json tag).
 
     Why: LLM training priors strongly associate "JSON output" with fenced code
     blocks, so providers routinely wrap responses despite explicit instructions
-    to the contrary. Stripping here avoids relying on ``json_repair`` and the
-    noisy warning it emits. The ``\\n?`` make the interior newlines optional so
-    single-line fences (```` ```json {...}``` ````) are handled too.
+    to the contrary (including 4+ backtick fences when values embed triple
+    backticks, or CommonMark tilde fences). Stripping here avoids relying on
+    ``json_repair`` and the noisy warning it emits.
+
+    Rules: the closing fence must use the opening character and be at least as
+    long; single-line fences (```` ```json {...}``` ````) are handled. Anything
+    else -- no fence, a shorter or mismatched closer, trailing prose -- returns
+    ``text`` itself (callers test ``is``). Runs in linear time: this sees raw
+    LLM output on the event loop, including degenerate whitespace runs.
     """
 
-    match = _CODE_FENCE_PATTERN.match(text)
-    return match.group(1) if match else text
+    match = _CODE_FENCE_OPEN_PATTERN.match(text)
+    if not match:
+        return text
+    fence = match.group("fence")
+    rest = text[match.end() :].rstrip()
+    closer_len = len(rest) - len(rest.rstrip(fence[0]))
+    if closer_len < len(fence):
+        return text
+    body = rest[: len(rest) - closer_len].rstrip(" \t")
+    if body.endswith("\n"):
+        body = body[:-1]
+    if body.endswith("\r"):
+        body = body[:-1]
+    return body
 
 
 def _first_structural_opener(text: str) -> tuple[str | None, int]:
@@ -7292,6 +7528,7 @@ class TokenTracker:
 
     def reset(self):
         self.prompt_tokens = 0
+        self.cached_prompt_tokens: int | None = None
         self.completion_tokens = 0
         self.total_tokens = 0
         self.call_count = 0
@@ -7300,38 +7537,46 @@ class TokenTracker:
         """Add token usage from one LLM call.
 
         Args:
-            token_counts: A dictionary containing prompt_tokens, completion_tokens, total_tokens
+            token_counts: Prompt, completion, and total token counts. A missing
+                or None total is estimated from the available component counts.
         """
-        self.prompt_tokens += token_counts.get("prompt_tokens", 0)
-        self.completion_tokens += token_counts.get("completion_tokens", 0)
+        prompt_tokens = token_counts.get("prompt_tokens") or 0
+        completion_tokens = token_counts.get("completion_tokens") or 0
+        total_tokens = token_counts.get("total_tokens")
+        if total_tokens is None:
+            total_tokens = prompt_tokens + completion_tokens
 
-        # If total_tokens is provided, use it directly; otherwise calculate the sum
-        if "total_tokens" in token_counts:
-            self.total_tokens += token_counts["total_tokens"]
-        else:
-            self.total_tokens += token_counts.get(
-                "prompt_tokens", 0
-            ) + token_counts.get("completion_tokens", 0)
-
+        self.prompt_tokens += prompt_tokens
+        self.completion_tokens += completion_tokens
+        self.total_tokens += total_tokens
         self.call_count += 1
+        cached_tokens = token_counts.get("cached_prompt_tokens")
+        if cached_tokens is not None:
+            self.cached_prompt_tokens = (self.cached_prompt_tokens or 0) + cached_tokens
 
     def get_usage(self):
         """Get current usage statistics."""
-        return {
+        usage = {
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
             "total_tokens": self.total_tokens,
             "call_count": self.call_count,
         }
+        if self.cached_prompt_tokens is not None:
+            usage["cached_prompt_tokens"] = self.cached_prompt_tokens
+        return usage
 
     def __str__(self):
         usage = self.get_usage()
-        return (
+        summary = (
             f"LLM call count: {usage['call_count']}, "
             f"Prompt tokens: {usage['prompt_tokens']}, "
             f"Completion tokens: {usage['completion_tokens']}, "
             f"Total tokens: {usage['total_tokens']}"
         )
+        if self.cached_prompt_tokens is not None:
+            summary += f", Cached prompt tokens: {self.cached_prompt_tokens}"
+        return summary
 
 
 async def apply_rerank_if_enabled(
@@ -7378,6 +7623,11 @@ async def apply_rerank_if_enabled(
             )
             document_texts.append(content)
 
+        # Custom rerank functions bypass generic_rerank_api's check, and the
+        # legacy-format slice below would treat a negative top_n as "drop N".
+        if top_n is not None and top_n < 0:
+            raise ValueError(f"top_n must be non-negative, got {top_n}")
+
         # Call the new rerank function that returns index-based results
         rerank_results = await rerank_func(
             query=query,
@@ -7394,7 +7644,11 @@ async def apply_rerank_if_enabled(
             # Check if results are in the new index-based format
             if first_object is not None and "index" in first_object:
                 # New format: [{"index": 0, "relevance_score": 0.85}, ...]
-                reranked_docs = []
+                # One entry per document: a repeated index would otherwise
+                # take several chunk_top_k slots. Keep its highest score,
+                # as chunk score aggregation does, because provider order
+                # is not trusted (see the sort below).
+                best_by_index: dict[int, dict] = {}
                 for result in rerank_results:
                     normalized_result, _ = normalize_rerank_result(
                         result, len(retrieved_docs)
@@ -7404,17 +7658,28 @@ async def apply_rerank_if_enabled(
 
                     index = normalized_result["index"]
                     relevance_score = normalized_result["relevance_score"]
+                    kept = best_by_index.get(index)
+                    if kept is not None and kept["rerank_score"] >= relevance_score:
+                        continue
 
                     # Get original document and add rerank score
                     doc = retrieved_docs[index].copy()
                     doc["rerank_score"] = relevance_score
-                    reranked_docs.append(doc)
+                    best_by_index[index] = doc
 
+                reranked_docs = list(best_by_index.values())
                 if not reranked_docs:
                     logger.warning(
                         "Rerank returned no usable results, using original chunks"
                     )
                     return retrieved_docs
+
+                # Sort by score instead of trusting the provider already
+                # returned results in relevance order: callers slice this
+                # list positionally (chunk_top_k truncation), so an
+                # unsorted response would silently keep the wrong chunks
+                # despite every chunk carrying a correct rerank_score.
+                reranked_docs.sort(key=lambda d: d["rerank_score"], reverse=True)
 
                 logger.info(
                     f"Successfully reranked: {len(reranked_docs)} chunks from {len(retrieved_docs)} original chunks"

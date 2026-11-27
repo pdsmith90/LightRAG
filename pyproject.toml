@@ -169,7 +169,7 @@ offline-llm = [
     "ollama>=0.5.4,<1.0.0",
     "zai-sdk>=0.2.3,<1.0.0",
     "aioboto3>=12.0.0,<16.0.0",
-    "voyageai>=0.2.0,<1.0.0",
+    "voyageai>=0.3.7,<1.0.0",
     "llama-index>=0.14.0,<1.0.0",  # Updated to ensure compatibility with openai 2.x
     "llama-index-llms-openai>=0.6.12",  # Explicitly require version that supports openai 2.x
     "google-api-core>=2.0.0,<3.0.0",
@@ -194,11 +194,9 @@ test = [
 
 evaluation = [
     "lightrag-hku[api]",
-    "ragas>=0.3.7",
-    # ragas (<=0.4.3) imports langchain_community.chat_models.vertexai at
-    # import time; langchain-community 0.4.2 deleted that module, which
-    # makes `import ragas` fail. Lift this cap once ragas stops importing it.
-    "langchain-community<0.4.2",
+    # ragas <=0.4.3 imports langchain_community.chat_models.vertexai at import
+    # time, a module langchain-community 0.4.2 deleted; 0.4.4 made it optional.
+    "ragas>=0.4.4",
     "datasets>=4.3.0",
 ]
 
@@ -214,6 +212,8 @@ lightrag-gunicorn = "lightrag.api.run_with_gunicorn:main"
 lightrag-hash-password = "lightrag.tools.hash_password:main"
 lightrag-download-cache = "lightrag.tools.download_cache:main"
 lightrag-clean-llmqc = "lightrag.tools.clean_llm_query_cache:main"
+lightrag-migrate-llm-cache = "lightrag.tools.migrate_llm_cache:main"
+lightrag-gc-llm-cache = "lightrag.tools.gc_llm_cache:main"
 lightrag-rebuild-vdb = "lightrag.tools.rebuild_vdb:main"
 lightrag-clear-storage = "lightrag.tools.clear_storage:main"
 lightrag-migrate-config = "lightrag.tools.migrate_config:main"
@@ -252,6 +252,15 @@ norecursedirs = [
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
+# Python 3.12+ warns when fork() runs in a multi-threaded process. The
+# real-Manager tests start shared_storage's SyncManager (fork context) inside
+# the pytest process, which earlier tests have left with executor threads; in
+# production that start runs in the gunicorn master before any threads exist.
+# Scoped to forks multiprocessing starts; tests calling os.fork() directly
+# carry their own filterwarnings mark.
+filterwarnings = [
+    "ignore:This process .* is multi-threaded, use of fork\\(\\) may lead to deadlocks in the child:DeprecationWarning:multiprocessing.popen_fork",
+]
 markers = [
     "offline: tests that run without any external service (default CI gate)",
     "integration: tests requiring external services; skipped by default, opt in with --run-integration",

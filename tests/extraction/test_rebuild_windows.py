@@ -12,7 +12,7 @@ from lightrag.operate import _split_rebuild_windows, rebuild_knowledge_from_chun
 
 pytestmark = pytest.mark.offline
 
-_REAL_LOAD = operate._get_cached_extraction_results
+_REAL_LOAD = operate._load_chunk_extract_rows
 
 
 @pytest.fixture(autouse=True)
@@ -86,7 +86,7 @@ async def _run(monkeypatch, window):
         rebuilt[(kwargs["src"], kwargs["tgt"])] = kwargs["chunk_ids"]
         return False
 
-    monkeypatch.setattr(operate, "_get_cached_extraction_results", spy_load)
+    monkeypatch.setattr(operate, "_load_chunk_extract_rows", spy_load)
     monkeypatch.setattr(operate, "_rebuild_single_entity", fake_entity)
     monkeypatch.setattr(operate, "_rebuild_single_relationship", fake_relationship)
 
@@ -182,12 +182,15 @@ async def test_a_windowed_rebuild_has_the_outcome_of_a_single_window(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_windows_without_any_cache_rebuild_nothing_in_best_effort(monkeypatch):
+async def test_windows_without_any_cache_still_rebuild_every_object(monkeypatch):
+    # Upstream's rebuild keeps an object no surviving record names (its
+    # provenance is repaired), so a window without cached extraction is
+    # rebuilt like the others instead of being skipped.
     rebuilt: dict = {}
 
     async def fake_entity(**kwargs):
         rebuilt[kwargs["entity_name"]] = kwargs["chunk_ids"]
-        return False
+        return True
 
     monkeypatch.setattr(operate, "_rebuild_single_entity", fake_entity)
     text_chunks, llm_cache = _stores(["gone"])
@@ -201,5 +204,37 @@ async def test_windows_without_any_cache_rebuild_nothing_in_best_effort(monkeypa
         llm_response_cache=llm_cache,
         global_config={"llm_model_max_async": 1, "kg_rebuild_window_chunks": 1},
     )
-    assert rebuilt == {}
+    assert rebuilt == {"E1": ["gone"], "E2": ["gone2"]}
     assert report.referenced_chunk_ids == {"gone", "gone2"}
+    assert report.missing_cache_chunk_ids == {"gone", "gone2"}
+    assert set(report.degraded_entities) == {"E1", "E2"}
+
+
+@pytest.mark.asyncio
+async def test_relation_windows_run_before_entity_windows(monkeypatch):
+    # An entity known only through its edges reads edges: with several windows
+    # each holds one kind, and every relation window runs before an entity one.
+    order: list[str] = []
+
+    async def fake_entity(**kwargs):
+        order.append("entity")
+        return False
+
+    async def fake_relationship(**kwargs):
+        order.append("relation")
+        return False
+
+    monkeypatch.setattr(operate, "_rebuild_single_entity", fake_entity)
+    monkeypatch.setattr(operate, "_rebuild_single_relationship", fake_relationship)
+    text_chunks, llm_cache = _stores(CHUNKS)
+    await rebuild_knowledge_from_chunks(
+        entities_to_rebuild=dict(ENTITIES),
+        relationships_to_rebuild=dict(RELATIONSHIPS),
+        knowledge_graph_inst=object(),
+        entities_vdb=_VDB(),
+        relationships_vdb=_VDB(),
+        text_chunks_storage=text_chunks,
+        llm_response_cache=llm_cache,
+        global_config={"llm_model_max_async": 2, "kg_rebuild_window_chunks": 3},
+    )
+    assert order == ["relation"] * len(RELATIONSHIPS) + ["entity"] * len(ENTITIES)
