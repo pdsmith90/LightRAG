@@ -2361,6 +2361,12 @@ async def _drop_unvetted_extract_rows(
                     logger.warning(
                         f"Could not tell which extract rows other chunks list: {e}"
                     )
+            else:
+                logger.warning(
+                    "Could not tell which extract rows other chunks list: the "
+                    "text-chunk storage has no cache_ids_listed_by_other_chunks, "
+                    "so every row is deleted"
+                )
             deletable = [k for k in stale if k not in shared]
             if deletable:
                 await llm_response_cache.delete(deletable)
