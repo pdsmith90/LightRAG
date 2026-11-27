@@ -2297,8 +2297,12 @@ async def _drop_unvetted_extract_rows(
     The rows are written before the hook runs, and the chunk's stored records
     only after it, so a retry that read them as plain cached extractions (the
     fork never re-applies the hook to those) would rebuild from records the hook
-    may have rejected. Without them the retry extracts the chunk again. Best
-    effort: the original failure is the one that is raised.
+    may have rejected. Without them the retry extracts the chunk again. It drops
+    the rows of every chunk of the run, not only the one that raised:
+    ``extract_entities`` stores the records of all its chunks together, after
+    every chunk has passed, so a chunk that passed before a sibling failed has
+    no stored records and its raw rows are as unvetted as the failing one's.
+    Best effort: the original failure is the one that is raised.
     """
     try:
         rows = await text_chunks_storage.get_by_ids(chunk_ids)
@@ -4969,8 +4973,8 @@ async def _apply_kg_extraction_validator(
     caller, and the deletion rebuild reads stored records and cached rows
     without re-validating either. Because a row is cached before the hook
     runs, a re-extraction that fails while a hook is set has that run's
-    extract rows dropped (``_drop_unvetted_extract_rows``), so a retry
-    extracts the chunk again. Caller-facing contract: "Extraction Quality
+    extract rows dropped, all chunks' of that run (``_drop_unvetted_extract_rows``),
+    so a retry extracts them again. Caller-facing contract: "Extraction Quality
     Hook" in docs/ProgramingWithCore.md. Call it before
     ``_inject_multimodal_records``.
     """

@@ -7,6 +7,7 @@ that answers from markers in the chunk text, so cache keys, ``llm_cache_list``
 and the purge journal behave as in production.
 """
 
+import asyncio
 from uuid import uuid4
 
 import numpy as np
@@ -641,5 +642,73 @@ async def test_validator_failure_during_reextraction_is_revalidated_on_retry(
         assert any("SHARED paragraph" in text for text in validator.calls)
         foo = await rag.chunk_entity_relation_graph.get_node("Foo")
         assert foo["description"] == "Foo shared fact [checked]"
+    finally:
+        await rag.finalize_storages()
+
+
+class _GatedValidator(_TaggingValidator):
+    """Tags like ``_TaggingValidator``; the chunk with ``fail_marker`` raises, but
+    only after every other chunk has passed the hook (async, so the chunks
+    overlap under the extraction semaphore)."""
+
+    def __init__(self, fail_marker: str, passing: int):
+        super().__init__()
+        self.fail_marker = fail_marker
+        self.passing = passing
+        self.passed = 0
+        self.enabled = True
+        self._all_passed = asyncio.Event()
+
+    async def __call__(self, chunk_key, chunk_text, maybe_nodes, maybe_edges):
+        if not self.enabled:
+            return super().__call__(chunk_key, chunk_text, maybe_nodes, maybe_edges)
+        if self.fail_marker in chunk_text:
+            await self._all_passed.wait()
+            raise RuntimeError("validator rejected the chunk")
+        result = super().__call__(chunk_key, chunk_text, maybe_nodes, maybe_edges)
+        self.passed += 1
+        if self.passed == self.passing:
+            self._all_passed.set()
+        return result
+
+
+@pytest.mark.asyncio
+async def test_failed_reextraction_drops_every_chunks_rows_of_the_run(tmp_path):
+    """A chunk's accepted records are stored only after EVERY chunk of the run
+    has passed the hook, so when a later chunk fails, the chunks that already
+    passed have no stored records either, and their raw rows would be read by a
+    retry without the hook. The drop therefore covers the whole run, not just
+    the chunk that raised; narrowing it to the failing chunk would let the retry
+    rebuild a hooked chunk from the raw output the hook had changed."""
+    llm = _StubLLM()
+    validator = _GatedValidator("V1ONLY", passing=1)
+    rag = await _make_rag(tmp_path, llm)
+    try:
+        await _insert(rag, "doc-v1", "doc-v2", "doc-v3")
+        rag.kg_extraction_validator = validator
+        passed_id, passed_row = await _chunk_with(rag, "doc-v1", "SHARED")
+        failed_id, failed_row = await _chunk_with(rag, "doc-v1", "V1ONLY")
+        keys = passed_row["llm_cache_list"] + failed_row["llm_cache_list"]
+        await rag.llm_response_cache.delete(keys)
+
+        result = await rag.adelete_by_doc_id("doc-v3")
+        assert result.status == "fail"
+        assert validator.passed >= 1  # a SHARED chunk passed the hook, V1ONLY raised
+
+        rows = await rag.text_chunks.get_by_ids([passed_id, failed_id])
+        for row in rows:
+            assert row["llm_cache_list"] == []
+            assert "kg_records" not in row
+        assert all(v is None for v in await rag.llm_response_cache.get_by_ids(keys))
+
+        validator.enabled = False
+        validator.calls.clear()
+        llm.calls.clear()
+        await _delete_ok(rag, "doc-v3")
+        # Every chunk of the run is extracted again, SHARED's included, and hooked.
+        assert set(llm.calls) == {("SHARED", False), ("V1ONLY", False)}
+        assert len(validator.calls) == len(llm.calls)
+        foo = await rag.chunk_entity_relation_graph.get_node("Foo")
+        assert "[checked]" in foo["description"]
     finally:
         await rag.finalize_storages()
