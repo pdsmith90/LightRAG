@@ -238,3 +238,60 @@ async def test_relation_windows_run_before_entity_windows(monkeypatch):
         global_config={"llm_model_max_async": 2, "kg_rebuild_window_chunks": 3},
     )
     assert order == ["relation"] * len(RELATIONSHIPS) + ["entity"] * len(ENTITIES)
+
+
+@pytest.mark.asyncio
+async def test_a_chunk_in_a_relation_and_an_entity_window_is_extracted_once(
+    monkeypatch,
+):
+    # c1 and c2 are referenced by a relation (window 1) and by E1 (window 2); neither
+    # has an extraction cache, so each window that met them would re-extract them.
+    # The memo hands window 2 the records window 1 got: the extraction function sees
+    # each chunk once, and the entity rebuild reads the records of that one call.
+    extracted: list[str] = []
+    seen_by_entity: dict[str, dict] = {}
+
+    async def fake_extract_entities(chunks, global_config, **kwargs):
+        extracted.extend(chunks)
+        return [
+            ({f"N-{chunk_id}": [{"description": f"from {chunk_id}"}]}, {})
+            for chunk_id in chunks
+        ]
+
+    async def fake_entity(**kwargs):
+        seen_by_entity[kwargs["entity_name"]] = {
+            chunk_id: kwargs["chunk_entities"].get(chunk_id)
+            for chunk_id in kwargs["chunk_ids"]
+        }
+        return False
+
+    async def fake_relationship(**kwargs):
+        return False
+
+    monkeypatch.setattr(operate, "extract_entities", fake_extract_entities)
+    monkeypatch.setattr(operate, "_rebuild_single_entity", fake_entity)
+    monkeypatch.setattr(operate, "_rebuild_single_relationship", fake_relationship)
+
+    chunks = ["c1", "c2", "c3", "c4"]
+    text_chunks = _KV(
+        {c: {"content": c, "full_doc_id": "doc", "llm_cache_list": []} for c in chunks}
+    )
+    report = await rebuild_knowledge_from_chunks(
+        entities_to_rebuild={"E1": ["c1", "c2"], "E2": ["c3", "c4"]},
+        relationships_to_rebuild={("A", "B"): ["c1", "c2"]},
+        knowledge_graph_inst=object(),
+        entities_vdb=_VDB(),
+        relationships_vdb=_VDB(),
+        text_chunks_storage=text_chunks,
+        llm_response_cache=_KV({}),
+        global_config={"llm_model_max_async": 2, "kg_rebuild_window_chunks": 2},
+    )
+
+    # Three windows: the relation's, then one per entity.
+    assert sorted(extracted) == chunks
+    assert report.reextracted_chunk_ids == set(chunks)
+    assert seen_by_entity["E1"] == {
+        "c1": {"N-c1": [{"description": "from c1"}]},
+        "c2": {"N-c2": [{"description": "from c2"}]},
+    }
+    assert set(seen_by_entity["E2"]) == {"c3", "c4"}
