@@ -719,3 +719,103 @@ async def test_failed_reextraction_drops_every_chunks_rows_of_the_run(tmp_path):
         assert "[checked]" in foo["description"]
     finally:
         await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_failed_reextraction_keeps_a_row_a_chunk_outside_the_run_lists(
+    tmp_path,
+):
+    """Extract rows are keyed on the prompt, so doc-v2's SHARED chunk (outside
+    the run: it carries stored records) lists the row doc-v1's SHARED chunk
+    wrote. The drop removes the key from the chunks of the run, which is what
+    forces their re-extraction, but deletes only the rows no other chunk lists;
+    deleting this one would leave doc-v2's reference dangling."""
+    llm = _StubLLM()
+    rag = await _make_rag(tmp_path, llm)
+    try:
+        await _insert(rag, "doc-v1")
+        rag.kg_extraction_validator = _TaggingValidator()
+        await _insert(rag, "doc-v2", "doc-v3")
+        inside_id, inside_row = await _chunk_with(rag, "doc-v1", "SHARED")
+        failed_id, failed_row = await _chunk_with(rag, "doc-v1", "V1ONLY")
+        outside_id, outside_row = await _chunk_with(rag, "doc-v2", "SHARED")
+        (shared_key,) = inside_row["llm_cache_list"]
+        assert outside_row["llm_cache_list"] == [shared_key]
+        assert "kg_records" in outside_row and "kg_records" not in inside_row
+        (failed_key,) = failed_row["llm_cache_list"]
+        await rag.llm_response_cache.delete([shared_key, failed_key])
+
+        validator = _GatedValidator("V1ONLY", passing=1)
+        rag.kg_extraction_validator = validator
+        result = await rag.adelete_by_doc_id("doc-v3")
+        assert result.status == "fail"
+        assert validator.passed_keys == [inside_id]
+
+        rows = await rag.text_chunks.get_by_ids([inside_id, failed_id, outside_id])
+        for row in rows[:2]:
+            assert row["llm_cache_list"] == []
+            assert "kg_records" not in row
+        assert rows[2]["llm_cache_list"] == [shared_key]
+        assert "kg_records" in rows[2]
+        assert await rag.llm_response_cache.get_by_id(shared_key) is not None
+        assert await rag.llm_response_cache.get_by_id(failed_key) is None
+
+        validator.enabled = False
+        validator.calls.clear()
+        llm.calls.clear()
+        await _delete_ok(rag, "doc-v3")
+        # The run's chunks are hooked again; SHARED reads the surviving row.
+        assert llm.calls == [("V1ONLY", False)]
+        assert sorted(("SHARED" in t, "V1ONLY" in t) for t in validator.calls) == [
+            (False, True),
+            (True, False),
+        ]
+        row = (await rag.text_chunks.get_by_ids([inside_id]))[0]
+        assert row["llm_cache_list"][0] == shared_key
+    finally:
+        await rag.finalize_storages()
+
+
+class _FakeChunks:
+    def __init__(self, rows, lookup=None):
+        self.rows = rows
+        if lookup is not None:
+            self.cache_ids_listed_by_other_chunks = lookup
+
+    async def get_by_ids(self, ids):
+        return [self.rows.get(i) for i in ids]
+
+    async def upsert(self, data):
+        self.rows.update(data)
+
+
+class _FakeCache:
+    def __init__(self):
+        self.deleted: list[str] = []
+
+    async def delete(self, keys):
+        self.deleted.extend(keys)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lookup", ["absent", "fails"])
+async def test_the_drop_deletes_every_row_when_sharing_cannot_be_asked(lookup):
+    """A text-chunk storage without ``cache_ids_listed_by_other_chunks``, or one
+    whose lookup raises, deletes every row of the run, as the cache delete does:
+    a row left behind would be trusted by the retry."""
+    from lightrag.operate import _drop_unvetted_extract_rows
+
+    key = "default:extract:" + "0" * 32
+
+    async def broken(cache_ids, exclude):
+        raise RuntimeError("lookup down")
+
+    chunks = _FakeChunks(
+        {"c1": {"llm_cache_list": [key]}}, broken if lookup == "fails" else None
+    )
+    cache = _FakeCache()
+    await _drop_unvetted_extract_rows(
+        ["c1"], chunks, cache, {"kg_extraction_validator": object()}
+    )
+    assert cache.deleted == [key]
+    assert chunks.rows["c1"]["llm_cache_list"] == []

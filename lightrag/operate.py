@@ -2321,7 +2321,16 @@ async def _drop_unvetted_extract_rows(
     ``extract_entities`` stores the records of all its chunks together, after
     every chunk has passed, so a chunk that passed before a sibling failed has
     no stored records and its raw rows are as unvetted as the failing one's.
-    Best effort: the original failure is the one that is raised.
+
+    The references are always removed from the run's chunks, which is what
+    forces the re-extraction. A row is deleted only if no chunk outside the run
+    still lists it: rows are keyed on the prompt, so a chunk with the same text
+    (or one that lost its reference) shares it, and deleting it would leave that
+    chunk's reference dangling (``cache_ids_listed_by_other_chunks``, as a
+    document delete asks it). A text-chunk storage without that lookup (only
+    JSON and PostgreSQL have it), or one whose lookup fails, deletes every row,
+    since a row left behind would be trusted. Best effort: the original failure
+    is the one that is raised.
     """
     try:
         if not _run_stores_records(global_config):
@@ -2341,7 +2350,20 @@ async def _drop_unvetted_extract_rows(
                     "llm_cache_list": [k for k in keys if k not in extract_keys],
                 }
         if stale:
-            await llm_response_cache.delete(stale)
+            shared: set[str] = set()
+            lookup = getattr(
+                text_chunks_storage, "cache_ids_listed_by_other_chunks", None
+            )
+            if lookup is not None:
+                try:
+                    shared = await lookup(stale, chunk_ids)
+                except Exception as e:
+                    logger.warning(
+                        f"Could not tell which extract rows other chunks list: {e}"
+                    )
+            deletable = [k for k in stale if k not in shared]
+            if deletable:
+                await llm_response_cache.delete(deletable)
         if updates:
             await text_chunks_storage.upsert(updates)
     except Exception as e:
