@@ -1389,6 +1389,116 @@ class ExternalWorksTest(unittest.TestCase):
         )
 
 
+class LibraryAliasTest(unittest.TestCase):
+    """Outside works that are library papers under another OpenAlex id."""
+
+    def tables(self):
+        def paper(pid, doi, title, year):
+            return [pid, doi, None, title, year, None, None, None, None, 1]
+
+        return {
+            "papers": [
+                paper("doi:10.1/g", "10.1/g", "Paper G", 2004),
+                paper("zot:KJ", None, "Alternative methods to smooth the field", 1981),
+                paper(
+                    "zot:KR", None, "Introduction to the mathematics of inversion", 1977
+                ),
+                paper("zot:KN", None, "A handbook of geophysics, no authors", 1985),
+                paper("zot:KX", None, "Same title in the library twice", 2000),
+                paper("zot:KY", None, "Same title in the library twice", 2000),
+                paper("zot:KS", None, "Introduction", 2001),
+            ],
+            "authors": [
+                ["z:jekeli|c", "Christopher Jekeli", None, 1],
+                ["z:twomey|s", "Sean Twomey", None, 1],
+            ],
+            "paper_authors": [
+                ["zot:KJ", "z:jekeli|c", 1, "zotero"],
+                ["zot:KR", "z:twomey|s", 1, "zotero"],
+            ],
+        }
+
+    @staticmethod
+    def ext(title, year, *names, doi=None):
+        return {
+            "doi": f"https://doi.org/{doi}" if doi else None,
+            "title": title,
+            "publication_year": year,
+            "authorships": [{"author": {"display_name": n}} for n in names],
+        }
+
+    def aliases(self, works):
+        return bsl.library_aliases(
+            self.tables(), {w: ["pa", "pb"] for w in works}, works
+        )
+
+    def test_doi_title_author_and_year_rules(self):
+        e = self.ext
+        works = {
+            "W1": e("Anything", 1950, doi="10.1/G"),  # the DOI is a library paper's
+            "W2": e("Alternative Methods to Smooth the Field.", 1982, "C. Jekeli"),
+            "W3": e("Alternative methods to smooth the field", 1990, "C. Jekeli"),
+            "W4": e(
+                "Introduction to the mathematics of inversion", 1977, "Brianne Hobbs"
+            ),
+            "W5": e("A handbook of geophysics - no authors", 1985),
+            "W6": e("A handbook of geophysics, no authors", 1986),
+            "W7": e("Same title in the library twice", 2000),
+            "W8": e("Introduction", 2001),
+        }
+        aliases, qa = self.aliases(works)
+        # W3: years too far apart; W4: a review, by another author; W6: no names, and not the same
+        # year; W7: two library papers fit; W8: too short a title to match
+        self.assertEqual(aliases, {"W1": "doi:10.1/g", "W2": "zot:KJ", "W5": "zot:KN"})
+        self.assertEqual(
+            (qa["by_doi"], qa["by_title"], qa["ambiguous_titles"]), (1, 2, 1)
+        )
+
+    def test_only_candidates_with_metadata_are_matched(self):
+        works = {"W2": self.ext("Alternative methods to smooth the field", 1981)}
+        aliases, _ = bsl.library_aliases(self.tables(), {"W9": ["pa", "pb"]}, works)
+        self.assertEqual(aliases, {})
+
+    def test_an_alias_is_a_citation_and_no_outside_work(self):
+        md = {
+            "AAAAAAA1": entry(doi="10.1/a"),
+            "AAAAAAA2": entry(doi="10.1/b"),
+            "AAAAAAA3": entry(item_key="KJ", title="A report OpenAlex lacks"),
+        }
+        works = {
+            "10.1/a": work("10.1/a", "W1", refs=["W2", "W500", "W101"]),
+            "10.1/b": work("10.1/b", "W2", refs=["W500", "W101"]),
+        }
+        tables, aux = bsl.assemble(
+            md, works, aliases={"W500": "zot:KJ", "W2": "zot:KJ"}
+        )
+        self.assertEqual(
+            sorted(map(tuple, tables["cites"])),
+            [
+                (
+                    "doi:10.1/a",
+                    "doi:10.1/b",
+                ),  # W2 is paper B's own id: the alias is ignored
+                ("doi:10.1/a", "zot:KJ"),
+                ("doi:10.1/b", "zot:KJ"),
+            ],
+        )
+        self.assertEqual(
+            aux["alias_edges"], {("doi:10.1/a", "zot:KJ"), ("doi:10.1/b", "zot:KJ")}
+        )
+        self.assertEqual(list(bsl.external_citers(aux)), ["W101"])
+
+    def test_the_reference_check_leaves_alias_edges_out(self):
+        tables = {
+            "cites": [["doi:10.1/a", "doi:10.1/b"], ["doi:10.1/a", "doi:10.1/g"]],
+            "papers": [["doi:10.1/a", "10.1/a", "W1"], ["doi:10.1/b", "10.1/b", "W2"]],
+        }
+        ref = {"10.1/a": {"cited": ["10.1/b"]}}
+        self.assertEqual(bsl.compare_reference(tables, ref)["edges_only_ours"], 1)
+        kept = bsl.compare_reference(tables, ref, {("doi:10.1/a", "doi:10.1/g")})
+        self.assertEqual((kept["edges_only_ours"], kept["jaccard"]), (0, 1.0))
+
+
 class TitleMatchBuildTest(unittest.TestCase):
     def groups(self):
         md = {
@@ -2150,6 +2260,45 @@ class EndToEndV2Test(unittest.TestCase):
             "Keys",
         ):
             self.assertIn(needle, md)
+
+    def test_outside_works_that_are_library_papers_become_citations(self):
+        w = self.w
+        # W101 carries the DOI of paper G (OpenAlex returns no record for 10.1/g); W102 is the
+        # report KE (no DOI) by its title, year and author. A and B cite both.
+        w.ext["W101"]["doi"] = "https://doi.org/10.1/G"
+        w.ext["W102"].update(
+            title="Collision of Galaxies.",
+            publication_year=2001,
+            authorships=[
+                {"author": {"id": "https://openalex.org/A2", "display_name": "A. Lee"}}
+            ],
+        )
+        self.assertEqual(w.run(), 0, w.err)
+        ext = [
+            r["work_id"] for r in read_csv(os.path.join(w.out, "external_works.csv"))
+        ]
+        self.assertEqual(ext, [])
+        cites = {
+            (r["citing_paper_id"], r["cited_paper_id"])
+            for r in read_csv(os.path.join(w.out, "cites.csv"))
+        }
+        for citing in ("doi:10.1/a", "doi:10.1/b"):
+            self.assertIn((citing, "doi:10.1/g"), cites)
+            self.assertIn((citing, "zot:KE"), cites)
+        qa = json.loads(read(os.path.join(w.out, "qa.json")))
+        al = qa["v2"]["external_works"]["library_aliases"]
+        self.assertEqual(
+            (al["by_doi"], al["by_title"], al["library_citations_added"]), (1, 1, 4)
+        )
+        self.assertEqual(
+            qa["v2"]["external_works"]["doi_equals_library_paper"]["count"], 0
+        )
+        # the reference file lacks A -> G and B -> G: alias edges are not compared
+        self.assertEqual(qa["oracle"]["jaccard"], 1.0)
+        self.assertIn(
+            "library papers under another OpenAlex id",
+            read(os.path.join(w.out, "QA.md")),
+        )
 
     def test_external_threshold_in_a_run(self):
         w = self.w

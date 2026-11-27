@@ -78,6 +78,13 @@ EXT_BATCH = 50
 RESOLVE_MAX_FAILS = (
     10  # single lookups of unknown outside works failing in a row before the rest wait
 )
+# An outside work is a library paper under another OpenAlex id (library_aliases) when its DOI is
+# the paper's, or its title is and either an author is shared, with years (when both are known)
+# at most ALIAS_YEAR_SLACK apart, or one side has no author names and the years are equal.
+# Titles shorter than ALIAS_MIN_TITLE letters and digits ("Introduction", "Preface") are not
+# matched.
+ALIAS_MIN_TITLE = 15
+ALIAS_YEAR_SLACK = 1
 EXT_SELECT = "id,doi,title,display_name,publication_year,type,cited_by_count,authorships,primary_location"
 
 # S2 context cleaning
@@ -325,6 +332,14 @@ def fold(s) -> str:
     s = unicodedata.normalize("NFKD", s or "")
     s = "".join(c for c in s if not unicodedata.combining(c)).casefold()
     return "".join(c for c in s if c.isalpha())
+
+
+def title_key(s) -> str:
+    """Casefold, strip accents, keep letters and digits ("IERS Conventions (2010)"
+    and "(1996)" stay apart)."""
+    s = unicodedata.normalize("NFKD", s or "")
+    s = "".join(c for c in s if not unicodedata.combining(c)).casefold()
+    return "".join(c for c in s if c.isalnum())
 
 
 def initials(given: str) -> str:
@@ -719,6 +734,7 @@ def assemble(
     doi_overrides: dict | None = None,
     merged=None,
     deleted=(),
+    aliases=None,
 ):
     """Build every table from the metadata and the OpenAlex works.
 
@@ -726,6 +742,8 @@ def assemble(
     by the S2 title match); the paper_id stays as it is. ``merged`` ({old W-id:
     W-id}) and ``deleted`` (W-ids) rewrite the reference lists before citations,
     coupling and outside works are taken from them (resolve_external_unknown).
+    ``aliases`` ({W-id: paper_id}, from library_aliases) names outside works that
+    are library papers: a reference to one is a citation of that paper.
 
     Returns (tables, aux): ``tables`` maps a table name to its rows (lists in
     column order, sorted by primary key); ``aux`` holds what the QA needs
@@ -875,7 +893,13 @@ def assemble(
         rec = paper_info[pid]["rec"]
         if rec and rec.get("id"):
             oa_to_paper.setdefault(short_id(rec["id"]), pid)
-    cites = set()
+    aliased = {
+        w: p
+        for w, p in (aliases or {}).items()
+        if w not in oa_to_paper and p in paper_info
+    }
+    oa_to_paper.update(aliased)
+    cites, direct = set(), set()
     refs_by_paper = {}
     merged, deleted = merged or {}, set(deleted)
     for pid, info in paper_info.items():
@@ -892,6 +916,8 @@ def assemble(
             tgt = oa_to_paper.get(r)
             if tgt and tgt != pid:
                 cites.add((pid, tgt))
+                if r not in aliased:
+                    direct.add((pid, tgt))
 
     coupled_rows = coupling(refs_by_paper)
 
@@ -952,6 +978,8 @@ def assemble(
         "n_with_reference_list": sum(1 for r in refs_by_paper.values() if r),
         "refs_by_paper": refs_by_paper,
         "oa_to_paper": oa_to_paper,
+        # citations that only an alias gives: the reference check leaves them out
+        "alias_edges": cites - direct,
         "doi_overrides": {
             pid: g["doi"]
             for pid, g in groups.items()
@@ -1283,6 +1311,74 @@ def build_cites(tables, s2_edges: dict) -> dict:
         "with_context": with_context,
         "total_contexts": n_ctx,
         "cut_contexts": n_cut,
+    }
+
+
+def _name_tokens(name) -> set:
+    """The folded words of a person's name, initials left out."""
+    return {f for f in (fold(t) for t in re.split(r"[\s,]+", name or "")) if len(f) > 1}
+
+
+def _same_work(w: dict, year, names: set) -> bool:
+    """Whether an outside work whose title is a library paper's is that paper:
+    an author in common and years (when both are known) at most
+    ALIAS_YEAR_SLACK apart; without names on one side, the same year. Names on
+    both sides that share no word reject it (a book review carries the
+    reviewer as its author)."""
+    wy = w.get("publication_year")
+    years = isinstance(wy, int) and isinstance(year, int)
+    if years and abs(wy - year) > ALIAS_YEAR_SLACK:
+        return False
+    theirs = set()
+    for a in w.get("authorships") or []:
+        theirs |= _name_tokens(((a or {}).get("author") or {}).get("display_name"))
+    if theirs and names:
+        return bool(theirs & names)
+    return years and wy == year
+
+
+def library_aliases(tables, citers: dict, ext_works: dict) -> tuple[dict, dict]:
+    """({W-id: paper_id}, QA) for the outside-work candidates that are library
+    papers under another OpenAlex id: a duplicate record, or a paper OpenAlex
+    did not return for its DOI or that has none (a report, a thesis, a book).
+    A work is a paper when its DOI is the paper's, or when its title_key is
+    that of exactly one paper that _same_work accepts."""
+    P = {c: i for i, (c, _) in enumerate(TABLES["papers"]["cols"])}
+    names = {r[0]: r[1] for r in tables["authors"]}
+    tokens = defaultdict(set)
+    for r in tables["paper_authors"]:
+        tokens[r[0]] |= _name_tokens(names.get(r[1]))
+    by_doi, by_title = {}, defaultdict(list)
+    for r in tables["papers"]:
+        if r[P["doi"]]:
+            by_doi.setdefault(r[P["doi"]], r[0])
+        k = title_key(r[P["title"]])
+        if len(k) >= ALIAS_MIN_TITLE:
+            by_title[k].append((r[0], r[P["year"]]))
+    aliases, how, ambiguous, examples = {}, Counter(), 0, []
+    for wid in sorted(citers):
+        w = ext_works.get(wid)
+        if not w:
+            continue
+        doi = norm_doi(w.get("doi") or "")
+        if doi in by_doi:
+            pid, kind = by_doi[doi], "doi"
+        else:
+            k = title_key(w.get("title") or w.get("display_name"))
+            fits = [p for p, y in by_title.get(k, ()) if _same_work(w, y, tokens[p])]
+            if len(fits) != 1:
+                ambiguous += len(fits) > 1
+                continue
+            pid, kind = fits[0], "title"
+        aliases[wid] = pid
+        how[kind] += 1
+        if len(examples) < 10:
+            examples.append([f"oa:{wid}", pid, kind])
+    return aliases, {
+        "by_doi": how["doi"],
+        "by_title": how["title"],
+        "ambiguous_titles": ambiguous,
+        "examples": examples,
     }
 
 
@@ -1842,12 +1938,15 @@ def _graph_stats(paper_ids, extra_nodes, edges):
     }
 
 
-def compare_reference(tables, ref: dict):
-    """Compare our citation edges (as DOI pairs) with the reference file's."""
+def compare_reference(tables, ref: dict, skip=frozenset()):
+    """Compare our citation edges (as DOI pairs) with the reference file's;
+    ``skip`` holds (citing, cited) pairs left out (the alias edges)."""
     ours_all = {
         (r[0][4:], r[1][4:])
         for r in tables["cites"]
-        if r[0].startswith("doi:") and r[1].startswith("doi:")
+        if r[0].startswith("doi:")
+        and r[1].startswith("doi:")
+        and (r[0], r[1]) not in skip
     }
     # citing DOIs we know OpenAlex for = papers with an OpenAlex record
     ours_citing = {r[1] for r in tables["papers"] if r[1] and r[2]}
@@ -2051,6 +2150,14 @@ def _render_v2(L, v, table) -> None:
         f"Outside works whose DOI equals a library paper's DOI (flagged, kept): "
         f"{x['doi_equals_library_paper']['count']}."
     )
+    al = x.get("library_aliases")
+    if al:
+        L.append(
+            f"Cited works found to be library papers under another OpenAlex id, so counted "
+            f"as citations: {al['by_doi']} by DOI, {al['by_title']} by title "
+            f"({al['ambiguous_titles']} titles fit several library papers and were left "
+            f"outside); {al['library_citations_added']} library citations added."
+        )
     L.append("")
     table(
         ["title", "year", "library papers citing"],
@@ -2372,13 +2479,14 @@ def main(argv=None) -> int:
     if a.refresh:  # ask about every outside work again, the merged and deleted ones too
         ext_store["merged"], ext_store["deleted"] = {}, []
 
-    def assemble_all():
+    def assemble_all(aliases=None):
         return assemble(
             metadata,
             works,
             overrides,
             ext_store.get("merged"),
             ext_store.get("deleted") or (),
+            aliases,
         )
 
     tables, aux = assemble_all()
@@ -2409,10 +2517,18 @@ def main(argv=None) -> int:
     )
     failed_requests += ext_stats["failed"] + res_stats["failed"]
 
+    # ---- outside works that are library papers under another OpenAlex id become citations
+    aliases, alias_qa = library_aliases(tables, citers, ext_store["works"])
+    if aliases:
+        tables, aux = assemble_all(aliases)
+        citers = external_citers(aux)
+    alias_qa["library_citations_added"] = len(aux["alias_edges"])
+
     oracle = None
-    if a.reference_check:  # OpenAlex edges only: compared before the S2 edges join
+    # OpenAlex id edges only: compared before the S2 edges join, without the alias edges
+    if a.reference_check:
         with open(a.reference_check, encoding="utf-8") as f:
-            oracle = compare_reference(tables, json.load(f))
+            oracle = compare_reference(tables, json.load(f), aux["alias_edges"])
 
     # ---- S2 records per paper, embeddings, corpus ids
     records, via = s2_records_by_paper(tables, papers_cache["by_id"], res["records"])
@@ -2462,6 +2578,7 @@ def main(argv=None) -> int:
         "deleted": len(ext_store.get("deleted") or []),
         "still_unknown": len(ext_store.get("unknown") or []),
     }
+    ext_qa["library_aliases"] = alias_qa
     build_embeddings(tables, records, emb_cache)
 
     violations = hard_checks(tables) + hard_checks_v2(tables)
