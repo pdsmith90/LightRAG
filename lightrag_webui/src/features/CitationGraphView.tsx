@@ -79,6 +79,9 @@ export default function CitationGraphView() {
                 <div className="min-w-0 truncate" title={`${item.citation}\n${item.doi || item.paper}`}>
                   <div className="truncate">{item.citation || item.paper}</div>
                   <div className="text-muted-foreground truncate text-xs">{item.doi || item.paper}</div>
+                  {item.tldr && (
+                    <div className="text-muted-foreground line-clamp-2 w-0 min-w-full text-xs whitespace-normal">{item.tldr}</div>
+                  )}
                 </div>
               )}
               getOptionValue={(item) => item.paper}

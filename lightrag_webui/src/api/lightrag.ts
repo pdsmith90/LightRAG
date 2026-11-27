@@ -635,6 +635,8 @@ export type PaperSummary = {
   n_refs: number | null
   n_cited: number | null
   n_cited_in_kb: number | null
+  // Semantic Scholar's TLDR, from the paper structure (fork): null or absent without one.
+  tldr?: string | null
   mode?: 'paper' | 'shared' | 'common' | 'map'
   context?: 'own' | 'kb' | 'linked'
   // The paper map: its reach and how many papers it found and shows at one and two hops.

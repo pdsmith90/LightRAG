@@ -707,6 +707,11 @@ or without `q`; an indexed key without metadata is listed too. The scan runs off
 event loop over haystacks folded once per document-list or metadata change, and the
 processed-document list is read at most every five minutes, one read shared by
 concurrent requests and later refreshes run behind the request.
+Each result also carries `tldr`: the Semantic Scholar TLDR from the loaded paper
+structure, found for all the results of one search by DOI or key in the structure
+already in memory (no query per paper), and `null` while the structure is off or
+unreadable, has no `tldr` column, or has none for that paper. The search never fails
+or waits for it beyond what the structure routes already do.
 
 `POST /graph/papers/passages` with `{"keys": [...], "question": "...", "top_n": 3}`
 (1 to 10 storage keys, all copies of one work; `top_n` 1 to 8) returns that work's

@@ -713,6 +713,31 @@ def _lite(st: _Struct, idx: int, kb: set[str]) -> dict:
     return out
 
 
+async def paper_tldrs(rag, papers: list[str]) -> dict[str, str]:
+    """The TLDR of each of ``papers`` (DOIs or attachment keys, as the paper
+    search names them) that the loaded structure has one for, by the text given.
+    Empty while the structure is unavailable, has no ``tldr`` column or reads
+    badly: the paper search does not depend on it. Never raises."""
+    if not papers:
+        return {}
+    try:
+        st = await _structure(rag)
+    except Unavailable:
+        return {}
+    except Exception as e:
+        logger.warning(f"zotero_struct: TLDRs for the paper search not read: {e}")
+        return {}
+    column = st.paper_extra.get("tldr")
+    if not column:
+        return {}
+    out: dict[str, str] = {}
+    for text in papers:
+        idx = _resolve(st, text)
+        if idx is not None and column[idx]:
+            out[text] = column[idx]
+    return out
+
+
 def _link_weight(st: _Struct, a: int, b: int) -> float:
     """A link's strength for the map and its edge width: _W_CITE when either
     paper cites the other (once, also when both do), plus _W_COUPLED times the

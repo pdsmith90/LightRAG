@@ -57,6 +57,37 @@ describe('CitationGraphView', () => {
     expect(screen.queryByText(strings.unavailable)).toBeNull()
   })
 
+  test('search results show the TLDR under the title when the paper has one', async () => {
+    const paper = (id: string, citation: string, tldr: string | null) => ({
+      paper: id,
+      doi: id,
+      keys: [],
+      title: citation,
+      citation,
+      year: '2020',
+      n_refs: null,
+      n_cited: null,
+      n_cited_in_kb: null,
+      tldr
+    })
+    __setAxiosAdapterForTests(async (config: any) => {
+      const found = new URL(config.url, 'http://x').pathname === '/graph/papers/search'
+      const data = found
+        ? [paper('10.1/a', 'Alpha 2020', 'Alpha measures gravity leakage.'), paper('10.1/b', 'Beta 2020', null)]
+        : { total: 0, topics: [] }
+      return { data, status: 200, statusText: 'OK', headers: {}, config }
+    })
+    setStatus(true)
+    renderWithProviders(<CitationGraphView />)
+
+    fireEvent.click(screen.getByRole('combobox', { name: strings.search.label }))
+    fireEvent.change(await screen.findByPlaceholderText(strings.search.searchPlaceholder), {
+      target: { value: 'a' }
+    })
+    expect(await screen.findByText('Alpha measures gravity leakage.', {}, { timeout: 3000 })).toBeTruthy()
+    expect(screen.getByText('Beta 2020')).toBeTruthy()
+  })
+
   test('opens on the Paper view with a search and switches to the Topics view', async () => {
     setStatus(true)
     renderWithProviders(<CitationGraphView />)

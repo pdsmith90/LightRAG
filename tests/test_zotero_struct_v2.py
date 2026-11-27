@@ -13,6 +13,7 @@ import zlib
 
 import pytest
 
+import lightrag.zotero_papers as zp
 import lightrag.zotero_struct as zs
 from tests.test_zotero_struct import (  # noqa: F401  (structure: autouse)
     TABLES,
@@ -250,6 +251,72 @@ async def test_papers_carry_the_tldr_and_the_semantic_scholar_counts():
     # topic lists use the same summary
     listed = (await zs.papers_by_topic(rag, "topic:T1"))["papers"]
     assert listed and all("tldr" in p for p in listed)
+
+
+async def test_paper_tldrs_name_the_papers_the_search_names_in_one_read():
+    db, rag = _v2()
+    found = await zs.paper_tldrs(rag, ["10.1/a", "10.1/B", "10.1/e", "10.9/unknown"])
+    # a DOI in any case finds its paper; a paper without a TLDR or an unknown one is left out
+    assert found == {
+        "10.1/a": "Alpha measures gravity leakage.",
+        "10.1/B": "Bravo maps mascons.",
+    }
+    assert db.names().count("papers") == 1
+    assert await zs.paper_tldrs(rag, []) == {}
+
+
+async def test_paper_tldrs_are_empty_without_the_column_or_the_structure(monkeypatch):
+    assert await zs.paper_tldrs(_rag(_DB()), ["10.1/a"]) == {}  # a v1 schema
+    monkeypatch.delenv(zs.SCHEMA_ENV)
+    db, rag = _v2()
+    assert await zs.paper_tldrs(rag, ["10.1/a"]) == {}  # off: the database is not asked
+    assert db.calls == []
+
+
+async def test_paper_tldrs_never_raise(monkeypatch):
+    async def broken(rag):
+        raise RuntimeError("pool closed")
+
+    monkeypatch.setattr(zs, "_structure", broken)
+    assert await zs.paper_tldrs(_rag(), ["10.1/a"]) == {}
+
+
+def _search_with(monkeypatch, rag):
+    async def fake(rag, q, limit=20, keys=None):
+        return [
+            {"paper": "10.1/a", "doi": "10.1/a", "keys": ["AAAA0001"], "title": "A",
+             "citation": "Alpha 2010", "year": "2010", "n_refs": 3, "n_cited": 2,
+             "n_cited_in_kb": 1},
+            {"paper": "10.1/e", "doi": "10.1/e", "keys": [], "title": "E",
+             "citation": "Echo 2018", "year": "2018", "n_refs": None, "n_cited": None,
+             "n_cited_in_kb": None},
+        ]  # fmt: skip
+
+    monkeypatch.setattr(zp, "search_papers", fake)
+    client, headers = _client(rag)
+    return client.get("/graph/papers/search?q=a", headers=headers)
+
+
+def test_the_search_route_adds_the_tldr_and_keeps_every_other_field(monkeypatch):
+    r = _search_with(monkeypatch, _v2()[1])
+    assert r.status_code == 200
+    a, e = r.json()
+    assert a["tldr"] == "Alpha measures gravity leakage."
+    assert e["tldr"] is None  # in the structure, no TLDR: null, not absent
+    assert {k: v for k, v in a.items() if k != "tldr"} == {
+        "paper": "10.1/a", "doi": "10.1/a", "keys": ["AAAA0001"], "title": "A",
+        "citation": "Alpha 2010", "year": "2010", "n_refs": 3, "n_cited": 2,
+        "n_cited_in_kb": 1,
+    }  # fmt: skip
+
+
+def test_the_search_route_still_answers_with_tldr_null_while_the_structure_is_off(
+    monkeypatch,
+):
+    monkeypatch.delenv(zs.SCHEMA_ENV)
+    r = _search_with(monkeypatch, _v2()[1])
+    assert r.status_code == 200 and r.headers["X-Paper-Search"] == "2"
+    assert [p["tldr"] for p in r.json()] == [None, None]
 
 
 async def test_the_optional_tables_are_found_in_the_fingerprint_and_reread_on_a_swap(

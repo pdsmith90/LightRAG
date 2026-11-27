@@ -397,7 +397,8 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
 
         Each result carries the paper id to pass to ``/graphs/paper`` (its DOI,
         else its Zotero key), a short citation, and how many of its references
-        are library papers and in the knowledge base. Words match with
+        are library papers and in the knowledge base, and its ``tldr`` (null
+        while the paper structure is off, or when it has none). Words match with
         typography folded on both sides; ``keys`` looks up several storage keys
         in one request, and ``q`` may then be left out. Every answer carries
         ``X-Paper-Search: 2``.
@@ -420,7 +421,13 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
         if limit is None:
             limit = len(key_list) if key_list else 20
         try:
-            return await zotero_papers.search_papers(rag, q or "", limit, keys=key_list)
+            found = await zotero_papers.search_papers(
+                rag, q or "", limit, keys=key_list
+            )
+            tldrs = await zotero_struct.paper_tldrs(rag, [p["paper"] for p in found])
+            for p in found:
+                p["tldr"] = tldrs.get(p["paper"])
+            return found
         except Exception as e:
             logger.error(f"Error searching papers with query '{q}': {str(e)}")
             logger.error(traceback.format_exc())
