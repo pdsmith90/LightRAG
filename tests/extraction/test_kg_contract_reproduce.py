@@ -22,6 +22,7 @@ inserts, a reopen with another configuration and a deletion. All names are
 invented.
 """
 
+import asyncio
 import json
 import sys
 from uuid import uuid4
@@ -44,6 +45,7 @@ from tests.extraction.test_kg_contract_rebuild import (
     _Characters,
     _embed,
     _graph,
+    _input_text,
     _llm,
     _reply,
 )
@@ -208,6 +210,70 @@ async def test_declaring_the_relation_list_rebuilds_old_chunks_as_they_were(
     assert edge["keywords"] == "contains, holds"
     assert edge["source_id"] == "A-chunk-000"
     assert edge["description"] == "ZA A."
+
+
+async def test_a_failed_contract_only_reextraction_drops_every_chunks_rows(
+    prompt_dir, tmp_path
+):
+    """A deletion's rebuild re-extracts A and C under the contract and no hook;
+    C's LLM call fails after A's row is cached. Records are stored only after
+    every chunk has passed, so the rows of both chunks are unchecked: the cached
+    path never applies the keyword check (COLD1-03), and a retry that trusted
+    them would put the free keywords of A into the graph. They are dropped, as
+    when a hook is set, and the retry extracts both chunks again."""
+    path, workspace = tmp_path / f"rag_{uuid4().hex}", f"kgc_{uuid4().hex}"
+    rag = await _open(path, workspace, _llm(_first))
+    try:
+        await _insert(rag, "A", "B", "C")
+        keys = []
+        for chunk_id in ("A-chunk-000", "C-chunk-000"):
+            keys += (await rag.text_chunks.get_by_id(chunk_id))["llm_cache_list"]
+        await rag.llm_response_cache.delete(keys)
+    finally:
+        await rag.finalize_storages()
+
+    state = {"fail": True, "calls": [], "a_keys": []}
+    base = _llm(_first)
+
+    async def llm(prompt, system_prompt=None, history_messages=None, **kwargs):
+        text = _input_text(prompt)
+        if text:
+            state["calls"].append(_tag(text))
+        if state["fail"] and "Report three" in text:
+            while not state["a_keys"]:
+                row = await rag.text_chunks.get_by_id("A-chunk-000")
+                listed = row["llm_cache_list"]
+                cached = await rag.llm_response_cache.get_by_ids(listed)
+                if listed and all(cached):
+                    state["a_keys"] = listed
+                await asyncio.sleep(0.01)
+            raise RuntimeError("LLM unavailable")
+        return await base(prompt, system_prompt, history_messages, **kwargs)
+
+    rag = await _open(path, workspace, llm, profile="contract.yml")
+    try:
+        result = await asyncio.wait_for(rag.adelete_by_doc_id("B"), 30)
+        assert result.status == "fail"
+        assert "LLM unavailable" in result.message
+        for chunk_id in ("A-chunk-000", "C-chunk-000"):
+            row = await rag.text_chunks.get_by_id(chunk_id)
+            assert row["llm_cache_list"] == []
+            assert CHUNK_KG_RECORDS_FIELD not in row
+        # The key differs from the first extraction's: the contract changes the prompt.
+        assert not set(state["a_keys"]) & set(keys)
+        assert all(
+            v is None for v in await rag.llm_response_cache.get_by_ids(state["a_keys"])
+        )
+
+        state["fail"] = False
+        state["calls"].clear()
+        assert (await rag.adelete_by_doc_id("B")).status == "success"
+        assert sorted(state["calls"]) == ["A", "C"]
+        edge = _graph(rag)["edges"][("Alpha Unit", "Zeta System")]
+        assert edge["keywords"] != "contains, holds"
+        assert CHUNK_KG_RECORDS_FIELD in await rag.text_chunks.get_by_id("A-chunk-000")
+    finally:
+        await rag.finalize_storages()
 
 
 # ------------------------------- chunks with stored records: the configuration changes

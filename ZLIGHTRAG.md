@@ -550,11 +550,15 @@ name the fold changed gets no attribution, as on the base branch.
 
 Failed re-extraction. A deletion's rebuild that re-extracts a surviving chunk (upstream's
 rule when its extraction cache is gone) runs the extraction, hook included. If that
-fails with a hook set, the extract rows the run cached are removed again, for every
-chunk of that run (`_drop_unvetted_extract_rows`), because a cached row is never
-re-hooked and a retry would otherwise rebuild from records the hook may have rejected.
-A chunk that passed the hook before a sibling failed is dropped too: the records of a
-run are stored only after all its chunks have passed, so it has none either. When a rebuild
+fails when the run would have stored accepted records (the extraction contract or a
+hook is set), the extract rows the run cached are removed again, for every chunk of
+that run (`_drop_unvetted_extract_rows`), because a cached row is never re-hooked or
+re-checked against the relation list and a retry would otherwise rebuild from records
+the hook may have rejected or the contract never checked. The test is the one
+`extract_entities` applies (`stores_accepted_records`: `relationship_types` in the
+profile, or a hook), so a contract-only run is covered. A chunk that passed the hook
+before a sibling failed is dropped too: the records of a run are stored only after all
+its chunks have passed, so it has none either. When a rebuild
 needs several windows (`KG_REBUILD_WINDOW_CHUNKS`), every relation window runs before
 any entity window, each window holding one kind, so an entity still reads rebuilt edges.
 

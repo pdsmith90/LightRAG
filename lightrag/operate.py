@@ -2278,33 +2278,54 @@ async def _reextract_chunks(
             text_chunks_storage=text_chunks_storage,
         )
     except Exception:
-        if global_config.get("kg_extraction_validator") is not None:
-            await _drop_unvetted_extract_rows(
-                chunk_ids, text_chunks_storage, llm_response_cache
-            )
+        await _drop_unvetted_extract_rows(
+            chunk_ids, text_chunks_storage, llm_response_cache, global_config
+        )
         raise
     return dict(zip(chunk_ids, results))
+
+
+def _run_stores_records(global_config: dict[str, Any]) -> bool:
+    """Fork: whether ``extract_entities`` stores its chunks' accepted records
+    under ``global_config``, resolved as it resolves it: the cached prompt
+    profile (else one resolved from ``addon_params`` and the JSON mode) and the
+    hook, through ``stores_accepted_records``."""
+    profile = global_config.get("_entity_extraction_prompt_profile")
+    if profile is None:
+        profile = resolve_entity_extraction_prompt_profile(
+            global_config.get("addon_params") or {},
+            global_config.get("entity_extraction_use_json", False),
+        )
+    return stores_accepted_records(
+        profile.get("relationship_types") or None,
+        global_config.get("kg_extraction_validator"),
+    )
 
 
 async def _drop_unvetted_extract_rows(
     chunk_ids: list[str],
     text_chunks_storage: BaseKVStorage,
     llm_response_cache: BaseKVStorage,
+    global_config: dict[str, Any],
 ) -> None:
-    """Fork: after a failed re-extraction with an extraction hook set, remove the
-    extract rows the run cached and their references.
+    """Fork: after a failed re-extraction that would have stored accepted
+    records (the extraction contract or a hook is set), remove the extract rows
+    the run cached and their references.
 
-    The rows are written before the hook runs, and the chunk's stored records
-    only after it, so a retry that read them as plain cached extractions (the
-    fork never re-applies the hook to those) would rebuild from records the hook
-    may have rejected. Without them the retry extracts the chunk again. It drops
-    the rows of every chunk of the run, not only the one that raised:
+    The rows are written before the hook runs and the contract's keyword check
+    is applied, and the chunk's stored records only after both, so a retry that
+    read them as plain cached extractions (the fork never re-applies either to
+    those) would rebuild from records the hook may have rejected or the
+    contract never checked. Without them the retry extracts the chunk again. It
+    drops the rows of every chunk of the run, not only the one that raised:
     ``extract_entities`` stores the records of all its chunks together, after
     every chunk has passed, so a chunk that passed before a sibling failed has
     no stored records and its raw rows are as unvetted as the failing one's.
     Best effort: the original failure is the one that is raised.
     """
     try:
+        if not _run_stores_records(global_config):
+            return
         rows = await text_chunks_storage.get_by_ids(chunk_ids)
         stale: list[str] = []
         updates: dict[str, dict[str, Any]] = {}
@@ -4972,9 +4993,10 @@ async def _apply_kg_extraction_validator(
     Applied to fresh extractions only: ``extract_entities`` is the only
     caller, and the deletion rebuild reads stored records and cached rows
     without re-validating either. Because a row is cached before the hook
-    runs, a re-extraction that fails while a hook is set has that run's
-    extract rows dropped, all chunks' of that run (``_drop_unvetted_extract_rows``),
-    so a retry extracts them again. Caller-facing contract: "Extraction Quality
+    runs, a re-extraction that fails when records would be stored (the
+    extraction contract or a hook is set) has that run's extract rows dropped,
+    all chunks' of that run (``_drop_unvetted_extract_rows``), so a retry
+    extracts them again. Caller-facing contract: "Extraction Quality
     Hook" in docs/ProgramingWithCore.md. Call it before
     ``_inject_multimodal_records``.
     """

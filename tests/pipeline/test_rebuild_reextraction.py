@@ -656,8 +656,13 @@ class _GatedValidator(_TaggingValidator):
         self.fail_marker = fail_marker
         self.passing = passing
         self.passed = 0
+        self.passed_keys: list[str] = []
         self.enabled = True
         self._all_passed = asyncio.Event()
+
+    def __deepcopy__(self, memo):
+        # The config is deep-copied per call; the Event is bound to the loop.
+        return self
 
     async def __call__(self, chunk_key, chunk_text, maybe_nodes, maybe_edges):
         if not self.enabled:
@@ -667,6 +672,7 @@ class _GatedValidator(_TaggingValidator):
             raise RuntimeError("validator rejected the chunk")
         result = super().__call__(chunk_key, chunk_text, maybe_nodes, maybe_edges)
         self.passed += 1
+        self.passed_keys.append(chunk_key)
         if self.passed == self.passing:
             self._all_passed.set()
         return result
@@ -681,7 +687,7 @@ async def test_failed_reextraction_drops_every_chunks_rows_of_the_run(tmp_path):
     the chunk that raised; narrowing it to the failing chunk would let the retry
     rebuild a hooked chunk from the raw output the hook had changed."""
     llm = _StubLLM()
-    validator = _GatedValidator("V1ONLY", passing=1)
+    validator = _GatedValidator("V1ONLY", passing=2)
     rag = await _make_rag(tmp_path, llm)
     try:
         await _insert(rag, "doc-v1", "doc-v2", "doc-v3")
@@ -693,7 +699,8 @@ async def test_failed_reextraction_drops_every_chunks_rows_of_the_run(tmp_path):
 
         result = await rag.adelete_by_doc_id("doc-v3")
         assert result.status == "fail"
-        assert validator.passed >= 1  # a SHARED chunk passed the hook, V1ONLY raised
+        # doc-v1's SHARED chunk passed the hook before V1ONLY raised.
+        assert passed_id in validator.passed_keys
 
         rows = await rag.text_chunks.get_by_ids([passed_id, failed_id])
         for row in rows:
