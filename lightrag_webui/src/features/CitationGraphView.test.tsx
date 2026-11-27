@@ -280,4 +280,3 @@ describe('CitationGraphView paper selection', () => {
     expect(chips()).toEqual(['Remove Alpha 2020'])
   })
 })
-
