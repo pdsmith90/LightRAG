@@ -172,11 +172,19 @@ const PaperMap = ({
     <div className="flex min-h-0 flex-1 flex-col">
       <div className="flex flex-wrap items-center gap-2 border-b px-3 py-2">
         <div className="min-w-0 flex-1">
-          <div className="truncate text-sm font-medium" title={summary?.title}>
-            {summary?.papers && summary.papers.length > 1
-              ? summary.papers.map((p) => p.citation || p.paper).join(' · ')
-              : summary?.citation || summary?.title || papers[0]}
-          </div>
+          {summary?.papers && summary.papers.length > 1 ? (
+            <div className="flex flex-col text-sm font-medium" title={summary?.title}>
+              {summary.papers.map((p) => (
+                <div key={p.paper} className="truncate">
+                  {p.citation || p.paper}
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="truncate text-sm font-medium" title={summary?.title}>
+              {summary?.citation || summary?.title || papers[0]}
+            </div>
+          )}
           <div className="text-muted-foreground truncate text-xs" role="status">
             {loading ? t('citationGraph.loading') : message}
           </div>
