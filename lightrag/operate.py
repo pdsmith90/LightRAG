@@ -4965,10 +4965,14 @@ async def _apply_kg_extraction_validator(
 ) -> tuple[dict[str, list[dict]], dict[tuple[str, str], list[dict]]]:
     """Run ``kg_extraction_validator`` on one chunk's extracted records.
 
-    Shared by ingestion (``extract_entities``) and the deletion rebuild's
-    cache path, so a cached row is held to the same rules as a fresh
-    extraction. Caller-facing contract: "Extraction Quality Hook" in
-    docs/ProgramingWithCore.md. Call it before ``_inject_multimodal_records``.
+    Applied to fresh extractions only: ``extract_entities`` is the only
+    caller, and the deletion rebuild reads stored records and cached rows
+    without re-validating either. Because a row is cached before the hook
+    runs, a re-extraction that fails while a hook is set has that run's
+    extract rows dropped (``_drop_unvetted_extract_rows``), so a retry
+    extracts the chunk again. Caller-facing contract: "Extraction Quality
+    Hook" in docs/ProgramingWithCore.md. Call it before
+    ``_inject_multimodal_records``.
     """
     validated = validator(
         chunk_key,
