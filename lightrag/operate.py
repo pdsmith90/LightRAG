@@ -2285,17 +2285,24 @@ async def _reextract_chunks(
     return dict(zip(chunk_ids, results))
 
 
-def _run_stores_records(global_config: dict[str, Any]) -> bool:
+def _run_stores_records(
+    global_config: dict[str, Any], profile: dict[str, Any] | None = None
+) -> bool:
     """Fork: whether ``extract_entities`` stores its chunks' accepted records
-    under ``global_config``, resolved as it resolves it: the cached prompt
-    profile (else one resolved from ``addon_params`` and the JSON mode) and the
-    hook, through ``stores_accepted_records``."""
-    profile = global_config.get("_entity_extraction_prompt_profile")
+    under ``global_config``: the extraction contract (the prompt profile's
+    ``relationship_types``) or a hook, through ``stores_accepted_records``.
+
+    ``profile`` is the prompt profile the caller already resolved for the same
+    run, so the stores-records decision reads the same profile the prompts were
+    built from; ``None`` resolves it here, as ``extract_entities`` does for
+    callers that construct ``global_config`` directly."""
     if profile is None:
-        profile = resolve_entity_extraction_prompt_profile(
-            global_config.get("addon_params") or {},
-            global_config.get("entity_extraction_use_json", False),
-        )
+        profile = global_config.get("_entity_extraction_prompt_profile")
+        if profile is None:
+            profile = resolve_entity_extraction_prompt_profile(
+                global_config.get("addon_params") or {},
+                global_config.get("entity_extraction_use_json", False),
+            )
     return stores_accepted_records(
         profile.get("relationship_types") or None,
         global_config.get("kg_extraction_validator"),
@@ -5238,7 +5245,11 @@ async def extract_entities(
     # With the contract or a hook, each chunk's accepted records (what reaches
     # the merge, after the name fold) are stored with the chunk, and a
     # knowledge rebuild reads them instead of re-running this post-processing.
-    store_records = stores_accepted_records(relationship_types, kg_extraction_validator)
+    # The drop decides the same question through this helper, so the two cannot
+    # drift. It is handed the profile resolved just above, so its own resolution
+    # (the ``profile=None`` default) does not run here and cannot fail: the
+    # decision is the one the inline form made, resolved once.
+    store_records = _run_stores_records(global_config, prompt_profile)
 
     max_total_records = global_config["entity_extract_max_records"]
     max_entity_records = global_config["entity_extract_max_entities"]
