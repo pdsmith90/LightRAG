@@ -531,6 +531,7 @@
     "related": {
       "filter": "Relation",
       "count": "Showing {{shown}} of {{total}}",
+      "countMany": "Showing {{shown}} papers",
       "sharedRefs": "Shared references: {{count}}",
       "sharedAuthors": "Shared authors: {{count}}",
       "readSentences": "Read citing sentences ({{count}})",
@@ -543,6 +544,7 @@
     },
     "outside": {
       "count": "Showing {{shown}} of {{total}} works cited by this paper and by other library papers",
+      "countMany": "Showing {{shown}} works cited by these papers and by other library papers",
       "libraryCiters": "Cited by library papers: {{count}}",
       "alsoCitedBy": "Also cited by",
       "empty": "No outside works"

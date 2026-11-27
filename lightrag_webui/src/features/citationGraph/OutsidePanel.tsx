@@ -16,7 +16,12 @@ const OutsidePanel = ({ papers, onOpen }: { papers: string[]; onOpen: (id: strin
   const load = useCallback(() => fanOut(papers, (paper) => getOutsideWorks(paper, LIMIT)), [papers])
   const { data, error, loading } = useFetched(load)
   const works = data ? mergeOutside(data) : []
-  const total = data?.answers.reduce((sum, { answer }) => sum + (answer.total ?? answer.works?.length ?? 0), 0) ?? 0
+  // Several chosen papers share outside works, so their totals add up to more than the distinct
+  // works shown: only a single chosen paper's answer has an exact total.
+  const total =
+    data?.total === 1
+      ? data.answers.reduce((sum, { answer }) => sum + (answer.total ?? answer.works?.length ?? 0), 0)
+      : null
 
   return (
     <PanelBody
@@ -28,7 +33,9 @@ const OutsidePanel = ({ papers, onOpen }: { papers: string[]; onOpen: (id: strin
       {works.length ? (
         <>
           <p className="text-muted-foreground px-3 py-2 text-xs">
-            {t('citationGraph.outside.count', { shown: works.length, total: Math.max(total, works.length) })}
+            {total === null
+              ? t('citationGraph.outside.countMany', { shown: works.length })
+              : t('citationGraph.outside.count', { shown: works.length, total: Math.max(total, works.length) })}
           </p>
           <ul>
             {works.map((work) => (

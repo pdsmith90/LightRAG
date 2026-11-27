@@ -39,11 +39,15 @@ const RelatedPanel = ({
   )
   const { data, error, loading } = useFetched(load)
   const related = data ? mergeRelated(data) : []
+  // Several chosen papers share related papers, so their totals add up to more than the distinct
+  // papers shown: only a single chosen paper's answer has an exact total.
   const total =
-    data?.answers.reduce(
-      (sum, { answer }) => sum + (answer.totals?.[relation] ?? answer.related?.length ?? 0),
-      0
-    ) ?? 0
+    data?.total === 1
+      ? data.answers.reduce(
+        (sum, { answer }) => sum + (answer.totals?.[relation] ?? answer.related?.length ?? 0),
+        0
+      )
+      : null
 
   const detail = (item: RelatedFrom) => {
     const facts = item.citation
@@ -109,10 +113,12 @@ const RelatedPanel = ({
         {data && (
           <>
             <p className="text-muted-foreground px-3 pb-1 text-xs">
-              {t('citationGraph.related.count', {
-                shown: related.length,
-                total: Math.max(total, related.length)
-              })}
+              {total === null
+                ? t('citationGraph.related.countMany', { shown: related.length })
+                : t('citationGraph.related.count', {
+                  shown: related.length,
+                  total: Math.max(total, related.length)
+                })}
             </p>
             {related.length ? (
               <ul>

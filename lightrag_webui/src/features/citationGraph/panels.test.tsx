@@ -223,6 +223,10 @@ describe('OutsidePanel', () => {
     const link = await screen.findByRole('link', { name: 'An outside work' })
     expect(link.getAttribute('href')).toBe('https://doi.org/10.9/outside')
     expect(screen.getByText('Cited by library papers: 21')).toBeTruthy()
+    // One paper: its total is exact, so the count says how many it left out.
+    expect(
+      screen.getByText('Showing 1 of 13 works cited by this paper and by other library papers')
+    ).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: 'Author c' }))
     expect(onOpen).toHaveBeenCalledWith('doi:10.1/c')
   })
@@ -322,7 +326,8 @@ describe('several chosen papers', () => {
     expect(requests.map(asked).sort()).toEqual([['10.1/p'], ['10.1/q']])
     expect(requests.every((url) => url.includes('relations=cites'))).toBe(true)
     expect(screen.getAllByRole('button', { name: 'A reference' })).toHaveLength(1)
-    expect(screen.getByText('Showing 2 of 9')).toBeTruthy()
+    // The two totals add up to 9, but the shared reference is one paper: only what is shown is counted.
+    expect(screen.getByText('Showing 2 papers')).toBeTruthy()
     // The copy of the shared reference that has sentences is the one from Q.
     fireEvent.click(screen.getByRole('button', { name: 'Read citing sentences (3)' }))
     expect(onPickCitation).toHaveBeenCalledWith({ citing: '10.1/q', cited: 'doi:10.1/ref' })
@@ -412,6 +417,9 @@ describe('several chosen papers', () => {
     expect(screen.getAllByRole('link', { name: 'Shared work' })).toHaveLength(1)
     expect(screen.getAllByRole('button', { name: 'Author c' })).toHaveLength(1)
     expect(screen.getByRole('button', { name: 'Author d' })).toBeTruthy()
-    expect(screen.getByText('Showing 2 of 15 works cited by this paper and by other library papers')).toBeTruthy()
+    // The two totals add up to 15, but the shared work is one work: only what is shown is counted.
+    expect(
+      screen.getByText('Showing 2 works cited by these papers and by other library papers')
+    ).toBeTruthy()
   })
 })
