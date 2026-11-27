@@ -22,6 +22,7 @@ import { ZapIcon } from 'lucide-react'
 
 import GraphViewer from '@/features/GraphViewer'
 import DocumentManager from '@/features/DocumentManager'
+import CitationGraphView from '@/features/CitationGraphView'
 import RetrievalView from '@/features/RetrievalView'
 
 import { Tabs, TabsContent } from '@/components/ui/Tabs'
@@ -235,6 +236,11 @@ function App() {
                 <TabsContent value="knowledge-graph" className="absolute top-0 right-0 bottom-0 left-0 overflow-hidden">
                   <ErrorBoundary>
                     <GraphViewer />
+                  </ErrorBoundary>
+                </TabsContent>
+                <TabsContent value="citation-graph" className="absolute top-0 right-0 bottom-0 left-0 overflow-hidden">
+                  <ErrorBoundary>
+                    <CitationGraphView />
                   </ErrorBoundary>
                 </TabsContent>
                 <TabsContent value="retrieval" className="absolute top-0 right-0 bottom-0 left-0 overflow-hidden">

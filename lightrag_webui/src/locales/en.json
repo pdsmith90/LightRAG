@@ -9,6 +9,7 @@
   "header": {
     "documents": "Documents",
     "knowledgeGraph": "Knowledge Graph",
+    "citationGraph": "Citation Graph",
     "retrieval": "Retrieval",
     "apiDocs": "API Documentation",
     "projectRepository": "Project Repository",
@@ -489,6 +490,93 @@
       }
     },
     "emptyGraph": "Empty(Try Reload Again)"
+  },
+  "citationGraph": {
+    "loading": "Loading...",
+    "error": "Could not load this data: {{message}}",
+    "unavailable": "Citation structure not loaded on this backend",
+    "openPaper": "Open this paper",
+    "citedByLibrary": "Cited in the library: {{count}}",
+    "notInKb": "Not in the knowledge base",
+    "influential": "Influential",
+    "modeLabel": "View",
+    "modePaper": "Paper",
+    "modeTopics": "Topics",
+    "panelLabel": "Panels",
+    "emptyPaper": "Search for a paper to see its citation map",
+    "search": {
+      "label": "Search papers",
+      "placeholder": "Search for a paper...",
+      "searchPlaceholder": "DOI, title, author or year...",
+      "noPapers": "No matching papers in the knowledge base"
+    },
+    "panels": {
+      "related": "Related",
+      "similar": "Similar",
+      "citation": "Citations",
+      "outside": "Outside works"
+    },
+    "relation": {
+      "cites": "References",
+      "cited_by": "Cited by",
+      "coupled": "Shared references",
+      "coauthor": "Shared authors"
+    },
+    "map": {
+      "readSentences": "Read the citing sentences"
+    },
+    "related": {
+      "filter": "Relation",
+      "count": "Showing {{shown}} of {{total}}",
+      "sharedRefs": "Shared references: {{count}}",
+      "sharedAuthors": "Shared authors: {{count}}",
+      "readSentences": "Read citing sentences ({{count}})",
+      "empty": "No related papers of this kind"
+    },
+    "similar": {
+      "similarity": "Similarity {{value}}%",
+      "unlinked": "Not linked by citation or authors",
+      "empty": "No similar papers"
+    },
+    "outside": {
+      "count": "Showing {{shown}} of {{total}} works cited by this paper and by other library papers",
+      "libraryCiters": "Cited by library papers: {{count}}",
+      "alsoCitedBy": "Also cited by",
+      "empty": "No outside works"
+    },
+    "citation": {
+      "pick": "Pick a citation link on the map, or a reference in Related, to read the sentences that cite",
+      "swap": "The other paper cites this one: swap direction",
+      "source": "Source: {{source}}",
+      "noSentences": "No citing sentences are stored for this citation"
+    },
+    "topics": {
+      "search": "Search topics",
+      "level": "Level",
+      "levels": {
+        "all": "All",
+        "domain": "Domains",
+        "field": "Fields",
+        "subfield": "Subfields",
+        "topic": "Topics"
+      },
+      "count": "Showing {{shown}} of {{total}}",
+      "papers": "Papers: {{count}}",
+      "empty": "No matching topics",
+      "back": "All topics",
+      "paperCount": "Showing {{shown}} of {{total}} papers, {{inKb}} with text in the knowledge base",
+      "alternatives": "Other matches:",
+      "primary": "Primary topic"
+    },
+    "reason": {
+      "not_in_structure": "This paper is not in the citation structure",
+      "no_embeddings": "The server has no paper embeddings",
+      "no_embedding": "This paper has no embedding",
+      "no_citation": "The library has no such citation",
+      "no_contexts_table": "The server stores no citing sentences",
+      "no_external_works": "No work outside the library is cited by this paper and by another library paper",
+      "no_topic": "No matching topic"
+    }
   },
   "retrievePanel": {
     "chatMessage": {

@@ -690,6 +690,162 @@ export const queryPaperMap = async (
   return response.data
 }
 
+// A paper as the structure routes (/graph/papers/related, similar, citation, outside,
+// by_topic) describe it (fork). `paper_id` is its structure id (`doi:<doi>` or `zot:<key>`).
+export type StructPaper = {
+  paper_id: string
+  doi: string | null
+  label: string
+  title: string | null
+  year: number | null
+  venue: string | null
+  authors: string[]
+  field: string | null
+  topic: string | null
+  in_kb: boolean
+  keys: string[]
+  cited_by_library: number
+  cites_library: number
+  cited_by_count: number | null
+  tldr?: string | null
+}
+
+export type PaperRelation = 'cites' | 'cited_by' | 'coupled' | 'coauthor'
+
+// How the library knows one citation: where it comes from, and what its sentences say.
+export type CitationFacts = {
+  source: string | null
+  is_influential: boolean | null
+  intents: string[]
+  n_contexts: number | null
+}
+
+export type RelatedPaper = StructPaper & {
+  score: number
+  reasons: PaperRelation[]
+  shared_refs?: number
+  coupling_score?: number
+  shared_authors?: number
+  citation?: CitationFacts
+}
+
+export type RelatedPapers = {
+  paper: StructPaper | null
+  totals?: Record<string, number>
+  related?: RelatedPaper[]
+  truncated?: boolean
+  reason?: string
+}
+
+export type PaperCitation = {
+  citing?: StructPaper
+  cited?: StructPaper
+  edge?: CitationFacts | null
+  contexts?: { ordinal: number; text: string; intents: string[] }[]
+  cited_cites_citing?: boolean
+  missing?: string[]
+  reason?: string
+}
+
+export type SimilarPapers = {
+  paper: StructPaper | null
+  similar?: (StructPaper & { similarity: number; links: PaperRelation[] })[]
+  reason?: string
+}
+
+export type OutsideWork = {
+  work_id: string
+  doi: string | null
+  title: string | null
+  year: number | null
+  first_author: string | null
+  venue: string | null
+  cited_by_count: number | null
+  n_library_citers: number
+  also_cited_by: StructPaper[]
+}
+
+export type OutsideWorks = {
+  paper: StructPaper | null
+  total?: number
+  works?: OutsideWork[]
+  truncated?: boolean
+  reason?: string
+}
+
+export type PaperTopic = {
+  topic_id: string
+  name: string
+  level: 'domain' | 'field' | 'subfield' | 'topic'
+  path: string
+  n_papers: number
+  n_primary: number
+}
+
+export type PaperTopics = { total: number; topics: PaperTopic[] }
+
+export type TopicPapers = {
+  topic: PaperTopic | null
+  alternatives?: PaperTopic[]
+  total: number
+  in_kb?: number
+  papers: (StructPaper & { primary?: boolean })[]
+  truncated?: boolean
+  reason?: string
+}
+
+// The routes below need the server's paper structure: they answer 501 without it.
+export const getRelatedPapers = async (
+  paper: string,
+  relations: PaperRelation[],
+  limit: number = 20
+): Promise<RelatedPapers> => {
+  const response = await axiosInstance.get(
+    `/graph/papers/related?paper=${encodeURIComponent(paper)}&relations=${relations.join(',')}&limit=${limit}`
+  )
+  return response.data
+}
+
+export const getPaperCitation = async (citing: string, cited: string): Promise<PaperCitation> => {
+  const response = await axiosInstance.get(
+    `/graph/papers/citation?citing=${encodeURIComponent(citing)}&cited=${encodeURIComponent(cited)}`
+  )
+  return response.data
+}
+
+export const getSimilarPapers = async (paper: string, limit: number = 10): Promise<SimilarPapers> => {
+  const response = await axiosInstance.get(
+    `/graph/papers/similar?paper=${encodeURIComponent(paper)}&limit=${limit}`
+  )
+  return response.data
+}
+
+export const getOutsideWorks = async (paper: string, limit: number = 20): Promise<OutsideWorks> => {
+  const response = await axiosInstance.get(
+    `/graph/papers/outside?paper=${encodeURIComponent(paper)}&limit=${limit}`
+  )
+  return response.data
+}
+
+export const getPaperTopics = async (
+  query: string,
+  level: PaperTopic['level'] | null,
+  limit: number = 200
+): Promise<PaperTopics> => {
+  const params = new URLSearchParams({ limit: String(limit) })
+  if (query) params.set('q', query)
+  if (level) params.set('level', level)
+  const response = await axiosInstance.get(`/graph/papers/topics?${params}`)
+  return response.data
+}
+
+export const getPapersByTopic = async (topic: string, limit: number = 50): Promise<TopicPapers> => {
+  const response = await axiosInstance.get(
+    `/graph/papers/by_topic?topic=${encodeURIComponent(topic)}&limit=${limit}`
+  )
+  return response.data
+}
+
 // Zotero label of a corpus file path (fork); `label` is null for a path with no Zotero entry.
 export type SourceLabel = {
   file_path: string
