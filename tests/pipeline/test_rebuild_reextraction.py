@@ -776,6 +776,95 @@ async def test_failed_reextraction_keeps_a_row_a_chunk_outside_the_run_lists(
         await rag.finalize_storages()
 
 
+class _LateFailureLLM(_StubLLM):
+    """``fail_marker``'s call raises, but only once ``chunk_id`` has cached its
+    row and referenced it, so the failure lands after an earlier chunk of the
+    same run completed (the run's chunks are concurrent).
+
+    Set ``fail_marker``, ``chunk_id`` and ``key`` after the initial insert, as
+    the tests set ``_TaggingValidator.raise_next``.
+    """
+
+    fail_marker: str | None = None
+    chunk_id: str | None = None
+    key: str | None = None
+    rag = None
+
+    def __deepcopy__(self, memo):
+        # The config is deep-copied per call; the poll reads the live storages.
+        return self
+
+    async def __call__(
+        self, prompt, system_prompt=None, history_messages=None, **kwargs
+    ):
+        source = history_messages[0]["content"] if history_messages else prompt
+        if self.fail_marker is not None and self.fail_marker in source:
+            for _ in range(500):
+                if await self._earlier_chunk_cached():
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                raise AssertionError("the earlier chunk never cached its row")
+            raise RuntimeError("LLM unavailable")
+        return await super().__call__(prompt, system_prompt, history_messages, **kwargs)
+
+    async def _earlier_chunk_cached(self) -> bool:
+        row = (await self.rag.text_chunks.get_by_ids([self.chunk_id]))[0]
+        if row["llm_cache_list"] != [self.key]:
+            return False
+        return await self.rag.llm_response_cache.get_by_id(self.key) is not None
+
+
+@pytest.mark.asyncio
+async def test_failed_reextraction_without_a_contract_or_hook_keeps_its_rows(
+    tmp_path,
+):
+    """Fork: the drop fires only when the run would have stored accepted
+    records, that is with the extraction contract or a hook set. With neither,
+    the run's rows are what extraction produced and nothing had to vet them, so
+    deleting them would only cost the LLM calls of a second extraction. A
+    failure here is the documented residual window (a retry may read the failed
+    run's rows), not a silent drop of rows nothing asked to keep."""
+    llm = _LateFailureLLM()
+    rag = await _make_rag(tmp_path, llm)
+    llm.rag = rag
+    try:
+        await _insert(rag, "doc-v1", "doc-v3")
+        shared_id, shared_row = await _chunk_with(rag, "doc-v1", "SHARED")
+        failed_id, failed_row = await _chunk_with(rag, "doc-v1", "V1ONLY")
+        (shared_key,) = shared_row["llm_cache_list"]
+        (failed_key,) = failed_row["llm_cache_list"]
+        await rag.llm_response_cache.delete([shared_key, failed_key])
+
+        llm.chunk_id, llm.key, llm.fail_marker = shared_id, shared_key, "V1ONLY"
+        result = await rag.adelete_by_doc_id("doc-v3")
+        assert result.status == "fail"
+        assert "LLM unavailable" in result.message
+        assert (await rag.doc_status.get_by_id("doc-v3"))["status"] == (
+            DocStatus.DELETING
+        )
+
+        # The earlier chunk of the run cached its row and referenced it; the
+        # drop left both alone, so a retry finds a complete extraction.
+        rows = await rag.text_chunks.get_by_ids([shared_id, failed_id])
+        assert rows[0]["llm_cache_list"] == [shared_key]
+        assert (await rag.llm_response_cache.get_by_id(shared_key)) is not None
+        assert rows[1]["llm_cache_list"] == []
+        assert await rag.llm_response_cache.get_by_id(failed_key) is None
+
+        llm.fail_marker = None
+        llm.calls.clear()
+        await _delete_ok(rag, "doc-v3")
+        # SHARED is rebuilt from its surviving row; only V1ONLY, whose call
+        # failed, is extracted again.
+        assert llm.calls == [("V1ONLY", False)]
+        foo = await rag.chunk_entity_relation_graph.get_node("Foo")
+        assert "Foo fact from v3" not in foo["description"]
+        assert _ids(foo["source_id"]) == {shared_id, failed_id}
+    finally:
+        await rag.finalize_storages()
+
+
 class _FakeChunks:
     def __init__(self, rows, lookup=None):
         self.rows = rows
