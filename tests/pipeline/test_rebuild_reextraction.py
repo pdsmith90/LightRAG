@@ -969,3 +969,76 @@ async def test_the_drop_deletes_every_row_when_sharing_cannot_be_asked(lookup):
     )
     assert cache.deleted == [key]
     assert chunks.rows["c1"]["llm_cache_list"] == []
+
+
+_HOOKED = {"kg_extraction_validator": object()}
+_EXTRACT_KEY = "default:extract:" + "0" * 32
+
+
+@pytest.mark.asyncio
+async def test_the_drop_detaches_the_chunks_when_the_cache_delete_fails():
+    """The references come off in a step of their own: a cache delete that
+    fails must not leave them in place, or the retry would read the raw rows as
+    cached extractions, without the hook."""
+    from lightrag.operate import _drop_unvetted_extract_rows
+
+    class _BrokenCache:
+        async def delete(self, keys):
+            raise RuntimeError("cache delete unavailable")
+
+    chunks = _FakeChunks({"c1": {"llm_cache_list": [_EXTRACT_KEY]}})
+    await _drop_unvetted_extract_rows(["c1"], chunks, _BrokenCache(), _HOOKED)
+    assert chunks.rows["c1"]["llm_cache_list"] == []
+
+
+@pytest.mark.asyncio
+async def test_the_drop_deletes_the_rows_when_the_chunks_cannot_be_written():
+    """The rows are deleted even when the references could not be removed. A
+    reference to a row that is gone sends the chunk back to the extraction; a
+    reference to a row still there would be trusted."""
+    from lightrag.operate import _drop_unvetted_extract_rows
+
+    async def broken(data):
+        raise RuntimeError("chunk storage down")
+
+    chunks = _FakeChunks({"c1": {"llm_cache_list": [_EXTRACT_KEY]}})
+    chunks.upsert = broken
+    cache = _FakeCache()
+    await _drop_unvetted_extract_rows(["c1"], chunks, cache, _HOOKED)
+    assert cache.deleted == [_EXTRACT_KEY]
+    assert chunks.rows["c1"]["llm_cache_list"] == [_EXTRACT_KEY]
+
+
+@pytest.mark.asyncio
+async def test_the_drop_deletes_the_rows_before_it_touches_the_references():
+    """A reference is written before its row, so the row goes before the
+    reference. A drop cut between its two steps (here a cancellation as the
+    chunks are written) then leaves a reference to a row that is gone, which
+    sends the chunk back to the extraction, and never a row no chunk lists,
+    which a document's cache delete could not find."""
+    from lightrag.operate import _drop_unvetted_extract_rows
+
+    async def cancelled(data):
+        raise asyncio.CancelledError()
+
+    chunks = _FakeChunks({"c1": {"llm_cache_list": [_EXTRACT_KEY]}})
+    chunks.upsert = cancelled
+    cache = _FakeCache()
+    with pytest.raises(asyncio.CancelledError):
+        await _drop_unvetted_extract_rows(["c1"], chunks, cache, _HOOKED)
+    assert cache.deleted == [_EXTRACT_KEY]
+
+
+@pytest.mark.asyncio
+async def test_the_drop_leaves_other_cache_references_alone():
+    """Only the extract rows are the failed run's. A chunk also lists rows of
+    other cache types (a multimodal analysis), which a cache delete finds only
+    through that list, so they stay listed and are not deleted."""
+    from lightrag.operate import _drop_unvetted_extract_rows
+
+    analysis_key = "default:analysis:" + "1" * 32
+    chunks = _FakeChunks({"c1": {"llm_cache_list": [analysis_key, _EXTRACT_KEY]}})
+    cache = _FakeCache()
+    await _drop_unvetted_extract_rows(["c1"], chunks, cache, _HOOKED)
+    assert chunks.rows["c1"]["llm_cache_list"] == [analysis_key]
+    assert cache.deleted == [_EXTRACT_KEY]

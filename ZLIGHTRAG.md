@@ -559,10 +559,17 @@ the hook may have rejected or the contract never checked. The test is the one
 profile, or a hook), so a contract-only run is covered. A chunk that passed the hook
 before a sibling failed is dropped too: the records of a run are stored only after all
 its chunks have passed, so it has none either. The run's chunks lose their references,
-which forces the re-extraction, but a row is deleted only if no chunk outside the run
-still lists it (rows are keyed on the prompt, so a chunk with the same text shares one);
-a text-chunk storage without `cache_ids_listed_by_other_chunks` (everything but JSON
-and PostgreSQL) deletes them all. When a rebuild
+which forces the re-extraction, and the rows are deleted too, before the references,
+because a row no chunk lists is out of reach of a later cache delete
+(`delete_llm_cache`). A row is deleted only if no chunk outside the run still lists it
+(rows are keyed on the prompt, so a chunk with the same text shares one); a text-chunk
+storage without `cache_ids_listed_by_other_chunks` (everything but JSON and PostgreSQL)
+deletes them all. The two steps fail separately. A failed reference removal leaves
+references to rows that are gone, which also forces the re-extraction (a row a chunk
+outside the run lists is not deleted, and is then still listed). A failed delete leaves
+the chunks without their references and the rows listed by no chunk of the run, out of
+reach of `delete_llm_cache` unless a retry's cache hit lists them again
+(`lightrag-gc-llm-cache` collects such a row only once its chunk is gone). When a rebuild
 needs several windows (`KG_REBUILD_WINDOW_CHUNKS`), every relation window runs before
 any entity window, each window holding one kind, so an entity still reads rebuilt edges.
 

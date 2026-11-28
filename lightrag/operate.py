@@ -2317,7 +2317,7 @@ async def _drop_unvetted_extract_rows(
 ) -> None:
     """Fork: after a failed re-extraction that would have stored accepted
     records (the extraction contract or a hook is set), remove the extract rows
-    the run cached and their references.
+    the run cached and their references, each in a step of its own.
 
     The rows are written before the hook runs and the contract's keyword check
     is applied, and the chunk's stored records only after both, so a retry that
@@ -2329,23 +2329,37 @@ async def _drop_unvetted_extract_rows(
     every chunk has passed, so a chunk that passed before a sibling failed has
     no stored records and its raw rows are as unvetted as the failing one's.
 
-    The references are always removed from the run's chunks, which is what
-    forces the re-extraction. A row is deleted only if no chunk outside the run
-    still lists it: rows are keyed on the prompt, so a chunk with the same text
-    (or one that lost its reference) shares it, and deleting it would leave that
-    chunk's reference dangling (``cache_ids_listed_by_other_chunks``, as a
-    document delete asks it). A text-chunk storage without that lookup (only
-    JSON and PostgreSQL have it), or one whose lookup fails, deletes every row,
-    since a row left behind would be trusted. Best effort: the original failure
-    is the one that is raised.
+    The references are removed from the run's chunks, which is what forces the
+    re-extraction. The rows are deleted as well because a row no chunk lists is
+    out of reach of a document's cache delete (``delete_llm_cache`` finds rows
+    only through ``llm_cache_list``) while it still holds the chunk's text. A
+    row is deleted only if no chunk outside the run still lists it: rows are
+    keyed on the prompt, so a chunk with the same text shares it, and deleting
+    it would leave that chunk's reference dangling
+    (``cache_ids_listed_by_other_chunks``, as a document delete asks it). A
+    text-chunk storage without that lookup (only JSON and PostgreSQL have it),
+    or one whose lookup fails, deletes every row, since a row left behind would
+    be listed by no chunk of the run.
+
+    The rows go first, as a reference is written before its row: a drop cut
+    between the two steps leaves a reference to a row that is gone, which sends
+    the chunk back to the extraction, never a row no chunk lists. The steps
+    fail separately. A delete that fails leaves the chunks without their
+    references all the same, so the retry cannot trust the rows, which are then
+    listed by no chunk of the run unless a retry's cache hit lists them again. A
+    reference removal that fails leaves references to rows that are gone,
+    except for a row a chunk outside the run lists, which is never deleted. So
+    a retry finds a raw row listed only when the references could not be
+    removed and the row is still there, or when the chunks could not be read.
+    Best effort: the original failure is the one that is raised.
     """
     try:
         if not _run_stores_records(global_config):
             return
         rows = await text_chunks_storage.get_by_ids(chunk_ids)
-        stale: list[str] = []
-        updates: dict[str, dict[str, Any]] = {}
         for chunk_id, row in zip(chunk_ids, rows):
+    stale: list[str] = []
+    updates: dict[str, dict[str, Any]] = {}
             if not isinstance(row, dict):
                 continue
             keys = list(row.get("llm_cache_list") or [])
@@ -2356,32 +2370,41 @@ async def _drop_unvetted_extract_rows(
                     **row,
                     "llm_cache_list": [k for k in keys if k not in extract_keys],
                 }
-        if stale:
-            shared: set[str] = set()
-            lookup = getattr(
-                text_chunks_storage, "cache_ids_listed_by_other_chunks", None
-            )
-            if lookup is not None:
-                try:
-                    shared = await lookup(stale, chunk_ids)
-                except Exception as e:
-                    logger.warning(
-                        f"Could not tell which extract rows other chunks list: {e}"
-                    )
-            else:
-                logger.warning(
-                    "Could not tell which extract rows other chunks list: the "
-                    "text-chunk storage has no cache_ids_listed_by_other_chunks, "
-                    "so every row is deleted"
-                )
-            deletable = [k for k in stale if k not in shared]
-            if deletable:
-                await llm_response_cache.delete(deletable)
-        if updates:
-            await text_chunks_storage.upsert(updates)
     except Exception as e:
         logger.warning(
             f"Could not drop the extract rows of a failed re-extraction: {e}"
+        )
+        return
+    if not stale:
+        return
+    try:
+        shared: set[str] = set()
+        lookup = getattr(text_chunks_storage, "cache_ids_listed_by_other_chunks", None)
+        if lookup is not None:
+            try:
+                shared = await lookup(stale, chunk_ids)
+            except Exception as e:
+                logger.warning(
+                    f"Could not tell which extract rows other chunks list: {e}"
+                )
+        else:
+            logger.warning(
+                "Could not tell which extract rows other chunks list: the "
+                "text-chunk storage has no cache_ids_listed_by_other_chunks, "
+                "so every row is deleted"
+            )
+        deletable = [k for k in stale if k not in shared]
+        if deletable:
+            await llm_response_cache.delete(deletable)
+    except Exception as e:
+        logger.warning(
+            f"Could not delete the extract rows of a failed re-extraction: {e}"
+        )
+    try:
+        await text_chunks_storage.upsert(updates)
+    except Exception as e:
+        logger.warning(
+            f"Could not remove the extract references of a failed re-extraction: {e}"
         )
 
 
