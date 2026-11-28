@@ -14,7 +14,9 @@ pass with a longer, a shorter and an equal-length description (the merge's
 free phrase), a glued name, three documents sharing entities, a deletion and a
 kept-summary deletion (the rebuilds from cached extractions), the re-ingest of
 the second one (with the kept-summary rebuild after it) and the graph after
-each step. All names are invented.
+each step. All names are invented. The graph workload runs on a clock of its
+own (``_one_second_clock``), because the order of a name's descriptions follows
+the second each was extracted in.
 
 To re-record after an intended change on the base branch, run
 ``python tests/extraction/test_kg_contract_inert.py`` with the base branch's
@@ -22,12 +24,15 @@ tree first on PYTHONPATH and paste the printed digests.
 """
 
 import asyncio
+import contextlib
 import hashlib
+import itertools
 import json
 import os
 import shutil
 import sys
 import tempfile
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -401,6 +406,32 @@ def _digest(obj) -> str:
     ).hexdigest()
 
 
+# A whole second, and what the workload's clock adds at every reading.
+_CLOCK_START = 1_700_000_000
+_CLOCK_STEP = 1e-6
+
+
+@contextlib.contextmanager
+def _one_second_clock():
+    """Run the graph workload inside one clock second.
+
+    The merge lists a name's descriptions by the whole second each was extracted
+    in, and by length within a second. That order is part of the summary prompts,
+    so of the cache keys and of the digest. A run that crosses a second boundary
+    between two extractions therefore writes other prompts than one that does
+    not, on the base branch as on this one, and a digest recorded on a fast
+    machine fails now and then on a slow one. The workload brings its own clock
+    instead: it still advances, by a microsecond at every reading.
+    """
+    real, readings = time.time, itertools.count()
+    time.time = lambda: _CLOCK_START + next(readings) * _CLOCK_STEP
+    try:
+        yield
+        assert next(readings) * _CLOCK_STEP < 0.5, "the workload left its second"
+    finally:
+        time.time = real
+
+
 async def _run_case(work_dir: str, use_json: bool, profile, fold: bool) -> dict:
     prompt_dir = Path(work_dir) / "prompts"
     (prompt_dir / "entity_type").mkdir(parents=True, exist_ok=True)
@@ -421,20 +452,17 @@ async def _run_case(work_dir: str, use_json: bool, profile, fold: bool) -> dict:
         extraction = await _extraction_prompts(use_json, addon)
     finally:
         entity_name_fold.disarm()
-    return {
-        "extraction": _digest(extraction),
-        "graph": _digest(
-            await _graph_workload(
-                os.path.join(work_dir, "g"),
-                use_json,
-                addon,
-                f"inert_{_case_id(use_json, profile, fold)}".replace(".", "_").replace(
-                    "-", "_"
-                ),
-                fold,
-            )
-        ),
-    }
+    with _one_second_clock():
+        graph = await _graph_workload(
+            os.path.join(work_dir, "g"),
+            use_json,
+            addon,
+            f"inert_{_case_id(use_json, profile, fold)}".replace(".", "_").replace(
+                "-", "_"
+            ),
+            fold,
+        )
+    return {"extraction": _digest(extraction), "graph": _digest(graph)}
 
 
 # Recorded from zlightrag a2bd9d148 (see the module docstring); the graph digests
@@ -489,6 +517,23 @@ async def test_prompts_and_graph_writes_equal_the_base_branch(
     assert (
         await _run_case(str(tmp_path), use_json, profile, fold)
         == GOLDEN[_case_id(use_json, profile, fold)]
+    )
+
+
+async def test_the_graph_digest_does_not_depend_on_the_wall_clock(
+    tmp_path, monkeypatch
+):
+    """On a slow machine two extractions fall into different clock seconds, which
+    reorders the descriptions the merge hands to a summary. The workload runs on
+    its own clock, so a wall clock that jumps 0.7 s at every reading gives the
+    digest of one that stands still."""
+    monkeypatch.setenv("PROMPT_DIR", "")
+    monkeypatch.setenv("MAX_EXTRACT_INPUT_TOKENS", "")
+    start, readings = time.time(), itertools.count(1)
+    monkeypatch.setattr(time, "time", lambda: start + 0.7 * next(readings))
+    assert (
+        await _run_case(str(tmp_path), False, "plain.yml", True)
+        == GOLDEN["text-plain.yml-fold"]
     )
 
 
