@@ -370,6 +370,67 @@ async def test_custom_kg_chunk_is_never_reextracted(tmp_path, keeps_source_id):
 
 
 @pytest.mark.asyncio
+async def test_kept_summary_rebuild_never_reextracts_a_custom_kg_chunk(
+    tmp_path, monkeypatch
+):
+    """Fork: the rebuild that follows the re-ingestion of a document deleted
+    with ``keep_summaries`` tells custom KG chunks from pipeline chunks as the
+    deletion's rebuild does. On a backend that drops the chunk row's
+    ``source_id`` only ``doc_status`` can tell them apart, so that rebuild is
+    given it too; without it the curated text went to the extraction LLM."""
+    from lightrag import operate
+    from lightrag.utils import load_json, write_json
+
+    llm = _StubLLM()
+    rag = await _make_rag(tmp_path, llm)
+    try:
+        await rag.ainsert_custom_kg(
+            {
+                "chunks": [
+                    {
+                        "content": "Curated note about Foo.",
+                        "source_id": "curated",
+                        "file_path": "curated.md",
+                    }
+                ],
+                "entities": [
+                    {
+                        "entity_name": "Foo",
+                        "entity_type": "concept",
+                        "description": "Curated Foo",
+                        "source_id": "curated",
+                    }
+                ],
+                "relationships": [],
+            }
+        )
+        await _insert(rag, "doc-v3")
+        (curated_id,) = (await rag.entity_chunks.get_by_id("Foo"))["chunk_ids"][:1]
+        # As PGKVStorage returns the row: without its source_id alias.
+        (row,) = await rag.text_chunks.get_by_ids([curated_id])
+        row = {k: v for k, v in row.items() if k != "source_id"}
+        await rag.text_chunks.upsert({curated_id: row})
+
+        reextracted: list[str] = []
+        extract_entities = operate.extract_entities
+
+        async def spy(chunks, *args, **kwargs):
+            reextracted.extend(chunks)
+            return await extract_entities(chunks, *args, **kwargs)
+
+        monkeypatch.setattr(operate, "extract_entities", spy)
+        registry = rag._kept_summaries_path()
+        write_json({"doc-v3": {"entities": ["Foo"], "relations": []}}, registry)
+        await rag._resummarize_kept_summaries({}, None)
+
+        assert reextracted == []
+        # The rebuild ran to its end: the entry is cleared, not left to retry.
+        assert load_json(registry) == {}
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
 async def test_failed_reextraction_fails_the_deletion_and_a_retry_completes(
     tmp_path,
 ):

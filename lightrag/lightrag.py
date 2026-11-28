@@ -8626,6 +8626,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                     pipeline_status_lock=pipeline_status_lock,
                     entity_chunks_storage=self.entity_chunks,
                     relation_chunks_storage=self.relation_chunks,
+                    doc_status_storage=self.doc_status,
                 )
                 await self._insert_done()
             for doc_id in back:
