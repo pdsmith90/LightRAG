@@ -1669,14 +1669,21 @@ async def rebuild_knowledge_from_chunks(
             only the provenance. The re-ingest merge adds the document's new
             fragments to it as to a fresh summary; the kept text still carries
             the document's old contribution until the entity is next summarized.
+            It spares summary calls only: under ``best_effort`` a surviving
+            chunk without usable extraction data is still re-extracted.
 
     Fork (windowed rebuild): the objects are rebuilt in windows of at most
     ``kg_rebuild_window_chunks`` referenced chunks (union over the window's
     objects), each window loading, rebuilding and releasing its own chunks, so a
     deletion that touches a large part of the corpus never holds it in memory at
-    once. When more than one window is needed, the relations' windows run before
-    the entities' (and each window holds one kind), so an entity still reads
-    rebuilt edges.
+    once; only the records of chunks a window re-extracted are kept for the
+    windows after it. When more than one window is needed, the relations'
+    windows run before the entities' (and each window holds one kind), so an
+    entity still reads rebuilt edges. Each window re-extracts its own chunks
+    before it rebuilds its objects, so "before any object is rebuilt" above
+    holds per window: a later window's re-extraction, and its failure, comes
+    after the earlier windows' objects were rewritten, and the retry rebuilds
+    them again.
     """
     if rebuild_policy not in ("best_effort", "rollback"):
         raise ValueError(f"Unsupported KG rebuild policy: {rebuild_policy}")
@@ -2353,13 +2360,13 @@ async def _drop_unvetted_extract_rows(
     removed and the row is still there, or when the chunks could not be read.
     Best effort: the original failure is the one that is raised.
     """
+    stale: list[str] = []
+    updates: dict[str, dict[str, Any]] = {}
     try:
         if not _run_stores_records(global_config):
             return
         rows = await text_chunks_storage.get_by_ids(chunk_ids)
         for chunk_id, row in zip(chunk_ids, rows):
-    stale: list[str] = []
-    updates: dict[str, dict[str, Any]] = {}
             if not isinstance(row, dict):
                 continue
             keys = list(row.get("llm_cache_list") or [])

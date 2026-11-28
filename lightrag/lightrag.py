@@ -8686,8 +8686,10 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                 associated with the document. Defaults to False.
             keep_summaries (bool): Fork (KEEP SUMMARIES). For a deletion the
                 document's re-ingestion will follow: rebuild the shared entities and
-                relations without the LLM, keeping a current description wherever a
-                new one would need an LLM summary. Defaults to False.
+                relations without LLM summaries, keeping a current description
+                wherever a new one would need one. A surviving chunk without
+                usable extraction data is still re-extracted with the LLM.
+                Defaults to False.
 
         Returns:
             DeletionResult: An object containing the outcome of the deletion process.

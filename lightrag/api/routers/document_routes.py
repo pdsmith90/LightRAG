@@ -1116,8 +1116,9 @@ class DeleteDocRequest(BaseModel):
     keep_summaries: bool = Field(
         default=False,
         description="For a deletion the documents' re-ingestion will follow: rebuild "
-        "the entities and relations they shared without the LLM, keeping a current "
-        "description wherever a new one would need an LLM summary (fork).",
+        "the entities and relations they shared without LLM summaries, keeping a "
+        "current description wherever a new one would need one. A surviving chunk "
+        "without usable extraction data is still re-extracted with the LLM (fork).",
     )
 
     @field_validator("doc_ids", mode="after")
